@@ -8,7 +8,7 @@
  * firmware's native pen on the note page AFTER the mindmap is
  * inserted (§4.1 step 6).
  *
- * Per-node affordances (§F-AC-5, Phase 1.4b):
+ * Per-node affordances (§F-AC-5):
  *   - Add Child (chevron-right, thicker stroke) — "primary"
  *   - Add Sibling (chevron-down, thinner stroke) — hidden on the root
  *   - Collapse/Expand toggle (filled circle / ring with +N) — any
@@ -22,26 +22,39 @@
  *
  * On Insert tap this component hands off to ./insert.ts.
  *
- * Phase 1.4a (this revision): READ-ONLY render of a tree. No
- * mutations, no action icons, no pan/zoom — just a canvas that
- * paints the passed-in tree so Phase 1.1-1.3 can be validated
- * on-device. The Cancel button is the only interactive affordance,
- * matching §F-AC-8 minus the Insert hand-off (deferred to Phase 2).
+ * Phase 1.4b (this revision): mutation-capable canvas. A
+ * useReducer-backed tree state supports Add Child, Add Sibling,
+ * Delete, and Collapse toggle. Tapping a node selects it (the
+ * Delete × is the only selection-gated affordance per §F-AC-5);
+ * tapping the selected node again or tapping empty stage clears
+ * selection. Collapsed subtrees are filtered from the render pass
+ * per §4.2; the layout itself still lays every node out
+ * deterministically (§F-IN-2 auto-expands before emit, so emit-time
+ * code doesn't see a collapsed tree).
  *
  * Rendering approach: pure React Native Views. No react-native-svg —
  * sn-shapes avoids that dependency for the same reason (native
  * linking on the Supernote firmware is unverified). Node outlines
  * use `borderRadius`/`borderWidth`; connectors are thin black Views
- * rotated into place. This mirrors the sn-shapes StrokePreview
- * pattern so the two plugins stay visually consistent on-device.
+ * rotated into place. Action icons are small Pressables with Text
+ * glyphs inside — a chevron for Add Child/Sibling, a filled circle /
+ * ring for Collapse, a × for Delete. This mirrors the sn-shapes
+ * StrokePreview pattern so the two plugins stay visually consistent
+ * on-device.
  */
-import React, {useMemo} from 'react';
+import React, {useCallback, useMemo, useReducer, useState} from 'react';
 import {Pressable, StyleSheet, Text, View} from 'react-native';
 import {PluginManager} from 'sn-plugin-lib';
 import {
+  addChild,
+  addSibling,
+  cloneTree,
   createTree,
+  deleteSubtree,
+  setCollapsed,
   ShapeKind,
   type MindmapNode,
+  type NodeId,
   type Tree,
 } from './model/tree';
 import {radialLayout, type LayoutResult} from './layout/radial';
@@ -66,26 +79,126 @@ const STROKE_PX_PER_PENWIDTH = 1 / 40;
  */
 const MIN_STROKE_PX = 2;
 
+/**
+ * Action-icon hit target. 28 px is small for a fingertip but large
+ * enough for the Supernote pen, which is what the whole UI is tuned
+ * for anyway. Scaled up to 36 once §10 tuning confirms a comfortable
+ * size on-device if needed.
+ */
+const ICON_SIZE = 28;
+
+/** Gap between node outline and the action icons that sit alongside it. */
+const ICON_GAP = 8;
+
 export type MindmapCanvasProps = {
   /**
    * Optional preloaded tree for the edit round-trip (§F-ED-6) or for
-   * on-device authoring tests before Phase 1.4b wires up mutations.
-   * Undefined → the canvas creates a fresh tree with just the root
-   * Oval.
+   * on-device authoring tests. Undefined → the canvas creates a
+   * fresh tree with just the root Oval.
    */
   initialTree?: Tree;
 };
 
+/**
+ * Reducer actions. Each action describes a single user gesture on
+ * the canvas — the reducer turns that into a cloned-then-mutated
+ * Tree so React's state identity comparison notices the change.
+ */
+type Action =
+  | {type: 'ADD_CHILD'; parentId: NodeId}
+  | {type: 'ADD_SIBLING'; nodeId: NodeId}
+  | {type: 'DELETE_SUBTREE'; nodeId: NodeId}
+  | {type: 'TOGGLE_COLLAPSE'; nodeId: NodeId};
+
+/**
+ * Pure reducer: clones the previous tree and applies the mutators
+ * from ./model/tree. The mutators themselves are imperative for
+ * testability but callers outside this module always see an
+ * immutable-style state transition.
+ */
+function treeReducer(state: Tree, action: Action): Tree {
+  const next = cloneTree(state);
+  switch (action.type) {
+    case 'ADD_CHILD':
+      addChild(next, action.parentId);
+      return next;
+    case 'ADD_SIBLING':
+      addSibling(next, action.nodeId);
+      return next;
+    case 'DELETE_SUBTREE':
+      deleteSubtree(next, action.nodeId);
+      return next;
+    case 'TOGGLE_COLLAPSE': {
+      const node = next.nodesById.get(action.nodeId);
+      if (!node) {
+        return state;
+      }
+      setCollapsed(next, action.nodeId, !node.collapsed);
+      return next;
+    }
+    default:
+      // Exhaustiveness guard — the Action union is closed, so TS
+      // flags any missing case here. Runtime throw is defense-in-
+      // depth for JS callers.
+      throw new Error(
+        `treeReducer: unknown action ${(action as {type: string}).type}`,
+      );
+  }
+}
+
 export default function MindmapCanvas({
   initialTree,
 }: MindmapCanvasProps = {}): React.JSX.Element {
-  // useMemo so repeated renders don't re-run layout; layout is pure
-  // and deterministic but the maps it allocates are not cheap on
-  // larger trees. The Phase 1.4b mutation reducer will replace
-  // `initialTree` with state + cloneTree, at which point the memo
-  // dep list becomes the state identity.
-  const tree = useMemo(() => initialTree ?? createTree(), [initialTree]);
+  // The initial-state arg is called lazily by React, so cloning only
+  // happens on mount. The clone is important: callers may reuse the
+  // same `initialTree` reference across remounts and expect their
+  // copy to be unmodified.
+  const [tree, dispatch] = useReducer(treeReducer, initialTree, seed =>
+    seed ? cloneTree(seed) : createTree(),
+  );
+
+  // Selection state. Only one of the per-node affordances (§F-AC-5
+  // Delete) is selection-gated, but we still centralise selection
+  // here so future work (label editing, highlight on hover) can
+  // reuse it.
+  const [selectedId, setSelectedId] = useState<NodeId | null>(null);
+
   const layout = useMemo(() => radialLayout(tree), [tree]);
+
+  // Visible set: fully-expanded layout minus nodes that live inside
+  // a collapsed subtree. A node is visible iff every ancestor is
+  // non-collapsed (the node itself being collapsed still shows —
+  // only its children disappear).
+  const visibleIds = useMemo(() => computeVisibleSet(tree), [tree]);
+
+  const handleSelect = useCallback((nodeId: NodeId) => {
+    setSelectedId(prev => (prev === nodeId ? null : nodeId));
+  }, []);
+
+  const handleBackgroundPress = useCallback(() => {
+    setSelectedId(null);
+  }, []);
+
+  const handleAddChild = useCallback((parentId: NodeId) => {
+    dispatch({type: 'ADD_CHILD', parentId});
+  }, []);
+
+  const handleAddSibling = useCallback((nodeId: NodeId) => {
+    dispatch({type: 'ADD_SIBLING', nodeId});
+  }, []);
+
+  const handleDelete = useCallback(
+    (nodeId: NodeId) => {
+      dispatch({type: 'DELETE_SUBTREE', nodeId});
+      // Deleted node can no longer be the selection target.
+      setSelectedId(prev => (prev === nodeId ? null : prev));
+    },
+    [],
+  );
+
+  const handleToggleCollapse = useCallback((nodeId: NodeId) => {
+    dispatch({type: 'TOGGLE_COLLAPSE', nodeId});
+  }, []);
 
   return (
     <View style={styles.root}>
@@ -102,11 +215,10 @@ export default function MindmapCanvas({
         </Pressable>
         <View style={styles.topBarSpacer} />
         {/*
-         * Insert button is a disabled stub in Phase 1.4a — the insert
-         * pipeline lands in Phase 2 (§F-IN-*). Kept visible so the
-         * on-device layout matches the final §F-AC-8 top bar, which
-         * makes it immediately obvious if the bar is clipped or
-         * misaligned.
+         * Insert button is a disabled stub — the insert pipeline
+         * lands in Phase 2 (§F-IN-*). Kept visible so the on-device
+         * layout matches the final §F-AC-8 top bar, which makes it
+         * immediately obvious if the bar is clipped or misaligned.
          */}
         <View
           accessibilityLabel="Insert (disabled)"
@@ -116,12 +228,84 @@ export default function MindmapCanvas({
           </Text>
         </View>
       </View>
-      <View style={styles.surface}>
-        <Stage tree={tree} layout={layout} />
-      </View>
+      <Pressable
+        accessibilityLabel="mindmap-background"
+        style={styles.surface}
+        onPress={handleBackgroundPress}>
+        <Stage
+          tree={tree}
+          layout={layout}
+          visibleIds={visibleIds}
+          selectedId={selectedId}
+          onSelect={handleSelect}
+          onAddChild={handleAddChild}
+          onAddSibling={handleAddSibling}
+          onDelete={handleDelete}
+          onToggleCollapse={handleToggleCollapse}
+        />
+      </Pressable>
     </View>
   );
 }
+
+/**
+ * Walk the tree from the root, stopping descent at every collapsed
+ * node. The collapsed node itself is visible; its descendants are
+ * not. Returns the set of visible NodeIds.
+ */
+function computeVisibleSet(tree: Tree): Set<NodeId> {
+  const visible = new Set<NodeId>();
+  const stack: NodeId[] = [tree.rootId];
+  while (stack.length > 0) {
+    const id = stack.pop() as NodeId;
+    visible.add(id);
+    const node = tree.nodesById.get(id);
+    if (!node || node.collapsed) {
+      continue;
+    }
+    for (const childId of node.childIds) {
+      stack.push(childId);
+    }
+  }
+  return visible;
+}
+
+/**
+ * Count descendants below a node. Used by the collapse badge to
+ * render `+N`. Iterative so deep trees can't blow the stack.
+ */
+function countDescendants(tree: Tree, nodeId: NodeId): number {
+  const node = tree.nodesById.get(nodeId);
+  if (!node) {
+    return 0;
+  }
+  let count = 0;
+  const stack: NodeId[] = [...node.childIds];
+  while (stack.length > 0) {
+    const id = stack.pop() as NodeId;
+    count += 1;
+    const child = tree.nodesById.get(id);
+    if (!child) {
+      continue;
+    }
+    for (const grandchildId of child.childIds) {
+      stack.push(grandchildId);
+    }
+  }
+  return count;
+}
+
+type StageProps = {
+  tree: Tree;
+  layout: LayoutResult;
+  visibleIds: Set<NodeId>;
+  selectedId: NodeId | null;
+  onSelect: (nodeId: NodeId) => void;
+  onAddChild: (parentId: NodeId) => void;
+  onAddSibling: (nodeId: NodeId) => void;
+  onDelete: (nodeId: NodeId) => void;
+  onToggleCollapse: (nodeId: NodeId) => void;
+};
 
 /**
  * Stage: centred plane sized to the layout's union bbox. Children
@@ -129,27 +313,38 @@ export default function MindmapCanvas({
  * mindmap-local (root at origin, may extend in any direction) to
  * stage-local (top-left = 0,0).
  *
- * The stage is sized to the union bbox, NOT to the surface, so it
- * can overflow on small screens without being clipped by the
- * intrinsic pan/zoom of Phase 1.4c (§F-AC-7). Phase 1.4a leaves the
- * stage unclipped; any overflow is fine for demo trees.
+ * Render order (back to front):
+ *   1. connectors (so nodes paint on top and mask the center→center
+ *      overshoot)
+ *   2. node outlines (interactive — tap selects)
+ *   3. action icons (interactive — Add Child / Sibling / Collapse /
+ *      Delete)
  */
 function Stage({
   tree,
   layout,
-}: {
-  tree: Tree;
-  layout: LayoutResult;
-}): React.JSX.Element {
+  visibleIds,
+  selectedId,
+  onSelect,
+  onAddChild,
+  onAddSibling,
+  onDelete,
+  onToggleCollapse,
+}: StageProps): React.JSX.Element {
   const {unionBbox} = layout;
   const origin: Point = {x: unionBbox.x, y: unionBbox.y};
 
-  // Enumerate directed edges parent → child. Iterate the node map
-  // once rather than walking the tree recursively — child linkage is
-  // already denormalised on each MindmapNode.
+  // Enumerate directed edges parent → child, skipping any edge that
+  // crosses the collapsed boundary (parent visible, child not).
   const edges: Array<{parent: MindmapNode; child: MindmapNode}> = [];
   for (const node of tree.nodesById.values()) {
+    if (!visibleIds.has(node.id)) {
+      continue;
+    }
     for (const childId of node.childIds) {
+      if (!visibleIds.has(childId)) {
+        continue;
+      }
       const child = tree.nodesById.get(childId);
       if (!child) {
         continue;
@@ -158,16 +353,17 @@ function Stage({
     }
   }
 
+  const visibleNodes: MindmapNode[] = [];
+  for (const node of tree.nodesById.values()) {
+    if (visibleIds.has(node.id)) {
+      visibleNodes.push(node);
+    }
+  }
+
   return (
     <View
       accessibilityLabel="mindmap-stage"
       style={{width: unionBbox.w, height: unionBbox.h}}>
-      {/*
-       * Connectors render first so nodes paint on top. Each node has
-       * `backgroundColor: '#fff'`, which masks the portion of a
-       * connector that would otherwise show inside the node outline
-       * (the line math goes center→center, not edge→edge).
-       */}
       {edges.map(({parent, child}) => {
         const parentCenter = layout.centers.get(parent.id);
         const childCenter = layout.centers.get(child.id);
@@ -184,13 +380,40 @@ function Stage({
           />
         );
       })}
-      {Array.from(tree.nodesById.values()).map(node => {
+      {visibleNodes.map(node => {
         const bbox = layout.bboxes.get(node.id);
         if (!bbox) {
           return null;
         }
         return (
-          <NodeFrame key={`node-${node.id}`} node={node} bbox={bbox} origin={origin} />
+          <NodeFrame
+            key={`node-${node.id}`}
+            node={node}
+            bbox={bbox}
+            origin={origin}
+            isSelected={selectedId === node.id}
+            onPress={onSelect}
+          />
+        );
+      })}
+      {visibleNodes.map(node => {
+        const bbox = layout.bboxes.get(node.id);
+        if (!bbox) {
+          return null;
+        }
+        return (
+          <NodeActions
+            key={`actions-${node.id}`}
+            node={node}
+            tree={tree}
+            bbox={bbox}
+            origin={origin}
+            isSelected={selectedId === node.id}
+            onAddChild={onAddChild}
+            onAddSibling={onAddSibling}
+            onDelete={onDelete}
+            onToggleCollapse={onToggleCollapse}
+          />
         );
       })}
     </View>
@@ -198,29 +421,36 @@ function Stage({
 }
 
 /**
- * Visual outline for a single node. Shape drives `borderRadius`:
+ * Visual outline + tap target for a single node. Shape drives
+ * `borderRadius`:
  *   OVAL              → height/2 (stadium / fully-rounded ends)
  *   RECTANGLE         → 0 (sharp corners)
  *   ROUNDED_RECTANGLE → SIBLING_CORNER_RADIUS (§F-AC-3)
  *
- * Outline weight comes from the shape's canonical pen width and is
- * converted to pixels via STROKE_PX_PER_PENWIDTH, matching sn-shapes'
- * StrokePreview so side-by-side rendering stays consistent.
+ * Selection highlight doubles the border width so the selected node
+ * reads clearly against the paper-white canvas; keeping the same
+ * black color preserves e-ink contrast (grey would anti-alias
+ * poorly).
  */
 function NodeFrame({
   node,
   bbox,
   origin,
+  isSelected,
+  onPress,
 }: {
   node: MindmapNode;
   bbox: Rect;
   origin: Point;
+  isSelected: boolean;
+  onPress: (nodeId: NodeId) => void;
 }): React.JSX.Element {
   const penWidth = penWidthForShape(node.shape);
-  const borderWidth = penWidthToPx(penWidth);
+  const borderWidth = penWidthToPx(penWidth) * (isSelected ? 2 : 1);
   return (
-    <View
+    <Pressable
       accessibilityLabel={`node-${node.id}`}
+      onPress={() => onPress(node.id)}
       style={[
         styles.nodeFrame,
         {
@@ -274,6 +504,129 @@ function Connector({
         },
       ]}
     />
+  );
+}
+
+/**
+ * Per-node action icon cluster (§F-AC-5). Rendered as absolutely-
+ * positioned Pressables around the node bbox. Visibility rules:
+ *   - Add Child       : always visible
+ *   - Add Sibling     : hidden on root (nodeId === rootId)
+ *   - Collapse toggle : visible only when node has ≥ 1 child
+ *   - Delete          : visible only when the node is selected AND
+ *                       is not the root (root can't be deleted)
+ */
+function NodeActions({
+  node,
+  tree,
+  bbox,
+  origin,
+  isSelected,
+  onAddChild,
+  onAddSibling,
+  onDelete,
+  onToggleCollapse,
+}: {
+  node: MindmapNode;
+  tree: Tree;
+  bbox: Rect;
+  origin: Point;
+  isSelected: boolean;
+  onAddChild: (id: NodeId) => void;
+  onAddSibling: (id: NodeId) => void;
+  onDelete: (id: NodeId) => void;
+  onToggleCollapse: (id: NodeId) => void;
+}): React.JSX.Element {
+  const isRoot = node.id === tree.rootId;
+  const hasChildren = node.childIds.length > 0;
+  const stageLeft = bbox.x - origin.x;
+  const stageTop = bbox.y - origin.y;
+
+  return (
+    <React.Fragment>
+      {/*
+       * Add Child — chevron "›" to the right, thicker stroke (the
+       * "primary" action per §F-AC-5).
+       */}
+      <Pressable
+        accessibilityLabel={`add-child-${node.id}`}
+        onPress={() => onAddChild(node.id)}
+        style={[
+          styles.iconButton,
+          styles.iconButtonPrimary,
+          {
+            left: stageLeft + bbox.w + ICON_GAP,
+            top: stageTop + bbox.h / 2 - ICON_SIZE / 2,
+          },
+        ]}>
+        <Text style={[styles.iconGlyph, styles.iconGlyphPrimary]}>{'\u203A'}</Text>
+      </Pressable>
+
+      {/* Add Sibling — chevron "⌄" below, thinner stroke. Hidden on the root. */}
+      {!isRoot && (
+        <Pressable
+          accessibilityLabel={`add-sibling-${node.id}`}
+          onPress={() => onAddSibling(node.id)}
+          style={[
+            styles.iconButton,
+            {
+              left: stageLeft + bbox.w / 2 - ICON_SIZE / 2,
+              top: stageTop + bbox.h + ICON_GAP,
+            },
+          ]}>
+          <Text style={styles.iconGlyph}>{'\u02C5'}</Text>
+        </Pressable>
+      )}
+
+      {/*
+       * Collapse/Expand toggle — bottom-right corner, inside the
+       * node outline. Filled dot when expanded, ring with "+N" when
+       * collapsed (§F-AC-5).
+       */}
+      {hasChildren && (
+        <Pressable
+          accessibilityLabel={`collapse-${node.id}`}
+          onPress={() => onToggleCollapse(node.id)}
+          style={[
+            styles.collapseButton,
+            {
+              left: stageLeft + bbox.w - ICON_SIZE - 4,
+              top: stageTop + bbox.h - ICON_SIZE - 4,
+            },
+          ]}>
+          {node.collapsed ? (
+            <View style={styles.collapseRing}>
+              <Text style={styles.collapseBadgeText}>
+                {`+${countDescendants(tree, node.id)}`}
+              </Text>
+            </View>
+          ) : (
+            <View style={styles.collapseDot} />
+          )}
+        </Pressable>
+      )}
+
+      {/*
+       * Delete — "×" at the top-right. Visible only when the node
+       * is selected, hidden on the root (use Cancel instead, per
+       * §F-AC-5).
+       */}
+      {isSelected && !isRoot && (
+        <Pressable
+          accessibilityLabel={`delete-${node.id}`}
+          onPress={() => onDelete(node.id)}
+          style={[
+            styles.iconButton,
+            styles.deleteButton,
+            {
+              left: stageLeft + bbox.w - ICON_SIZE / 2,
+              top: stageTop - ICON_SIZE / 2,
+            },
+          ]}>
+          <Text style={styles.iconGlyph}>{'\u00D7'}</Text>
+        </Pressable>
+      )}
+    </React.Fragment>
   );
 }
 
@@ -380,5 +733,61 @@ const styles = StyleSheet.create({
   connector: {
     position: 'absolute',
     backgroundColor: '#000',
+  },
+  iconButton: {
+    position: 'absolute',
+    width: ICON_SIZE,
+    height: ICON_SIZE,
+    borderWidth: 1,
+    borderColor: '#000',
+    borderRadius: ICON_SIZE / 2,
+    backgroundColor: '#fff',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  iconButtonPrimary: {
+    borderWidth: 2,
+  },
+  iconGlyph: {
+    fontSize: 16,
+    fontWeight: '500',
+    color: '#000',
+    // Keeps the chevron vertically centred on Android where the
+    // default Text baseline drifts toward the descender.
+    lineHeight: 18,
+  },
+  iconGlyphPrimary: {
+    fontWeight: '700',
+  },
+  collapseButton: {
+    position: 'absolute',
+    width: ICON_SIZE,
+    height: ICON_SIZE,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  collapseDot: {
+    width: 14,
+    height: 14,
+    borderRadius: 7,
+    backgroundColor: '#000',
+  },
+  collapseRing: {
+    width: ICON_SIZE,
+    height: ICON_SIZE,
+    borderRadius: ICON_SIZE / 2,
+    borderWidth: 2,
+    borderColor: '#000',
+    backgroundColor: '#fff',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  collapseBadgeText: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: '#000',
+  },
+  deleteButton: {
+    backgroundColor: '#fff',
   },
 });
