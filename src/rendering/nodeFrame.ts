@@ -9,17 +9,23 @@
  * (tracked as a §10 tuning item).
  *
  *   OVAL              — elongated rounded rectangle, darker border
+ *                       (uses ROOT_PEN_WIDTH, §F-AC-2)
  *   RECTANGLE         — 4 sharp corners, standard border
- *   ROUNDED_RECTANGLE — small corner radius, standard border
+ *                       (uses PEN_DEFAULTS.penWidth)
+ *   ROUNDED_RECTANGLE — small corner radius (SIBLING_CORNER_RADIUS),
+ *                       standard border
  *
  * Reuses sn-shapes/src/shapes.ts's roundedRectPoints helper per
  * §7.1's comment — Phase 2 will decide the import path (vendor
- * vs. local mirror); stubs today use a local placeholder.
+ * vs. local mirror); stubs today contain no implementation body.
+ *
+ * The concrete Phase 2 implementation will import PEN_DEFAULTS from
+ * ../geometry and ROOT_PEN_WIDTH / SIBLING_CORNER_RADIUS from
+ * ../layout/constants; those imports are intentionally omitted from
+ * this stub until the body exists, to keep the lint surface clean.
  */
 import type {Geometry, Rect} from '../geometry';
-import {ShapeKind} from '../model/tree';
-import {PEN_DEFAULTS} from '../geometry';
-import {ROOT_PEN_WIDTH, SIBLING_CORNER_RADIUS} from '../layout/constants';
+import type {ShapeKind} from '../model/tree';
 
 export type NodeFrameOptions = {
   /**
@@ -43,17 +49,5 @@ export function nodeFrame(
   _shape: ShapeKind,
   _opts: NodeFrameOptions = {},
 ): Geometry {
-  // Reference the imports so tsc+eslint are satisfied until the real
-  // implementation lands. A single array literal keeps the symbols
-  // live without tripping the `no-void` lint rule.
-  const _phase2Refs: readonly unknown[] = [
-    PEN_DEFAULTS,
-    ROOT_PEN_WIDTH,
-    SIBLING_CORNER_RADIUS,
-  ];
-  if (_phase2Refs.length < 0) {
-    // unreachable — here purely so the ref array is not dead code
-    throw new Error('unreachable');
-  }
   throw new Error('TODO(Phase 2, §F-IN-2): nodeFrame not implemented');
 }
