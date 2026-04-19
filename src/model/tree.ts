@@ -16,8 +16,11 @@
  * nodes here but is intentionally NOT carried into the marker
  * records — at Insert time the tree is fully expanded (§F-IN-2).
  *
- * Phase 1 (§9) fills in the mutator bodies; Phase 3 (marker) reads
- * this shape verbatim when encoding.
+ * Mutators in this module mutate the passed `Tree` in place and
+ * return whatever information the caller needs (new id, removed ids,
+ * etc.). The authoring canvas uses `cloneTree` before dispatching
+ * into a reducer so the reducer stays pure from the outside even
+ * though the helpers here are imperative.
  */
 
 export type NodeId = number;
@@ -71,55 +74,157 @@ export function createTree(): Tree {
 }
 
 /**
- * Add a RECTANGLE child to `parentId`. Returns the new node id.
- * Per §F-AC-3, shape is determined by the creating action, not by
- * depth.
- *
- * TODO(Phase 1): implement. Must:
- *   - reject if parentId does not exist
- *   - allocate id from tree.nextId
- *   - push id onto parent's childIds
- *   - insert into nodesById
+ * Deep-clone a tree so the caller can mutate the clone without
+ * affecting the original. Used by the authoring canvas reducer to
+ * keep dispatch pure even though the mutators below work in place.
  */
-export function addChild(_tree: Tree, _parentId: NodeId): NodeId {
-  throw new Error('TODO(Phase 1, §F-AC-3): addChild not implemented');
+export function cloneTree(tree: Tree): Tree {
+  const cloned = new Map<NodeId, MindmapNode>();
+  for (const [id, node] of tree.nodesById) {
+    cloned.set(id, {
+      id: node.id,
+      parentId: node.parentId,
+      shape: node.shape,
+      childIds: node.childIds.slice(),
+      collapsed: node.collapsed,
+    });
+  }
+  return {
+    rootId: tree.rootId,
+    nodesById: cloned,
+    nextId: tree.nextId,
+  };
 }
 
 /**
- * Add a ROUNDED_RECTANGLE sibling next to `nodeId` (i.e. a child of
- * nodeId's parent, inserted after nodeId in the parent's childIds).
- * Root has no siblings; calling this on the root must throw per
- * §F-AC-5 (Add Sibling is hidden, not disabled).
- *
- * TODO(Phase 1): implement.
+ * Look up a node; throw if missing. Internal helper to keep the
+ * mutator bodies small.
  */
-export function addSibling(_tree: Tree, _nodeId: NodeId): NodeId {
-  throw new Error('TODO(Phase 1, §F-AC-3): addSibling not implemented');
+function mustGet(tree: Tree, id: NodeId): MindmapNode {
+  const node = tree.nodesById.get(id);
+  if (!node) {
+    throw new Error(`tree: unknown node id ${id}`);
+  }
+  return node;
+}
+
+/**
+ * Allocate a fresh node, register it in `nodesById`, and return its
+ * id. Shared by addChild / addSibling — they differ only in the
+ * shape byte and in how the new id is linked into the parent's
+ * childIds, so the allocation bookkeeping lives here.
+ */
+function allocateNode(
+  tree: Tree,
+  parentId: NodeId,
+  shape: ShapeKind,
+): NodeId {
+  const id = tree.nextId;
+  tree.nextId += 1;
+  tree.nodesById.set(id, {
+    id,
+    parentId,
+    shape,
+    childIds: [],
+    collapsed: false,
+  });
+  return id;
+}
+
+/**
+ * Add a RECTANGLE child to `parentId`. Returns the new node id.
+ * Per §F-AC-3, shape is determined by the creating action, not by
+ * depth.
+ */
+export function addChild(tree: Tree, parentId: NodeId): NodeId {
+  const parent = mustGet(tree, parentId);
+  const id = allocateNode(tree, parentId, ShapeKind.RECTANGLE);
+  parent.childIds.push(id);
+  return id;
+}
+
+/**
+ * Add a ROUNDED_RECTANGLE sibling next to `nodeId` (a child of
+ * nodeId's parent, inserted immediately after nodeId in the
+ * parent's childIds). Root has no siblings; calling this on the
+ * root throws per §F-AC-5 (Add Sibling is hidden, not disabled, so
+ * reaching this code path is a programming error).
+ */
+export function addSibling(tree: Tree, nodeId: NodeId): NodeId {
+  const pivot = mustGet(tree, nodeId);
+  if (pivot.parentId === null) {
+    throw new Error('tree: addSibling on root is forbidden (§F-AC-5)');
+  }
+  const parent = mustGet(tree, pivot.parentId);
+  const id = allocateNode(tree, pivot.parentId, ShapeKind.ROUNDED_RECTANGLE);
+  const pivotIdx = parent.childIds.indexOf(nodeId);
+  // pivotIdx cannot be -1 — parent.childIds is the source of truth
+  // for parent/child linkage. If we ever find it missing, the tree
+  // is corrupt; surface loudly rather than appending silently.
+  if (pivotIdx < 0) {
+    throw new Error(
+      `tree: inconsistent state — node ${nodeId} not found in parent ${pivot.parentId}.childIds`,
+    );
+  }
+  parent.childIds.splice(pivotIdx + 1, 0, id);
+  return id;
 }
 
 /**
  * Delete the subtree rooted at `nodeId`. Deleting the root is
  * forbidden (§4.3, §F-AC-5). Returns the set of removed node ids so
  * callers (e.g. emit time) can drop associated label strokes.
- *
- * TODO(Phase 1): implement.
  */
-export function deleteSubtree(_tree: Tree, _nodeId: NodeId): Set<NodeId> {
-  throw new Error('TODO(Phase 1, §4.3): deleteSubtree not implemented');
+export function deleteSubtree(tree: Tree, nodeId: NodeId): Set<NodeId> {
+  const target = mustGet(tree, nodeId);
+  if (target.parentId === null) {
+    throw new Error('tree: cannot delete root (§4.3, §F-AC-5)');
+  }
+  const removed = new Set<NodeId>();
+  // Iterative DFS to avoid recursion depth surprises on pathological
+  // trees. Order does not matter — callers only care about set
+  // membership.
+  const stack: NodeId[] = [nodeId];
+  while (stack.length > 0) {
+    const id = stack.pop() as NodeId;
+    const node = tree.nodesById.get(id);
+    if (!node) {
+      continue;
+    }
+    removed.add(id);
+    for (const childId of node.childIds) {
+      stack.push(childId);
+    }
+    tree.nodesById.delete(id);
+  }
+  // Unlink from parent.
+  const parent = mustGet(tree, target.parentId);
+  const idx = parent.childIds.indexOf(nodeId);
+  if (idx >= 0) {
+    parent.childIds.splice(idx, 1);
+  }
+  return removed;
 }
 
 /**
  * Set collapsed state. Any node with ≥ 1 child may be collapsed
  * (§F-AC-5, §4.2) regardless of whether those children came from
- * addChild or addSibling. Leaves cannot be collapsed — enforce or
- * no-op, caller's choice, TBD in Phase 1.
+ * addChild or addSibling. Calling this on a leaf is a no-op so UI
+ * handlers can dispatch speculatively without guard races.
  */
 export function setCollapsed(
-  _tree: Tree,
-  _nodeId: NodeId,
-  _collapsed: boolean,
+  tree: Tree,
+  nodeId: NodeId,
+  collapsed: boolean,
 ): void {
-  throw new Error('TODO(Phase 1, §4.2): setCollapsed not implemented');
+  const node = mustGet(tree, nodeId);
+  if (node.childIds.length === 0) {
+    // Leaf: no-op. §F-AC-5 says the toggle is hidden on leaves; if
+    // we somehow get here, silently ignoring is safer than throwing
+    // from a UI callback.
+    return;
+  }
+  node.collapsed = collapsed;
 }
 
 /**
@@ -129,8 +234,22 @@ export function setCollapsed(
  * subtrees are still emitted — §F-IN-2 auto-expansion at Insert
  * time.
  *
- * TODO(Phase 1): implement.
+ * Order is depth-first, visiting children in their `childIds`
+ * order, starting from the root. The root is always index 0, which
+ * matches the §6.3 wire-format requirement.
  */
-export function flattenForEmit(_tree: Tree): MindmapNode[] {
-  throw new Error('TODO(Phase 1, §F-IN-2): flattenForEmit not implemented');
+export function flattenForEmit(tree: Tree): MindmapNode[] {
+  const out: MindmapNode[] = [];
+  const stack: NodeId[] = [tree.rootId];
+  while (stack.length > 0) {
+    const id = stack.pop() as NodeId;
+    const node = mustGet(tree, id);
+    out.push(node);
+    // Push children in reverse so the top-of-stack is the first
+    // child — this gives us left-to-right pre-order.
+    for (let i = node.childIds.length - 1; i >= 0; i -= 1) {
+      stack.push(node.childIds[i]);
+    }
+  }
+  return out;
 }
