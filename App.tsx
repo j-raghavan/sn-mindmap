@@ -1,6 +1,7 @@
-import React, {useEffect, useState} from 'react';
+import React, {useEffect, useMemo, useState} from 'react';
 import EditMindmap from './src/EditMindmap';
 import MindmapCanvas from './src/MindmapCanvas';
+import {addChild, addSibling, createTree, type Tree} from './src/model/tree';
 import {
   BUTTON_ID_EDIT_MINDMAP,
   BUTTON_ID_TOOLBAR,
@@ -40,6 +41,40 @@ function viewForButtonId(id: number | undefined): ActiveView {
   }
 }
 
+/**
+ * Build a small hand-coded demo tree for on-device testing of
+ * Phase 1.4a. Shape assignment follows §F-AC-3:
+ *   - root is OVAL (from createTree)
+ *   - addChild(parent) → RECTANGLE child
+ *   - addSibling(pivot) → ROUNDED_RECTANGLE sibling
+ *
+ * Topology (unbalanced so §F-LY-3's leaf-count slice math is
+ * visible on-device):
+ *
+ *              root (Oval)
+ *              /    |    \
+ *         ideas  tasks   notes
+ *          / \     |       |
+ *      A  B-sib   T1     (leaf)
+ *                 |
+ *                T2
+ *
+ * Replaced by the real tree reducer in Phase 1.4b; until then this
+ * fixture exists solely so the on-device APK renders something
+ * non-trivial when the toolbar Mindmap button is tapped.
+ */
+function buildDemoTree(): Tree {
+  const tree = createTree();
+  const ideas = addChild(tree, tree.rootId);
+  const tasks = addChild(tree, tree.rootId);
+  addChild(tree, tree.rootId); // "notes" — leaf
+  addChild(tree, ideas); // "A"
+  addSibling(tree, ideas); // "B-sib" — sibling of "ideas" under root.
+  const t1 = addChild(tree, tasks);
+  addChild(tree, t1); // "T2"
+  return tree;
+}
+
 export default function App(): React.JSX.Element {
   // Lazy initial state reads the router's cached "last event" synchronously
   // so the first render picks the right view. This matters because
@@ -50,6 +85,10 @@ export default function App(): React.JSX.Element {
   const [view, setView] = useState<ActiveView>(() =>
     viewForButtonId(getLastButtonEvent()?.id),
   );
+
+  // Build the demo tree once per App mount. Phase 1.4b will replace
+  // this with a real reducer state.
+  const demoTree = useMemo(() => buildDemoTree(), []);
 
   useEffect(() => {
     return subscribeToButtonEvents(event => {
@@ -63,5 +102,5 @@ export default function App(): React.JSX.Element {
 
   // Default: toolbar "Mindmap" (id=100) or unknown — show the authoring
   // canvas.
-  return <MindmapCanvas />;
+  return <MindmapCanvas initialTree={demoTree} />;
 }
