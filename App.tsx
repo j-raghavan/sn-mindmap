@@ -27,7 +27,17 @@ installPluginRouter();
 type ActiveView = 'authoring' | 'edit';
 
 function viewForButtonId(id: number | undefined): ActiveView {
-  return id === BUTTON_ID_EDIT_MINDMAP ? 'edit' : 'authoring';
+  // Explicit switch (rather than a ternary that only checks one id) so
+  // both §7.2 constants appear at the decision site — keeps the
+  // route table greppable and makes it a compile-time error if the
+  // ids ever drift out of the pluginRouter source of truth.
+  switch (id) {
+    case BUTTON_ID_EDIT_MINDMAP:
+      return 'edit';
+    case BUTTON_ID_TOOLBAR:
+    default:
+      return 'authoring';
+  }
 }
 
 export default function App(): React.JSX.Element {
@@ -52,8 +62,6 @@ export default function App(): React.JSX.Element {
   }
 
   // Default: toolbar "Mindmap" (id=100) or unknown — show the authoring
-  // canvas. Referencing the constant keeps the type-export alive and
-  // makes the mapping symmetric/greppable.
-  void BUTTON_ID_TOOLBAR;
+  // canvas.
   return <MindmapCanvas />;
 }

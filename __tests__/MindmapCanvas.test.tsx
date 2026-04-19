@@ -23,6 +23,8 @@ describe('MindmapCanvas (scaffold)', () => {
     expect(renderer).toBeDefined();
     const json = renderer!.toJSON();
     expect(json).toBeTruthy();
-    renderer!.unmount();
+    act(() => {
+      renderer!.unmount();
+    });
   });
 });

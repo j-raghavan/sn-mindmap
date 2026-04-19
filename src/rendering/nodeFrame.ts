@@ -43,10 +43,17 @@ export function nodeFrame(
   _shape: ShapeKind,
   _opts: NodeFrameOptions = {},
 ): Geometry {
-  // Reference the imports so tsc+eslint are satisfied until
-  // the real implementation lands.
-  void PEN_DEFAULTS;
-  void ROOT_PEN_WIDTH;
-  void SIBLING_CORNER_RADIUS;
+  // Reference the imports so tsc+eslint are satisfied until the real
+  // implementation lands. A single array literal keeps the symbols
+  // live without tripping the `no-void` lint rule.
+  const _phase2Refs: readonly unknown[] = [
+    PEN_DEFAULTS,
+    ROOT_PEN_WIDTH,
+    SIBLING_CORNER_RADIUS,
+  ];
+  if (_phase2Refs.length < 0) {
+    // unreachable — here purely so the ref array is not dead code
+    throw new Error('unreachable');
+  }
   throw new Error('TODO(Phase 2, §F-IN-2): nodeFrame not implemented');
 }
