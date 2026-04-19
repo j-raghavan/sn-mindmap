@@ -1,0 +1,10 @@
+{
+  "name": "Mindmap",
+  "desc": "Build mindmaps directly in your Supernote notes. Tap to add and connect nodes, then label them with your native pen. Re-edit later by lassoing.",
+  "iconPath": "assets/icon.png",
+  "versionName": "0.1.0",
+  "versionCode": "100",
+  "pluginID": "xl4pdqskm5sqfg0j",
+  "pluginKey": "SnMindmap",
+  "jsMainPath": "index"
+}

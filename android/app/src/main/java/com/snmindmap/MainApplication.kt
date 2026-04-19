@@ -1,4 +1,4 @@
-package com.snshapes
+package com.snmindmap
 
 import android.app.Application
 import com.facebook.react.PackageList
