@@ -20,9 +20,15 @@
  *
  * Phase 4 (§9) builds this in earnest. Phase 0 just stubs the entry
  * point so App.tsx can route to it.
+ *
+ * Phase 0 note: the placeholder renders a Close button that calls
+ * PluginManager.closePluginView(). Without it the plugin host sits
+ * on top of Notes forever — the platform has no implicit back
+ * gesture for plugin views.
  */
 import React from 'react';
-import {StyleSheet, Text, View} from 'react-native';
+import {Pressable, StyleSheet, Text, View} from 'react-native';
+import {PluginManager} from 'sn-plugin-lib';
 
 export default function EditMindmap(): React.JSX.Element {
   // Phase 0 placeholder. Phase 4 replaces this with the real
@@ -33,6 +39,12 @@ export default function EditMindmap(): React.JSX.Element {
       <Text style={styles.body}>
         Edit flow will appear here (Phase 4).
       </Text>
+      <Pressable
+        accessibilityRole="button"
+        onPress={() => PluginManager.closePluginView()}
+        style={({pressed}) => [styles.closeBtn, pressed && styles.closeBtnPressed]}>
+        <Text style={styles.closeBtnText}>Close</Text>
+      </Pressable>
     </View>
   );
 }
@@ -52,5 +64,22 @@ const styles = StyleSheet.create({
   body: {
     fontSize: 14,
     opacity: 0.7,
+    marginBottom: 32,
+    textAlign: 'center',
+  },
+  closeBtn: {
+    paddingVertical: 12,
+    paddingHorizontal: 32,
+    borderRadius: 8,
+    borderWidth: 2,
+    borderColor: '#000',
+  },
+  closeBtnPressed: {
+    backgroundColor: '#000',
+  },
+  closeBtnText: {
+    fontSize: 16,
+    fontWeight: '500',
+    color: '#000',
   },
 });

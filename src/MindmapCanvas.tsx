@@ -25,9 +25,16 @@
  * Phase 1 (§9) builds this component incrementally: tree + layout
  * first, then mutation UI, then pan/zoom. No insert, no marker, no
  * edit round-trip until Phase 2/3/4.
+ *
+ * Phase 0 note: the placeholder renders a Close button that calls
+ * PluginManager.closePluginView(). Without it the plugin host sits
+ * on top of Notes forever — from the user's perspective Notes
+ * appears hung — since the platform has no implicit back gesture
+ * for plugin views.
  */
 import React from 'react';
-import {StyleSheet, Text, View} from 'react-native';
+import {Pressable, StyleSheet, Text, View} from 'react-native';
+import {PluginManager} from 'sn-plugin-lib';
 
 export type MindmapCanvasProps = {
   /**
@@ -49,6 +56,12 @@ export default function MindmapCanvas(
       <Text style={styles.body}>
         Authoring canvas will appear here (Phase 1).
       </Text>
+      <Pressable
+        accessibilityRole="button"
+        onPress={() => PluginManager.closePluginView()}
+        style={({pressed}) => [styles.closeBtn, pressed && styles.closeBtnPressed]}>
+        <Text style={styles.closeBtnText}>Close</Text>
+      </Pressable>
     </View>
   );
 }
@@ -68,5 +81,22 @@ const styles = StyleSheet.create({
   body: {
     fontSize: 14,
     opacity: 0.7,
+    marginBottom: 32,
+    textAlign: 'center',
+  },
+  closeBtn: {
+    paddingVertical: 12,
+    paddingHorizontal: 32,
+    borderRadius: 8,
+    borderWidth: 2,
+    borderColor: '#000',
+  },
+  closeBtnPressed: {
+    backgroundColor: '#000',
+  },
+  closeBtnText: {
+    fontSize: 16,
+    fontWeight: '500',
+    color: '#000',
   },
 });
