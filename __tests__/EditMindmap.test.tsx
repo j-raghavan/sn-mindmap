@@ -329,7 +329,7 @@ describe('EditMindmap (Phase 4.3)', () => {
     });
   });
 
-  it('hides the Insert button on success (edit-mode Cancel-only until Phase 4.5)', async () => {
+  it('hides the Insert button on success (edit-mode swaps Insert → Save in Phase 4.5)', async () => {
     const tree = buildDecodedTree();
     const bboxes = buildDecodedBboxes(tree);
     mockGetLasso.mockResolvedValue({success: true, result: []});
@@ -345,10 +345,9 @@ describe('EditMindmap (Phase 4.3)', () => {
     });
     await flushAsync(renderer);
 
-    // Cancel is still present (it's the only way out in edit mode
-    // until Save lands in Phase 4.5). react-test-renderer surfaces
-    // the label on both the Pressable composite and its host View, so
-    // the count is > 1 — asserting >0 is enough.
+    // Cancel is still present. react-test-renderer surfaces the label
+    // on both the Pressable composite and its host View, so the count
+    // is > 1 — asserting >0 is enough.
     expect(findByAccessibilityLabel(renderer, 'Cancel').length).toBeGreaterThan(
       0,
     );
@@ -356,6 +355,8 @@ describe('EditMindmap (Phase 4.3)', () => {
     // always renders a Pressable labeled "Insert", so the count would
     // be > 0; asserting 0 exactly is the right regression guard.
     expect(findByAccessibilityLabel(renderer, 'Insert').length).toBe(0);
+    // Save takes Insert's place in edit mode (Phase 4.5 §F-ED-7).
+    expect(findByAccessibilityLabel(renderer, 'Save').length).toBeGreaterThan(0);
     act(() => {
       renderer.unmount();
     });
@@ -708,6 +709,183 @@ describe('EditMindmap (Phase 4.4) — preserved-stroke wiring', () => {
     expect(flat.height).toBe(10);
     act(() => {
       renderer.unmount();
+    });
+  });
+});
+
+describe('EditMindmap (Phase 4.5) — Save end-to-end (§F-ED-7)', () => {
+  // These tests prove the preEdit plumbing from EditMindmap →
+  // MindmapCanvas → insertMindmap works end-to-end. The lower-level
+  // insert pipeline, bucket-translation math, and Save button UX are
+  // exhaustively covered in insert.test.ts and MindmapCanvas.test.tsx
+  // respectively, so here we focus on wiring: after a successful
+  // decode + associate, tapping Save must trigger deleteLassoElements
+  // FIRST (§F-ED-7 step 0) followed by insertGeometry for the re-emit
+  // and eventually closePluginView. A failure in Save must keep the
+  // plugin view open with a visible error — echoing the first-insert
+  // error UX the Insert button already has.
+  const mockInsertGeometry = PluginCommAPI.insertGeometry as jest.Mock;
+  const mockLassoElements = PluginCommAPI.lassoElements as jest.Mock;
+  const mockDelete = PluginCommAPI.deleteLassoElements as jest.Mock;
+  const mockGetFile = PluginCommAPI.getCurrentFilePath as jest.Mock;
+  const mockGetPage = PluginCommAPI.getCurrentPageNum as jest.Mock;
+
+  beforeEach(() => {
+    mockGetLasso.mockReset();
+    mockClose.mockReset();
+    mockDecode.mockReset();
+    mockInsertGeometry.mockReset();
+    mockLassoElements.mockReset();
+    mockDelete.mockReset();
+    mockGetFile.mockReset();
+    mockGetPage.mockReset();
+
+    mockGetLasso.mockResolvedValue({success: true, result: []});
+    mockClose.mockResolvedValue(true);
+    mockInsertGeometry.mockResolvedValue({success: true});
+    mockLassoElements.mockResolvedValue({success: true});
+    mockDelete.mockResolvedValue({success: true});
+    mockGetFile.mockResolvedValue({
+      success: true,
+      result: '/note/test.note',
+    });
+    mockGetPage.mockResolvedValue({success: true, result: 0});
+  });
+
+  function buildTwoNodeTree(): {tree: Tree; childId: NodeId} {
+    const tree = createTree();
+    addChild(tree, tree.rootId);
+    const childId = tree.nodesById.get(tree.rootId)!.childIds[0];
+    return {tree, childId};
+  }
+
+  /**
+   * Run one Save-end-to-end setup: decode returns a two-node tree with
+   * mindmap-local bboxes + a markerOriginPage. The caller then taps
+   * Save and asserts on the mock call patterns.
+   */
+  async function mountForSave(
+    renderer: {current?: ReactTestRenderer},
+  ): Promise<void> {
+    const {tree, childId} = buildTwoNodeTree();
+    const mindmapLocalBboxes = new Map<NodeId, Rect>();
+    mindmapLocalBboxes.set(tree.rootId, {x: 0, y: 0, w: 220, h: 96});
+    mindmapLocalBboxes.set(childId, {x: 300, y: 0, w: 220, h: 96});
+    mockDecode.mockReturnValue({
+      ok: true,
+      tree,
+      nodeBboxesById: mindmapLocalBboxes,
+      markerOriginPage: {x: 400, y: 500},
+    });
+    act(() => {
+      renderer.current = create(<EditMindmap />);
+    });
+    await flushAsync(renderer.current!);
+  }
+
+  it('renders the Save button (not Insert) once the decode completes', async () => {
+    const ref: {current?: ReactTestRenderer} = {};
+    await mountForSave(ref);
+    expect(findByAccessibilityLabel(ref.current!, 'Save').length).toBeGreaterThan(0);
+    expect(findByAccessibilityLabel(ref.current!, 'Insert').length).toBe(0);
+    act(() => {
+      ref.current!.unmount();
+    });
+  });
+
+  it('tapping Save calls deleteLassoElements BEFORE any insertGeometry', async () => {
+    const ref: {current?: ReactTestRenderer} = {};
+    await mountForSave(ref);
+    // Track call order by recording the call index as a side-effect.
+    const order: string[] = [];
+    mockDelete.mockImplementation(async () => {
+      order.push('delete');
+      return {success: true};
+    });
+    mockInsertGeometry.mockImplementation(async () => {
+      order.push('insert');
+      return {success: true};
+    });
+    const saveBtns = findByAccessibilityLabel(ref.current!, 'Save');
+    // The Pressable composite exposes onPress; the host View doesn't.
+    const pressable = saveBtns.find(
+      n => typeof n.props.onPress === 'function',
+    );
+    expect(pressable).toBeDefined();
+    await act(async () => {
+      (pressable!.props.onPress as () => void)();
+      // Flush microtasks until the pipeline settles (delete → emit →
+      // insert → lasso → close is a handful of awaits).
+      for (let i = 0; i < 10; i++) {
+        await Promise.resolve();
+      }
+    });
+    expect(mockDelete).toHaveBeenCalledTimes(1);
+    expect(mockInsertGeometry.mock.calls.length).toBeGreaterThan(0);
+    // Order: delete must precede the first insertGeometry call.
+    expect(order[0]).toBe('delete');
+    expect(order.slice(1).every(x => x === 'insert')).toBe(true);
+    // And the plugin view closes at the end.
+    expect(mockLassoElements).toHaveBeenCalledTimes(1);
+    expect(mockClose).toHaveBeenCalledTimes(1);
+    act(() => {
+      ref.current!.unmount();
+    });
+  });
+
+  it('surfaces a Save error banner (and keeps the plugin open) when deleteLassoElements fails', async () => {
+    const ref: {current?: ReactTestRenderer} = {};
+    await mountForSave(ref);
+    mockDelete.mockResolvedValue({
+      success: false,
+      error: {message: 'firmware lock'},
+    });
+    const saveBtns = findByAccessibilityLabel(ref.current!, 'Save');
+    const pressable = saveBtns.find(
+      n => typeof n.props.onPress === 'function',
+    );
+    await act(async () => {
+      (pressable!.props.onPress as () => void)();
+      for (let i = 0; i < 10; i++) {
+        await Promise.resolve();
+      }
+    });
+    // On Save failure: delete was attempted, but nothing downstream
+    // ran and the plugin view stays open so the user can retry.
+    expect(mockDelete).toHaveBeenCalledTimes(1);
+    expect(mockInsertGeometry).not.toHaveBeenCalled();
+    expect(mockLassoElements).not.toHaveBeenCalled();
+    expect(mockClose).not.toHaveBeenCalled();
+    // The Save button's error banner uses MindmapCanvas's insertError
+    // surface (label="insert-error"). We descend into its Text child
+    // and assert the firmware message bubbles up (same UX as the Phase
+    // 2.2 Insert error flow). Walking children manually avoids
+    // stringifying react-test-renderer nodes (which are circular).
+    const errBanners = ref.current!.root.findAll(
+      n =>
+        typeof n.type === 'string' &&
+        n.props.accessibilityLabel === 'insert-error',
+    );
+    expect(errBanners.length).toBeGreaterThan(0);
+    const firstBanner = errBanners[0];
+    // The banner's sole child is a <Text> whose children is the string.
+    const collectStrings = (node: unknown): string[] => {
+      if (typeof node === 'string') {
+        return [node];
+      }
+      if (Array.isArray(node)) {
+        return node.flatMap(collectStrings);
+      }
+      if (node && typeof node === 'object' && 'props' in node) {
+        const children = (node as {props: {children?: unknown}}).props.children;
+        return collectStrings(children);
+      }
+      return [];
+    };
+    const textBits = collectStrings(firstBanner.props.children);
+    expect(textBits.some(s => s.includes('firmware lock'))).toBe(true);
+    act(() => {
+      ref.current!.unmount();
     });
   });
 });

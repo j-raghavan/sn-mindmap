@@ -1,7 +1,7 @@
 /**
- * High-level insert flow (§5.3, §F-IN-1..F-IN-5).
+ * High-level insert flow (§5.3, §F-IN-1..F-IN-5; §F-ED-7 on re-insert).
  *
- * Sequence:
+ * First-insert sequence:
  *   1. resolvePageSize() — the three-step fall-through from
  *      sn-shapes/src/ShapePalette.tsx via PluginCommAPI
  *      getCurrentFilePath -> getCurrentPageNum -> PluginFileAPI
@@ -12,13 +12,10 @@
  *   4. Fit-to-page scale if wider than the page (§F-LY-6). Applies
  *      to node positions and outline dimensions; preserved label
  *      strokes on re-insert are TRANSLATED, not scaled, so they pass
- *      through the scale step untouched (the caller is responsible
- *      for translating them into the post-edit layout's coordinates
- *      per §F-ED-7 before handing them to us).
+ *      through the scale step untouched.
  *   5. Emit geometries via ./rendering/emitGeometries.ts — outlines,
- *      connectors, marker (Phase 3 splice point), and on re-insert
- *      preserved label strokes. Every emission sets
- *      showLassoAfterInsert: false (§F-IN-3).
+ *      connectors, marker, and on re-insert preserved label strokes.
+ *      Every emission sets showLassoAfterInsert: false (§F-IN-3).
  *   6. Insert via PluginCommAPI.insertGeometry one-at-a-time. We do
  *      NOT batch via PluginFileAPI.insertElements yet — §F-IN-3
  *      flags it as a future path ("when stable"), and a partial
@@ -28,19 +25,52 @@
  *      auto-select the whole block (§F-IN-3 / §11).
  *   8. PluginManager.closePluginView() to dismiss (§F-IN-4).
  *
+ * Re-insert (Save) sequence — triggered by an optional `preEdit`
+ * context on InsertInput (§F-ED-7):
+ *   0. After resolving page size, call
+ *      PluginCommAPI.deleteLassoElements() to remove the previously-
+ *      inserted mindmap from the page. EditMindmap enters through the
+ *      lasso-toolbar "Edit Mindmap" entry, so the firmware's lasso is
+ *      already wrapped around the old block — a single
+ *      deleteLassoElements clears the whole thing (outlines,
+ *      connectors, marker bits, and preserved label strokes).
+ *   2a. After step 4's fit-to-page, compute per-node MOVE DELTA:
+ *           delta = postEditPageBbox.topLeft - preEditPageBbox.topLeft
+ *       for every node present in BOTH the pre-edit and post-edit
+ *       layouts. Strokes for nodes that exist only pre-edit (deleted
+ *       subtree) are dropped; nodes that exist only post-edit (new
+ *       Add Child / Add Sibling) have no strokes to translate.
+ *   2b. translateStrokes(bucket, delta) for each surviving bucket.
+ *       Rigid translation only — no scale, rotate, or resample
+ *       (§F-LY-6, §8.1). This preserves every stroke's original pen
+ *       style and point list, modulo the coordinate shift.
+ *   5. Hand the translated bucket to emitGeometries as the existing
+ *      preservedStrokesByNode param. The remaining insert / lasso /
+ *      close steps run unchanged.
+ *
  * Error handling (§F-IN-5): on any failure after one or more
  * geometries have been inserted, best-effort cleanup by lassoing the
  * partial union rect and calling deleteLassoElements before
  * re-raising to the UI. Cleanup failures are swallowed — the original
  * error is what the user needs to act on, and manual cleanup is
  * acceptable for v0.1.
+ *
+ * Save-specific failure modes:
+ *   - deleteLassoElements (step 0) failure aborts the whole save
+ *     before any new geometry lands on the page, so no cleanup is
+ *     needed and the user's old mindmap stays intact.
+ *   - Any failure during the post-delete insert loop leaves the page
+ *     in a mixed state: the old mindmap has been removed, and the
+ *     partial new emit is cleaned up by the standard §F-IN-5 path.
+ *     v0.1 accepts that the user may see an empty page and need to
+ *     undo; we do not attempt to restore the original strokes.
  */
 import {PluginCommAPI, PluginFileAPI, PluginManager} from 'sn-plugin-lib';
 
 import type {Geometry, Rect} from './geometry';
 import type {LayoutResult} from './layout/radial';
 import {radialLayout} from './layout/radial';
-import type {StrokeBucket} from './model/strokes';
+import {translateStrokes, type StrokeBucket} from './model/strokes';
 import {cloneTree, type NodeId, type Tree} from './model/tree';
 import {emitGeometries} from './rendering/emitGeometries';
 
@@ -70,16 +100,55 @@ type ApiRes<T> =
   | null
   | undefined;
 
+/**
+ * Pre-edit context needed to translate preserved label strokes from
+ * the pre-edit layout into the post-edit layout's coordinates on
+ * Save. Supplied by EditMindmap on the §F-ED-7 round-trip — the
+ * plugin holds neither the pre-edit layout nor the strokes outside
+ * edit mode, so everything insertMindmap needs to reconstruct the
+ * move delta lives in this bundle.
+ *
+ * - `preEditPageBboxes`: where each node WAS in page coords (decoder
+ *   nodeBboxesById shifted by markerOriginPage), keyed by the
+ *   decoder's post-decode NodeId.
+ * - `strokesByNodePage`: associateStrokes output in PAGE coords —
+ *   each stroke lives at its original pen-captured page coordinate.
+ *   Not pre-translated by the caller; insertMindmap applies the
+ *   delta internally so the cross-coord-system knowledge stays in
+ *   one place (§F-ED-7).
+ */
+export type PreEditContext = {
+  preEditPageBboxes: Map<NodeId, Rect>;
+  strokesByNodePage: StrokeBucket;
+};
+
 export type InsertInput = {
   tree: Tree;
   /**
-   * Only supplied on re-insert from edit mode (§F-ED-7). On
-   * first-insert this is undefined — the plugin never owns labels
-   * at initial authoring (§F-IN-2 step 3). When supplied, callers
-   * MUST have already translated each bucket into post-edit
-   * coordinates; we pass them through emitGeometries as-is.
+   * Only supplied on re-insert from edit mode (§F-ED-7). Present →
+   * insertMindmap:
+   *   1. Calls PluginCommAPI.deleteLassoElements() right after
+   *      page-size resolution to clear the pre-edit mindmap from
+   *      the page (the lasso is already wrapped around it, courtesy
+   *      of the "Edit Mindmap" entry point).
+   *   2. Computes a per-node move delta
+   *        postEditPageBbox.topLeft − preEditPageBbox.topLeft
+   *      for every node in both the pre-edit and post-edit layouts.
+   *   3. Translates each node's stroke bucket by its delta (rigid —
+   *      no scaling, §F-LY-6).
+   *   4. Drops strokes for nodes that no longer exist in the
+   *      post-edit tree (the user deleted a subtree). Strokes for
+   *      newly-added nodes never existed pre-edit, so there's
+   *      nothing to translate for them either.
+   *   5. Hands the translated bucket to emitGeometries via the same
+   *      preservedStrokesByNode path the first-insert flow has
+   *      always supported (the first-insert flow just always passes
+   *      `undefined`).
+   *
+   * Undefined → first-insert. The plugin never owns labels at
+   * initial authoring (§F-IN-2 step 3).
    */
-  preservedStrokesByNode?: StrokeBucket;
+  preEdit?: PreEditContext;
 };
 
 /**
@@ -89,6 +158,22 @@ export type InsertInput = {
  */
 export async function insertMindmap(input: InsertInput): Promise<void> {
   const {width: pageWidth, height: pageHeight} = await resolvePageSize();
+
+  // §F-ED-7 step 0 — re-insert path only. Delete the pre-edit
+  // mindmap from the page BEFORE we start emitting the new one. The
+  // "Edit Mindmap" entry leaves the lasso wrapped around the old
+  // block, so a single deleteLassoElements reclaims everything
+  // (outlines, connectors, marker strokes, preserved label strokes).
+  // Done before layout/emit so a failure here leaves the old mindmap
+  // intact and we can throw cleanly — no partial state to clean up.
+  if (input.preEdit !== undefined) {
+    const delRes = (await PluginCommAPI.deleteLassoElements()) as ApiRes<boolean>;
+    if (!delRes?.success) {
+      throw new Error(
+        delRes?.error?.message ?? 'deleteLassoElements failed',
+      );
+    }
+  }
 
   // §F-IN-2 step 0 — auto-expand every subtree so the layout + emit
   // passes see the fully expanded tree. We clone so the caller's
@@ -121,6 +206,15 @@ export async function insertMindmap(input: InsertInput): Promise<void> {
     pageHeight,
   );
 
+  // §F-ED-7 — compute post-edit stroke bucket. For first-insert this
+  // is undefined (the plugin doesn't own labels at authoring time).
+  // For Save, we translate every pre-edit bucket by its node's move
+  // delta; nodes deleted in this edit session drop out silently.
+  const preservedStrokesByNode =
+    input.preEdit === undefined
+      ? undefined
+      : translateStrokesForSave(input.preEdit, pageLayout.bboxes);
+
   // §F-IN-2 — assemble the geometry list (outlines, connectors,
   // marker, preserved strokes on re-insert).
   //
@@ -134,7 +228,7 @@ export async function insertMindmap(input: InsertInput): Promise<void> {
   const {geometries, unionRect} = emitGeometries({
     tree: expanded,
     layout: pageLayout,
-    preservedStrokesByNode: input.preservedStrokesByNode,
+    preservedStrokesByNode,
   });
 
   // §F-IN-3 — sequential insertGeometry with showLassoAfterInsert
@@ -209,6 +303,60 @@ async function resolvePageSize(): Promise<{width: number; height: number}> {
     // Fall through to defaults.
   }
   return {width: DEFAULT_PAGE_WIDTH, height: DEFAULT_PAGE_HEIGHT};
+}
+
+/**
+ * §F-ED-7 — per-node stroke translation for Save.
+ *
+ * Given the pre-edit page bboxes and stroke buckets carried over from
+ * EditMindmap, plus the FRESH post-edit page bboxes computed by
+ * transformLayout, produce a new bucket whose strokes live in
+ * post-edit page coordinates.
+ *
+ * Algorithm:
+ *   For every (nodeId, strokes) in preEdit.strokesByNodePage:
+ *     - look up preEditBbox for that id → if missing, drop bucket.
+ *       Missing pre-edit bbox is a decoder-vs-associator mismatch that
+ *       shouldn't happen in practice but isn't worth crashing over.
+ *     - look up postEditBbox for that id → if missing, drop bucket.
+ *       This is the "user deleted this subtree during edit" case. The
+ *       strokes simply go with the node (§F-ED-7 doesn't specify an
+ *       orphan destination and there isn't a sensible one — the node
+ *       is gone, so its labels go with it).
+ *     - delta = postEditBbox.topLeft − preEditBbox.topLeft.
+ *     - translateStrokes(strokes, delta) → post-edit page coords.
+ *
+ * Pure function — preEdit and the post-edit bbox map are untouched;
+ * translateStrokes itself never mutates inputs. Stable iteration
+ * order: the returned Map preserves insertion order from
+ * preEdit.strokesByNodePage, which was built in the decoder's BFS
+ * order (so tests and logs can rely on a deterministic layout).
+ *
+ * Newly-added nodes never appear as keys in preEdit.strokesByNodePage
+ * because strokes came from the pre-edit lasso; they therefore end up
+ * with no preserved strokes automatically, which is the right
+ * behavior — the user hasn't written any labels for them yet.
+ */
+function translateStrokesForSave(
+  preEdit: PreEditContext,
+  postEditPageBboxes: Map<NodeId, Rect>,
+): StrokeBucket {
+  const out: StrokeBucket = new Map();
+  for (const [id, strokes] of preEdit.strokesByNodePage) {
+    const pre = preEdit.preEditPageBboxes.get(id);
+    const post = postEditPageBboxes.get(id);
+    if (!pre || !post) {
+      // Either a decoder/associator mismatch (pre missing) or the
+      // node was deleted in this edit session (post missing). Drop
+      // the bucket silently — §F-ED-7 has no restoration path for
+      // deleted subtrees' labels, and a hard error here would
+      // block every Save whose user deleted anything.
+      continue;
+    }
+    const delta = {x: post.x - pre.x, y: post.y - pre.y};
+    out.set(id, translateStrokes(strokes, delta));
+  }
+  return out;
 }
 
 /**

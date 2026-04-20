@@ -84,7 +84,7 @@ import {
   STANDARD_PEN_WIDTH,
 } from './layout/constants';
 import type {Point, Rect} from './geometry';
-import {insertMindmap} from './insert';
+import {insertMindmap, type PreEditContext} from './insert';
 import type {
   OutOfMapStrokes,
   PreservedStroke,
@@ -158,15 +158,37 @@ export type MindmapCanvasProps = {
   /**
    * When true, the canvas is running inside the edit round-trip
    * (§5.4). Current behavior:
-   *   - The Insert button is hidden. "Save" (§F-ED-7) lands in Phase
-   *     4.5; until then, edit-mode is Cancel-only and any topology
-   *     edits are discarded on Cancel. This is an intentional WIP
-   *     state — EditMindmap notes the same caveat.
+   *   - The Insert button is replaced by a "Save" button. Tapping
+   *     Save runs the §F-ED-7 round-trip: deleteLassoElements on the
+   *     pre-edit mindmap, then emit + insert + lasso + close around
+   *     the post-edit mindmap, with preserved label strokes
+   *     translated by each node's move delta.
+   *   - If `preEdit` is omitted, Save is still rendered but will
+   *     call insertMindmap without a pre-edit context — the new
+   *     mindmap lands on the page without deleting the old one
+   *     first. This is a defensive degraded mode; EditMindmap
+   *     always supplies preEdit in the normal flow.
    *
    * Authoring (isEditMode false / omitted) is the §F-AC-* flow: the
    * Insert button runs the full §F-IN-* pipeline.
    */
   isEditMode?: boolean;
+  /**
+   * Pre-edit context bundle for the §F-ED-7 Save flow. When present
+   * and `isEditMode` is true, Save will hand this to insertMindmap,
+   * which (a) calls deleteLassoElements to clear the pre-edit
+   * mindmap, (b) computes per-node move delta postEdit − preEdit,
+   * and (c) translates preserved label strokes by that delta before
+   * re-emitting. Supplied by EditMindmap; omitted on the authoring
+   * canvas.
+   *
+   * Held but not inspected by MindmapCanvas — it's pure plumbing
+   * from EditMindmap to insertMindmap. The fields inside are the
+   * pre-edit page bboxes (used by insertMindmap to reconstruct the
+   * delta) and the raw page-coord stroke buckets (translateStrokes
+   * is applied internally).
+   */
+  preEdit?: PreEditContext;
   /**
    * Preserved label strokes bucketed by NodeId (Phase 4.4 / §F-ED-6).
    *
@@ -254,12 +276,14 @@ export default function MindmapCanvas({
   isEditMode = false,
   initialPreservedStrokes,
   // initialOutOfMapStrokes is held on the props contract for Phase 4.6
-  // (pre-Save out-of-map confirmation dialog). Phase 4.4 intentionally
-  // does not consume it — the strokes aren't rendered and no Save path
-  // exists yet. Listed in destructuring so the contract stays visible
-  // in the component signature even though it's currently a no-op.
-  // The underscore prefix opts out of no-unused-vars for Phase 4.4.
+  // (pre-Save out-of-map confirmation dialog). Phase 4.5 intentionally
+  // does not consume it — the strokes aren't rendered and the Save
+  // flow doesn't gate on them yet. Listed in destructuring so the
+  // contract stays visible in the component signature even though
+  // it's currently a no-op. The underscore prefix opts out of
+  // no-unused-vars until Phase 4.6 wires it up.
   initialOutOfMapStrokes: _initialOutOfMapStrokes,
+  preEdit,
 }: MindmapCanvasProps = {}): React.JSX.Element {
   // The initial-state arg is called lazily by React, so cloning only
   // happens on mount. The clone is important: callers may reuse the
@@ -454,6 +478,41 @@ export default function MindmapCanvas({
     }
   }, [tree, showInsertError]);
 
+  /**
+   * Handle Save tap (§F-ED-7, Phase 4.5). Same debounce/error-banner
+   * UX as Insert; the only difference is that we pass `preEdit` so
+   * insertMindmap takes the re-insert branch (delete old mindmap
+   * first, translate preserved label strokes by each node's move
+   * delta, then emit + insert + lasso + close around the post-edit
+   * tree).
+   *
+   * Shares the isInserting state with Insert so the same pending-
+   * spinner / disabled-button UX applies — the two buttons are
+   * mutually exclusive by isEditMode, so there's no risk of a race
+   * between them.
+   */
+  const handleSave = useCallback(async () => {
+    if (insertingRef.current) {
+      return;
+    }
+    insertingRef.current = true;
+    setIsInserting(true);
+    setInsertError(null);
+    if (errorTimerRef.current) {
+      clearTimeout(errorTimerRef.current);
+      errorTimerRef.current = null;
+    }
+    try {
+      await insertMindmap({tree, preEdit});
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Save failed';
+      showInsertError(message);
+    } finally {
+      insertingRef.current = false;
+      setIsInserting(false);
+    }
+  }, [tree, preEdit, showInsertError]);
+
   return (
     <View style={styles.root}>
       <View style={styles.topBar}>
@@ -498,16 +557,21 @@ export default function MindmapCanvas({
         </Pressable>
         <View style={styles.topBarSpacer} />
         {/*
-         * Insert button — §F-AC-8. Always enabled because the tree
-         * always has ≥ 1 node; the only reason it's locally disabled
-         * is while an insert is already in flight, to debounce double
-         * taps during the §F-NF-2 ≤ 2.0 s budget.
+         * Insert / Save button — §F-AC-8 for first-insert, §F-ED-7
+         * for re-insert. Always enabled because the tree always has
+         * ≥ 1 node; the only reason it's locally disabled is while
+         * an insert is already in flight, to debounce double taps
+         * during the §F-NF-2 ≤ 2.0 s budget.
          *
-         * Hidden entirely in edit mode (Phase 4.3 WIP state — see
-         * MindmapCanvasProps.isEditMode): Save lands in Phase 4.5.
-         * Rendering the button with a Save label now would mislead
-         * users into thinking their edits persist, when in fact
-         * Phase 4.3 through early Phase 4.5 has no round-trip save.
+         * Authoring (isEditMode=false) → "Insert" fires the
+         * §F-IN-* pipeline. Edit (isEditMode=true) → "Save" fires
+         * the §F-ED-7 round-trip (delete pre-edit mindmap, then
+         * emit + insert + lasso + close with preserved label
+         * strokes translated by each node's move delta). The two
+         * buttons are mutually exclusive — only one shape of this
+         * button ever renders, with a distinct accessibilityLabel
+         * so tests and on-device tooling can target whichever flow
+         * they're exercising.
          */}
         {!isEditMode && (
           <Pressable
@@ -527,6 +591,27 @@ export default function MindmapCanvas({
                 isInserting && styles.topBarBtnTextDisabled,
               ]}>
               {isInserting ? 'Inserting…' : 'Insert'}
+            </Text>
+          </Pressable>
+        )}
+        {isEditMode && (
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Save"
+            accessibilityState={{disabled: isInserting}}
+            disabled={isInserting}
+            onPress={handleSave}
+            style={({pressed}) => [
+              styles.topBarBtn,
+              pressed && !isInserting && styles.topBarBtnPressed,
+              isInserting && styles.topBarBtnDisabled,
+            ]}>
+            <Text
+              style={[
+                styles.topBarBtnText,
+                isInserting && styles.topBarBtnTextDisabled,
+              ]}>
+              {isInserting ? 'Saving…' : 'Save'}
             </Text>
           </Pressable>
         )}

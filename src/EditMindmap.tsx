@@ -10,19 +10,18 @@
  *      reason message and offer a Close button to dismiss the plugin.
  *   4. If decode succeeds: mount MindmapCanvas with the decoded tree
  *      pre-populated (§F-ED-6).
- *   5. On Save (Phase 4.5 / §F-ED-7): translate preserved label
- *      strokes by each node's move delta, then deleteLassoElements →
+ *   5. On Save (Phase 4.5 / §F-ED-7): hand the preEdit context
+ *      (pre-edit page bboxes + page-coord stroke buckets) through
+ *      to MindmapCanvas, which forwards it to insertMindmap on the
+ *      Save tap. insertMindmap then calls deleteLassoElements →
+ *      translate preserved strokes by each node's move delta →
  *      emit → insert → lasso(unionRect) → closePluginView.
  *
- * Phase 4.4 scope (this revision): steps 1-4 plus in-map
- * preserved-stroke routing (§F-ED-5) and rendering (§F-ED-6). The
- * Save button is still gated — §F-ED-7 lands in Phase 4.5. Until
- * then, MindmapCanvas is mounted with isEditMode=true, which hides
- * Insert; edit mode is Cancel-only and any topology edits are
- * discarded on Cancel. That's the correct WIP behavior for the gap
- * between Phase 4.4 and Phase 4.5, and matches how the plugin would
- * behave if a user opened edit mode before the save pipeline is
- * wired.
+ * Phase 4.5 scope (this revision): all five steps. EditMindmap's
+ * responsibility ends at handing the preEdit bundle to
+ * MindmapCanvas; the round-trip mechanics (delete + translate +
+ * emit + insert) live in insertMindmap so the cross-coord-system
+ * logic stays in one place alongside the first-insert pipeline.
  *
  * Decoder-to-associator data flow (Phase 4.4):
  *   1. decodeMarker returns nodeBboxesById in MINDMAP-LOCAL coords
@@ -261,20 +260,31 @@ export default function EditMindmap(): React.JSX.Element {
     );
   }
 
-  // phase.kind === 'ready'. MindmapCanvas in edit mode hides Insert
-  // until the Save path lands in Phase 4.5. Until then, Cancel is
-  // the only exit and any edits are discarded — acceptable WIP
-  // behavior while §F-ED-7 is under construction.
+  // phase.kind === 'ready'. MindmapCanvas in edit mode shows a Save
+  // button (Phase 4.5 / §F-ED-7) — tapping it invokes the round-trip
+  // delete + re-emit pipeline via insertMindmap. Cancel is still an
+  // exit (discards edits and closes the plugin view).
   //
   // Phase 4.4: we also pass preserved label strokes (node-local for
   // the canvas's render path) and the out-of-map bucket (held for
   // Phase 4.6's pre-Save confirmation dialog).
+  //
+  // Phase 4.5: we additionally pass `preEdit` — the pre-edit page
+  // bboxes and page-coord stroke buckets — which insertMindmap uses
+  // on Save to compute per-node move delta and translate preserved
+  // strokes into post-edit page coordinates. The canvas holds this
+  // opaquely and forwards it to insertMindmap on the Save-button
+  // handler; none of it is consumed by the canvas itself.
   return (
     <MindmapCanvas
       initialTree={phase.tree}
       isEditMode
       initialPreservedStrokes={phase.preservedStrokesByNodeLocal}
       initialOutOfMapStrokes={phase.outOfMapStrokes}
+      preEdit={{
+        preEditPageBboxes: phase.pageBboxesById,
+        strokesByNodePage: phase.preservedStrokesByNodePage,
+      }}
     />
   );
 }

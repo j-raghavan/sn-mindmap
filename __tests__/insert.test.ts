@@ -40,11 +40,13 @@ jest.mock('sn-plugin-lib', () => ({
 
 import {PluginCommAPI, PluginFileAPI, PluginManager} from 'sn-plugin-lib';
 
+import type {Geometry, Rect} from '../src/geometry';
 import {
   DEFAULT_PAGE_HEIGHT,
   DEFAULT_PAGE_WIDTH,
   INSERT_MARGIN_PX,
   insertMindmap,
+  type PreEditContext,
 } from '../src/insert';
 import {radialLayout} from '../src/layout/radial';
 import {
@@ -52,10 +54,13 @@ import {
   MARKER_PUBLISHED_NODE_CAP,
   MarkerCapacityError,
 } from '../src/marker/encode';
+import type {StrokeBucket} from '../src/model/strokes';
 import {
   addChild,
   createTree,
+  deleteSubtree,
   setCollapsed,
+  type NodeId,
   type Tree,
 } from '../src/model/tree';
 
@@ -511,5 +516,313 @@ describe('insertMindmap — marker capacity (§F-PE-4)', () => {
     expect(nonMarkerInserts(insertCalls).length).toBe(
       2 * MARKER_PUBLISHED_NODE_CAP - 1,
     );
+  });
+});
+
+describe('insertMindmap — Save round-trip (§F-ED-7)', () => {
+  /**
+   * Minimal stroke fixture at a known page-coord position. We use
+   * polylines (GEO_polygon / straightLine) because they carry a
+   * `points` array that makes before/after translation assertions
+   * direct: every point shifts by the same (dx, dy).
+   *
+   * penType=10 (Fineliner) satisfies the firmware allow-list; tests
+   * that filter by pen color use 0x00 (black) so a simple filter
+   * separates preserved strokes from the 0x9D marker bits.
+   */
+  function polyline(points: Array<{x: number; y: number}>): Geometry {
+    return {
+      type: 'GEO_polygon',
+      points,
+      penColor: 0x00,
+      penType: 10,
+      penWidth: 400,
+      showLassoAfterInsert: true,
+    };
+  }
+
+  /**
+   * Extract preserved-stroke inserts from the insertGeometry mock
+   * call log. Preserved strokes survive emit with their original
+   * `points` array translated by the move delta, so we can
+   * fingerprint them by their fixture's exact point count (2) —
+   * rectangular outlines are 5-point closed polygons, oval outlines
+   * sample at 64+ points, and marker strokes carry penColor 0x9D.
+   * A 2-point GEO_polygon with penColor != marker is always one of
+   * our preserved fixtures.
+   */
+  function preservedStrokeInserts(
+    insertCalls: Array<[{penColor?: number; type?: string; points?: Array<{x: number; y: number}>}]>,
+  ): Array<Array<{x: number; y: number}>> {
+    const out: Array<Array<{x: number; y: number}>> = [];
+    for (const [g] of insertCalls) {
+      if (g.type !== 'GEO_polygon' || g.penColor === MARKER_PEN_COLOR) {
+        continue;
+      }
+      const pts = g.points;
+      if (!pts || pts.length !== 2) {
+        continue;
+      }
+      out.push(pts);
+    }
+    return out;
+  }
+
+  /**
+   * Re-capture per-node page bboxes that insertMindmap just produced.
+   * Used by tests to assert that strokes landed at the expected
+   * post-edit page coordinates. We compute it the same way
+   * insertMindmap does: radialLayout + fit-to-page, so the numbers
+   * stay in sync with the orchestrator without poking at private
+   * helpers.
+   */
+  function postEditPageBboxes(tree: Tree): Map<NodeId, Rect> {
+    const base = radialLayout(tree);
+    const available = DEFAULT_PAGE_WIDTH - 2 * INSERT_MARGIN_PX;
+    const availableH = DEFAULT_PAGE_HEIGHT - 2 * INSERT_MARGIN_PX;
+    const scale = Math.min(
+      1,
+      available / Math.max(1, base.unionBbox.w),
+      availableH / Math.max(1, base.unionBbox.h),
+    );
+    const scaledU = {
+      x: base.unionBbox.x * scale,
+      y: base.unionBbox.y * scale,
+      w: base.unionBbox.w * scale,
+      h: base.unionBbox.h * scale,
+    };
+    const tx = DEFAULT_PAGE_WIDTH / 2 - (scaledU.x + scaledU.w / 2);
+    const ty = DEFAULT_PAGE_HEIGHT / 2 - (scaledU.y + scaledU.h / 2);
+    const out = new Map<NodeId, Rect>();
+    for (const [id, r] of base.bboxes) {
+      out.set(id, {
+        x: r.x * scale + tx,
+        y: r.y * scale + ty,
+        w: r.w * scale,
+        h: r.h * scale,
+      });
+    }
+    return out;
+  }
+
+  it('calls deleteLassoElements BEFORE any insertGeometry when preEdit is present', async () => {
+    const tree = buildSmallTree();
+    const post = postEditPageBboxes(tree);
+    // Fabricate a matching pre-edit: identical bboxes (delta=0) so
+    // the "clears old mindmap" assertion doesn't depend on the
+    // delta math. Empty stroke bucket — this test is about
+    // ordering, not stroke translation.
+    const preEdit: PreEditContext = {
+      preEditPageBboxes: new Map(post),
+      strokesByNodePage: new Map(),
+    };
+
+    await insertMindmap({tree, preEdit});
+
+    expect(PluginCommAPI.deleteLassoElements).toHaveBeenCalledTimes(1);
+    const delOrder = asMock(PluginCommAPI.deleteLassoElements).mock
+      .invocationCallOrder[0];
+    const firstInsertOrder = asMock(PluginCommAPI.insertGeometry).mock
+      .invocationCallOrder[0];
+    expect(firstInsertOrder).toBeGreaterThan(delOrder);
+  });
+
+  it('does NOT call deleteLassoElements on first-insert (preEdit undefined)', async () => {
+    const tree = buildSmallTree();
+    await insertMindmap({tree});
+
+    // Successful first-insert: no pre-edit delete. The standard
+    // §F-IN-3 post-insert lasso still fires exactly once.
+    expect(PluginCommAPI.deleteLassoElements).not.toHaveBeenCalled();
+    expect(PluginCommAPI.lassoElements).toHaveBeenCalledTimes(1);
+  });
+
+  it('aborts before any insert when deleteLassoElements fails', async () => {
+    asMock(PluginCommAPI.deleteLassoElements).mockResolvedValueOnce({
+      success: false,
+      error: {message: 'simulated: delete refused'},
+    });
+
+    const tree = buildSmallTree();
+    const post = postEditPageBboxes(tree);
+    const preEdit: PreEditContext = {
+      preEditPageBboxes: new Map(post),
+      strokesByNodePage: new Map(),
+    };
+
+    await expect(insertMindmap({tree, preEdit})).rejects.toThrow(
+      /delete refused/,
+    );
+
+    // No geometry was ever inserted and no cleanup lasso was needed
+    // — the old mindmap is still on the page intact.
+    expect(PluginCommAPI.insertGeometry).not.toHaveBeenCalled();
+    expect(PluginCommAPI.lassoElements).not.toHaveBeenCalled();
+    expect(PluginManager.closePluginView).not.toHaveBeenCalled();
+  });
+
+  it('translates a preserved stroke by the node move delta', async () => {
+    // Pre-edit: root at an offset 100px right and 50px down from
+    // where radialLayout would place it on a fresh page. Post-edit
+    // layout lands at the centered page position. Move delta =
+    // post − pre, applied to every stroke point.
+    const tree = buildSmallTree();
+    const post = postEditPageBboxes(tree);
+    const rootPost = post.get(tree.rootId);
+    if (!rootPost) {
+      throw new Error('test bug: root missing from post-edit bboxes');
+    }
+    const rootPre: Rect = {
+      x: rootPost.x + 100,
+      y: rootPost.y + 50,
+      w: rootPost.w,
+      h: rootPost.h,
+    };
+    // A single 2-point polyline on the root, in PRE-edit page coords
+    // — points relative to the pre-edit bbox position. Expected
+    // post-edit points are shifted by (post − pre) = (−100, −50).
+    const strokeP1 = {x: rootPre.x + 10, y: rootPre.y + 20};
+    const strokeP2 = {x: rootPre.x + 30, y: rootPre.y + 40};
+    const strokesByNodePage: StrokeBucket = new Map();
+    strokesByNodePage.set(tree.rootId, [polyline([strokeP1, strokeP2])]);
+
+    const preEditPageBboxes = new Map<NodeId, Rect>();
+    // Only the root carries a preserved stroke for this test; other
+    // nodes can have identical pre/post bboxes (delta=0) since no
+    // strokes are keyed on them.
+    for (const [id, bb] of post) {
+      preEditPageBboxes.set(id, id === tree.rootId ? rootPre : bb);
+    }
+
+    await insertMindmap({
+      tree,
+      preEdit: {preEditPageBboxes, strokesByNodePage},
+    });
+
+    // The bucketed stroke reached emitGeometries and was inserted.
+    const preservedPointLists = preservedStrokeInserts(
+      asMock(PluginCommAPI.insertGeometry).mock.calls,
+    );
+    expect(preservedPointLists).toHaveLength(1);
+    const [pts] = preservedPointLists;
+    expect(pts).toEqual([
+      {x: strokeP1.x - 100, y: strokeP1.y - 50},
+      {x: strokeP2.x - 100, y: strokeP2.y - 50},
+    ]);
+    // And these coincide with (rootPost.x + 10, rootPost.y + 20) etc.
+    expect(pts[0]).toEqual({x: rootPost.x + 10, y: rootPost.y + 20});
+    expect(pts[1]).toEqual({x: rootPost.x + 30, y: rootPost.y + 40});
+  });
+
+  it('drops strokes for nodes that were deleted during the edit session', async () => {
+    // Build a tree with one child, run the delete via deleteSubtree
+    // so the post-edit tree only has the root. The pre-edit bbox
+    // map still includes the child (that's the "pre-edit"
+    // snapshot), and its stroke bucket should be silently dropped —
+    // no throw, no emit.
+    const tree = createTree();
+    const childId = addChild(tree, tree.rootId);
+    // Pre-edit: both the root and the (still-present) child had
+    // page bboxes at known locations.
+    const preEditPageBboxes = new Map<NodeId, Rect>([
+      [tree.rootId, {x: 700, y: 900, w: 220, h: 96}],
+      [childId, {x: 1000, y: 900, w: 220, h: 96}],
+    ]);
+    const strokesByNodePage: StrokeBucket = new Map();
+    strokesByNodePage.set(childId, [
+      polyline([
+        {x: 1010, y: 910},
+        {x: 1050, y: 950},
+      ]),
+    ]);
+    // Now delete the child — post-edit tree has root only.
+    deleteSubtree(tree, childId);
+    expect(tree.nodesById.has(childId)).toBe(false); // sanity
+
+    await insertMindmap({
+      tree,
+      preEdit: {preEditPageBboxes, strokesByNodePage},
+    });
+
+    // The child's stroke was dropped because the child no longer
+    // exists in the post-edit tree. No preserved strokes reached
+    // emitGeometries.
+    const preservedPointLists = preservedStrokeInserts(
+      asMock(PluginCommAPI.insertGeometry).mock.calls,
+    );
+    expect(preservedPointLists).toHaveLength(0);
+  });
+
+  it('drops strokes when the pre-edit bbox map is missing a node (defensive)', async () => {
+    // Associator/decoder mismatch: a stroke is bucketed on a node
+    // id that isn't in the pre-edit bbox map. We can't compute a
+    // move delta without a pre bbox, so the bucket must be dropped
+    // silently rather than crashing the whole Save.
+    const tree = buildSmallTree();
+    const post = postEditPageBboxes(tree);
+    // Deliberately empty pre-edit bbox map.
+    const preEditPageBboxes = new Map<NodeId, Rect>();
+    const strokesByNodePage: StrokeBucket = new Map();
+    strokesByNodePage.set(tree.rootId, [
+      polyline([
+        {x: 500, y: 500},
+        {x: 550, y: 550},
+      ]),
+    ]);
+
+    await expect(
+      insertMindmap({
+        tree,
+        preEdit: {preEditPageBboxes, strokesByNodePage},
+      }),
+    ).resolves.toBeUndefined();
+
+    const preservedPointLists = preservedStrokeInserts(
+      asMock(PluginCommAPI.insertGeometry).mock.calls,
+    );
+    expect(preservedPointLists).toHaveLength(0);
+    // Delete still happened, even though no strokes were preserved.
+    expect(PluginCommAPI.deleteLassoElements).toHaveBeenCalledTimes(1);
+    // Sanity: non-preserved emits (outlines + connectors + marker)
+    // still went through for the new map.
+    expect(post.size).toBe(4); // buildSmallTree: root + 3 children
+    expect(
+      nonMarkerInserts(asMock(PluginCommAPI.insertGeometry).mock.calls)
+        .length,
+    ).toBe(7);
+  });
+
+  it('cleanup path still runs when preEdit is present and insert fails mid-stream', async () => {
+    // After the pre-edit delete succeeds, simulate an insertGeometry
+    // failure partway through. §F-IN-5 cleanup should still run
+    // (lasso + delete on the partial emit), re-raising the original
+    // insert error. The pre-edit delete has already fired and is
+    // counted separately from the cleanup delete.
+    asMock(PluginCommAPI.insertGeometry)
+      .mockResolvedValueOnce({success: true})
+      .mockResolvedValueOnce({success: true})
+      .mockResolvedValueOnce({
+        success: false,
+        error: {message: 'simulated: insert failed mid-stream'},
+      });
+
+    const tree = buildSmallTree();
+    const post = postEditPageBboxes(tree);
+    const preEdit: PreEditContext = {
+      preEditPageBboxes: new Map(post),
+      strokesByNodePage: new Map(),
+    };
+
+    await expect(insertMindmap({tree, preEdit})).rejects.toThrow(
+      /insert failed mid-stream/,
+    );
+
+    // Two deletes total: one for the pre-edit mindmap (step 0), one
+    // for the §F-IN-5 cleanup of the partial new emit.
+    expect(PluginCommAPI.deleteLassoElements).toHaveBeenCalledTimes(2);
+    // Cleanup lasso ran (and it's the only lasso — the final
+    // §F-IN-3 auto-lasso is skipped on failure).
+    expect(PluginCommAPI.lassoElements).toHaveBeenCalledTimes(1);
+    expect(PluginManager.closePluginView).not.toHaveBeenCalled();
   });
 });

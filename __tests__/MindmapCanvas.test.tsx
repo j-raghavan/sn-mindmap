@@ -1300,4 +1300,228 @@ describe('MindmapCanvas', () => {
       unmount();
     });
   });
+
+  describe('Phase 4.5 — Save button wires to insertMindmap (§F-ED-7)', () => {
+    // Phase 4.5 replaces the hidden-in-edit Insert button with a
+    // "Save" button that runs the round-trip §F-ED-7 pipeline:
+    // deleteLassoElements → translate preserved strokes by each
+    // node's move delta → emit → insert → lasso(unionRect) → close.
+    // The UX mirrors Insert's debounce + error-banner behaviour and
+    // the full orchestration lives in insertMindmap; these tests
+    // cover the Save-specific UI wiring.
+
+    beforeEach(() => {
+      (PluginCommAPI.insertGeometry as jest.Mock).mockClear();
+      (PluginCommAPI.insertGeometry as jest.Mock).mockResolvedValue({
+        success: true,
+      });
+      (PluginCommAPI.lassoElements as jest.Mock).mockClear();
+      (PluginCommAPI.lassoElements as jest.Mock).mockResolvedValue({
+        success: true,
+      });
+      (PluginCommAPI.deleteLassoElements as jest.Mock).mockClear();
+      (PluginCommAPI.deleteLassoElements as jest.Mock).mockResolvedValue({
+        success: true,
+      });
+      (PluginManager.closePluginView as jest.Mock).mockClear();
+      (PluginManager.closePluginView as jest.Mock).mockResolvedValue(true);
+    });
+
+    function buildPreEdit(tree: ReturnType<typeof createTree>): {
+      preEditPageBboxes: Map<number, {x: number; y: number; w: number; h: number}>;
+      strokesByNodePage: Map<number, never[]>;
+    } {
+      // Identical pre/post bboxes keeps delta=0 and makes assertions
+      // about the delete + insert sequence independent of
+      // translation math. Stroke bucket empty for the same reason —
+      // §F-ED-7 translation is covered in insert.test.ts.
+      const pre = new Map<number, {x: number; y: number; w: number; h: number}>();
+      for (const id of tree.nodesById.keys()) {
+        pre.set(id, {x: id * 100, y: id * 100, w: 220, h: 96});
+      }
+      return {preEditPageBboxes: pre, strokesByNodePage: new Map()};
+    }
+
+    it('renders a Save Pressable with label "Save" when isEditMode=true', () => {
+      const {renderer, unmount} = renderCanvas(<MindmapCanvas isEditMode />);
+      const save = findPressable(renderer, 'Save');
+      expect(save.props.accessibilityState?.disabled).toBe(false);
+      expect(save.props.disabled).toBe(false);
+      // Insert is hidden in edit mode (Phase 4.3 contract carried
+      // forward to Phase 4.5 — the two buttons are mutually exclusive).
+      expect(findHostByLabel(renderer, 'Insert')).toHaveLength(0);
+      unmount();
+    });
+
+    it('does not render Save in authoring mode (isEditMode omitted)', () => {
+      // Authoring flow must stay on "Insert". A stray Save label
+      // here would cause the authoring canvas to try to re-insert
+      // without a preEdit context.
+      const {renderer, unmount} = renderCanvas(<MindmapCanvas />);
+      expect(findHostByLabel(renderer, 'Save')).toHaveLength(0);
+      // Insert is visible as before.
+      expect(findHostByLabel(renderer, 'Insert').length).toBeGreaterThan(0);
+      unmount();
+    });
+
+    it('tapping Save drives the full §F-ED-7 pipeline (delete + emit + insert + close)', async () => {
+      const tree = createTree();
+      addChild(tree, tree.rootId);
+      const preEdit = buildPreEdit(tree);
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} isEditMode preEdit={preEdit} />,
+      );
+
+      const save = findPressable(renderer, 'Save');
+      const onPress = save.props.onPress as () => void;
+      await act(async () => {
+        onPress();
+        await flushPromises();
+        await flushPromises();
+      });
+
+      // deleteLassoElements fires first (before any insertGeometry).
+      expect(PluginCommAPI.deleteLassoElements).toHaveBeenCalledTimes(1);
+      // 2 outlines + 1 connector = 3 non-marker geometries emitted.
+      expect(
+        nonMarkerInsertCount(PluginCommAPI.insertGeometry as jest.Mock),
+      ).toBe(3);
+      expect(PluginCommAPI.lassoElements).toHaveBeenCalledTimes(1);
+      expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
+      unmount();
+    });
+
+    it('shows "Saving…" while the save is in flight', async () => {
+      // Keep insertGeometry pending so we can observe the mid-flight
+      // button state. Matches the Insert-path debounce tests below.
+      let resolveFirst: () => void = () => {};
+      const pending = new Promise<void>(r => {
+        resolveFirst = r;
+      });
+      (PluginCommAPI.insertGeometry as jest.Mock).mockImplementationOnce(
+        async () => {
+          await pending;
+          return {success: true};
+        },
+      );
+
+      const tree = createTree();
+      const preEdit = buildPreEdit(tree);
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} isEditMode preEdit={preEdit} />,
+      );
+
+      const save = findPressable(renderer, 'Save');
+      const onPress = save.props.onPress as () => void;
+      await act(async () => {
+        onPress();
+        await flushPromises();
+      });
+      // The button's label should have swapped to the pending state
+      // — look it up by the new label.
+      const pendingBtn = findPressable(renderer, 'Save');
+      expect(pendingBtn.props.accessibilityState?.disabled).toBe(true);
+      // Resolve so the test cleans up.
+      resolveFirst();
+      await flushAsync();
+      unmount();
+    });
+
+    it('shows an error banner when save fails and keeps the plugin open', async () => {
+      (PluginCommAPI.deleteLassoElements as jest.Mock).mockResolvedValueOnce({
+        success: false,
+        error: {message: 'simulated: delete refused'},
+      });
+
+      const tree = createTree();
+      const preEdit = buildPreEdit(tree);
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} isEditMode preEdit={preEdit} />,
+      );
+      const save = findPressable(renderer, 'Save');
+      const onPress = save.props.onPress as () => void;
+      await act(async () => {
+        onPress();
+        await flushPromises();
+        await flushPromises();
+      });
+
+      const banners = findHostByLabel(renderer, 'insert-error');
+      expect(banners).toHaveLength(1);
+      expect(PluginManager.closePluginView).not.toHaveBeenCalled();
+      // No partial insert happened — the failure aborted before any
+      // insertGeometry call.
+      expect(PluginCommAPI.insertGeometry).not.toHaveBeenCalled();
+      unmount();
+    });
+
+    it('debounces rapid double-taps so only one save runs at a time', async () => {
+      // Same debounce pattern as the Insert button — the underlying
+      // insertingRef is shared, so a double-tap during the Save's
+      // in-flight window must no-op.
+      let resolveFirst: () => void = () => {};
+      const pending = new Promise<void>(r => {
+        resolveFirst = r;
+      });
+      (PluginCommAPI.insertGeometry as jest.Mock).mockImplementationOnce(
+        async () => {
+          await pending;
+          return {success: true};
+        },
+      );
+
+      const tree = createTree();
+      const preEdit = buildPreEdit(tree);
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} isEditMode preEdit={preEdit} />,
+      );
+      const save = findPressable(renderer, 'Save');
+      const onPress = save.props.onPress as () => void;
+      await act(async () => {
+        onPress();
+        await flushPromises();
+      });
+      await act(async () => {
+        onPress(); // second tap while first is in flight — no-op
+        await flushPromises();
+      });
+
+      // deleteLassoElements only fired once despite two taps, because
+      // insertingRef short-circuits handleSave's second entry.
+      expect(PluginCommAPI.deleteLassoElements).toHaveBeenCalledTimes(1);
+      expect(PluginCommAPI.insertGeometry).toHaveBeenCalledTimes(1);
+
+      resolveFirst();
+      await flushAsync();
+      unmount();
+    });
+
+    it('still works without preEdit (defensive degraded mode)', async () => {
+      // If isEditMode=true but no preEdit is supplied (EditMindmap
+      // always supplies it in practice), Save should still be
+      // tappable and still run the emit/insert path — it just skips
+      // the delete step because insertMindmap has no pre-edit
+      // context to act on.
+      const tree = createTree();
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} isEditMode />,
+      );
+      const save = findPressable(renderer, 'Save');
+      const onPress = save.props.onPress as () => void;
+      await act(async () => {
+        onPress();
+        await flushPromises();
+        await flushPromises();
+      });
+
+      // No delete (preEdit was undefined).
+      expect(PluginCommAPI.deleteLassoElements).not.toHaveBeenCalled();
+      // But the first-insert pipeline still ran to completion.
+      expect(
+        nonMarkerInsertCount(PluginCommAPI.insertGeometry as jest.Mock),
+      ).toBeGreaterThan(0);
+      expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
+      unmount();
+    });
+  });
 });
