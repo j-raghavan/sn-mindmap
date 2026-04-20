@@ -85,6 +85,11 @@ import {
 } from './layout/constants';
 import type {Point, Rect} from './geometry';
 import {insertMindmap, type PreEditContext} from './insert';
+import {
+  MARKER_CAPACITY_MESSAGE,
+  MarkerCapacityError,
+} from './marker/encode';
+import ConfirmDialog from './ConfirmDialog';
 import type {
   OutOfMapStrokes,
   PreservedStroke,
@@ -409,6 +414,41 @@ export default function MindmapCanvas({
     );
   }, []);
 
+  // §F-PE-4 — marker-capacity error is a persistent modal, not the
+  // transient insert-error banner: the user must acknowledge it and
+  // reduce nodes before a retry can succeed, so the spec text stays
+  // on-screen until they tap OK. MarkerCapacityError bubbles up from
+  // encodeMarker (inside emitGeometries, called by insertMindmap)
+  // before any geometry has been committed to the page, so there is
+  // no partial cleanup to do when we switch routes from banner → modal.
+  const [capacityModalOpen, setCapacityModalOpen] = useState(false);
+  const handleCapacityAcknowledge = useCallback(() => {
+    setCapacityModalOpen(false);
+  }, []);
+
+  /**
+   * Route an error caught from insertMindmap to the correct UI
+   * surface. MarkerCapacityError → persistent capacity modal (§F-PE-4);
+   * everything else → the transient 2 s error banner used by the rest
+   * of the insert pipeline (§F-IN-5).
+   *
+   * Centralised so the Insert and Save paths can't drift apart — both
+   * must show the same modal for the same capacity failure, and both
+   * must keep the plugin view open (never closePluginView) so the
+   * user can return to authoring / editing and reduce the node count.
+   */
+  const handleInsertError = useCallback(
+    (err: unknown) => {
+      if (err instanceof MarkerCapacityError) {
+        setCapacityModalOpen(true);
+        return;
+      }
+      const message = err instanceof Error ? err.message : 'Insert failed';
+      showInsertError(message);
+    },
+    [showInsertError],
+  );
+
   // Clear-button two-tap confirm state. `clearArmed` flips to true on
   // the first tap, re-rendering the button label as "Confirm Clear".
   // A second tap within CLEAR_CONFIRM_MS commits the reset; otherwise
@@ -469,13 +509,12 @@ export default function MindmapCanvas({
     try {
       await insertMindmap({tree});
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Insert failed';
-      showInsertError(message);
+      handleInsertError(err);
     } finally {
       insertingRef.current = false;
       setIsInserting(false);
     }
-  }, [tree, showInsertError]);
+  }, [tree, handleInsertError]);
 
   // Phase 4.6 — pre-Save out-of-map confirmation dialog (§8.1). When
   // the user's lassoed region contained strokes whose centroid fell
@@ -511,13 +550,12 @@ export default function MindmapCanvas({
     try {
       await insertMindmap({tree, preEdit});
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Save failed';
-      showInsertError(message);
+      handleInsertError(err);
     } finally {
       insertingRef.current = false;
       setIsInserting(false);
     }
-  }, [tree, preEdit, showInsertError]);
+  }, [tree, preEdit, handleInsertError]);
 
   /**
    * Handle Save tap (§F-ED-7, Phase 4.5 + 4.6). If any out-of-map
@@ -706,69 +744,44 @@ export default function MindmapCanvas({
        * Rendered on top of the canvas when the user taps Save and at
        * least one stroke's centroid fell outside every node's bbox.
        *
-       * Layout: absolute-positioned overlay fills the canvas; a
-       * Pressable backdrop dims the surface and dismisses the dialog
-       * on tap (the §646 "tap-outside to cancel" idiom). The centered
-       * card sits on top of the backdrop. We stop tap propagation on
-       * the card itself so a careless tap inside the card doesn't
-       * count as a backdrop tap.
-       *
-       * The button row exposes both actions via accessibilityLabel so
-       * the test suite can drive "Save anyway" / "Cancel" independently
-       * of the visible text (we might end up tweaking button copy
-       * without wanting to churn every test).
+       * The body is passed as a two-segment array so the dynamic "{N}
+       * strokes fell outside…" count stays as its own child of the
+       * body Text (the Phase 4.6 count test inspects that split via
+       * children.filter).
        */}
-      {isEditMode && saveConfirmOpen && (
-        <View
-          accessibilityLabel="save-confirm-dialog"
-          style={styles.dialogOverlay}
-          pointerEvents="box-none">
-          <Pressable
-            accessibilityLabel="save-confirm-backdrop"
-            style={styles.dialogBackdrop}
-            onPress={handleSaveCancel}
-          />
-          <View style={styles.dialogCard}>
-            <Text style={styles.dialogTitle}>
-              Some strokes are outside every node
-            </Text>
-            <Text
-              accessibilityLabel="save-confirm-body"
-              style={styles.dialogBody}>
-              {outOfMapCount === 1
-                ? '1 stroke fell outside every node and will not be saved. '
-                : `${outOfMapCount} strokes fell outside every node and will not be saved. `}
-              Cancel to close the plugin and re-lasso with a wider selection,
-              or save anyway to drop them.
-            </Text>
-            <View style={styles.dialogButtonRow}>
-              <Pressable
-                accessibilityRole="button"
-                accessibilityLabel="save-confirm-cancel"
-                onPress={handleSaveCancel}
-                style={({pressed}) => [
-                  styles.dialogBtn,
-                  pressed && styles.dialogBtnPressed,
-                ]}>
-                <Text style={styles.dialogBtnText}>Cancel</Text>
-              </Pressable>
-              <Pressable
-                accessibilityRole="button"
-                accessibilityLabel="save-confirm-proceed"
-                onPress={handleSaveConfirm}
-                style={({pressed}) => [
-                  styles.dialogBtn,
-                  styles.dialogBtnPrimary,
-                  pressed && styles.dialogBtnPrimaryPressed,
-                ]}>
-                <Text style={[styles.dialogBtnText, styles.dialogBtnTextPrimary]}>
-                  Save anyway
-                </Text>
-              </Pressable>
-            </View>
-          </View>
-        </View>
-      )}
+      <ConfirmDialog
+        labelPrefix="save-confirm"
+        visible={isEditMode && saveConfirmOpen}
+        title="Some strokes are outside every node"
+        body={[
+          outOfMapCount === 1
+            ? '1 stroke fell outside every node and will not be saved. '
+            : `${outOfMapCount} strokes fell outside every node and will not be saved. `,
+          'Cancel to close the plugin and re-lasso with a wider selection, or save anyway to drop them.',
+        ]}
+        primaryLabel="Save anyway"
+        onPrimary={handleSaveConfirm}
+        secondaryLabel="Cancel"
+        onSecondary={handleSaveCancel}
+        primaryVariant="destructive"
+      />
+      {/*
+       * §F-PE-4 marker-capacity modal. Surfaced when insertMindmap
+       * throws MarkerCapacityError (i.e. the tree exceeded
+       * MARKER_PUBLISHED_NODE_CAP = 50). No secondary button — the
+       * only path forward is acknowledging the error and reducing
+       * nodes on the canvas, so a "cancel" affordance would be
+       * meaningless. Body is the verbatim §F-PE-4 spec text from
+       * marker/encode.ts (single source of truth; no duplication here).
+       */}
+      <ConfirmDialog
+        labelPrefix="capacity-error"
+        visible={capacityModalOpen}
+        title="Mindmap too large"
+        body={MARKER_CAPACITY_MESSAGE}
+        primaryLabel="OK"
+        onPrimary={handleCapacityAcknowledge}
+      />
     </View>
   );
 }
@@ -1463,84 +1476,6 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 13,
     fontWeight: '500',
-  },
-  // Phase 4.6 — pre-Save out-of-map confirmation dialog styles (§8.1).
-  // StyleSheet.absoluteFillObject pins the overlay over the entire
-  // canvas; the dialogBackdrop is a full-bleed Pressable that dims +
-  // absorbs taps (except on the card itself, which sits on top).
-  dialogOverlay: {
-    position: 'absolute',
-    top: 0,
-    bottom: 0,
-    left: 0,
-    right: 0,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  dialogBackdrop: {
-    position: 'absolute',
-    top: 0,
-    bottom: 0,
-    left: 0,
-    right: 0,
-    // Semi-transparent black — on e-ink it renders as a subtle mid-
-    // gray that's still readable through but unmistakably "modal".
-    backgroundColor: 'rgba(0,0,0,0.35)',
-  },
-  dialogCard: {
-    backgroundColor: '#fff',
-    borderWidth: 1,
-    borderColor: '#000',
-    borderRadius: 6,
-    paddingVertical: 20,
-    paddingHorizontal: 24,
-    maxWidth: 480,
-    minWidth: 320,
-  },
-  dialogTitle: {
-    fontSize: 16,
-    fontWeight: '700',
-    color: '#000',
-    marginBottom: 12,
-  },
-  dialogBody: {
-    fontSize: 14,
-    color: '#000',
-    lineHeight: 20,
-    marginBottom: 20,
-  },
-  dialogButtonRow: {
-    flexDirection: 'row',
-    justifyContent: 'flex-end',
-  },
-  dialogBtn: {
-    paddingVertical: 8,
-    paddingHorizontal: 16,
-    borderWidth: 1,
-    borderColor: '#000',
-    borderRadius: 4,
-    marginLeft: 12,
-  },
-  dialogBtnPressed: {
-    backgroundColor: '#eee',
-  },
-  // Primary (commit) button uses the same inverted black-on-white →
-  // white-on-black treatment the Clear button's armed state uses, so
-  // the destructive-intent button reads as the stronger affordance.
-  dialogBtnPrimary: {
-    backgroundColor: '#000',
-    borderColor: '#000',
-  },
-  dialogBtnPrimaryPressed: {
-    backgroundColor: '#333',
-  },
-  dialogBtnText: {
-    fontSize: 14,
-    fontWeight: '500',
-    color: '#000',
-  },
-  dialogBtnTextPrimary: {
-    color: '#fff',
   },
   surface: {
     flex: 1,

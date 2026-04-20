@@ -1842,4 +1842,184 @@ describe('MindmapCanvas', () => {
       unmount();
     });
   });
+
+  describe('Phase 5 — §F-PE-4 marker-capacity modal', () => {
+    // Building a tree with > MARKER_PUBLISHED_NODE_CAP nodes forces
+    // encodeMarkerBytes to throw MarkerCapacityError, which bubbles up
+    // through emitGeometries → insertMindmap → the canvas catch block.
+    // The new contract: surface a persistent modal (not the transient
+    // 2 s insert-error banner), keep the plugin view open, let the
+    // user OK the modal and return to the canvas to reduce nodes.
+
+    beforeEach(() => {
+      (PluginCommAPI.insertGeometry as jest.Mock).mockClear();
+      (PluginCommAPI.insertGeometry as jest.Mock).mockResolvedValue({
+        success: true,
+      });
+      (PluginCommAPI.lassoElements as jest.Mock).mockClear();
+      (PluginCommAPI.lassoElements as jest.Mock).mockResolvedValue({
+        success: true,
+      });
+      (PluginCommAPI.deleteLassoElements as jest.Mock).mockClear();
+      (PluginCommAPI.deleteLassoElements as jest.Mock).mockResolvedValue({
+        success: true,
+      });
+      (PluginManager.closePluginView as jest.Mock).mockClear();
+      (PluginManager.closePluginView as jest.Mock).mockResolvedValue(true);
+    });
+
+    /**
+     * Build a right-chain tree with `nodeCount` total nodes (including
+     * the root). A chain is the cheapest over-cap structure: one
+     * addChild per link, no layout fan-out cost. For nodeCount=51 the
+     * marker encoder will throw MarkerCapacityError on the first
+     * encodeMarkerBytes call because MARKER_PUBLISHED_NODE_CAP = 50.
+     */
+    function buildOversizedTree(nodeCount: number): ReturnType<typeof createTree> {
+      const t = createTree();
+      let last = t.rootId;
+      for (let i = 1; i < nodeCount; i += 1) {
+        last = addChild(t, last);
+      }
+      return t;
+    }
+
+    it('opens the capacity modal (not the transient banner) when Insert exceeds the cap', async () => {
+      const tree = buildOversizedTree(51);
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      const insert = findPressable(renderer, 'Insert');
+      await act(async () => {
+        (insert.props.onPress as () => void)();
+        await flushPromises();
+        await flushPromises();
+      });
+      // Capacity modal is present…
+      expect(findHostByLabel(renderer, 'capacity-error-dialog').length).toBeGreaterThan(0);
+      // …and the transient banner route was NOT taken (the banner is
+      // not for persistent errors; the spec text needs to stay up
+      // until the user dismisses it).
+      expect(findHostByLabel(renderer, 'insert-error')).toHaveLength(0);
+      // Plugin view must stay open so the user can edit the tree.
+      expect(PluginManager.closePluginView).not.toHaveBeenCalled();
+      // Nothing landed on the page — emit failed before insertGeometry.
+      expect(PluginCommAPI.insertGeometry).not.toHaveBeenCalled();
+      unmount();
+    });
+
+    it('modal body is the verbatim §F-PE-4 capacity message', async () => {
+      const tree = buildOversizedTree(51);
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      const insert = findPressable(renderer, 'Insert');
+      await act(async () => {
+        (insert.props.onPress as () => void)();
+        await flushPromises();
+        await flushPromises();
+      });
+      const body = findHostByLabel(renderer, 'capacity-error-body');
+      expect(body.length).toBeGreaterThan(0);
+      expect(body[0].props.children).toContain('more structure than can be embedded');
+      expect(body[0].props.children).toContain('Reduce nodes');
+      expect(body[0].props.children).toContain('multiple mindmaps');
+      // Spec cross-refs (§F-PE-4) must not leak into user-facing text.
+      expect(body[0].props.children).not.toMatch(/§/);
+      unmount();
+    });
+
+    it('"OK" dismisses the capacity modal and leaves the plugin open', async () => {
+      const tree = buildOversizedTree(51);
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      const insert = findPressable(renderer, 'Insert');
+      await act(async () => {
+        (insert.props.onPress as () => void)();
+        await flushPromises();
+        await flushPromises();
+      });
+      expect(findHostByLabel(renderer, 'capacity-error-dialog').length).toBeGreaterThan(0);
+      // Tap OK to acknowledge.
+      const ok = findPressable(renderer, 'capacity-error-proceed');
+      act(() => {
+        (ok.props.onPress as () => void)();
+      });
+      // Modal dismissed, plugin still open.
+      expect(findHostByLabel(renderer, 'capacity-error-dialog')).toHaveLength(0);
+      expect(PluginManager.closePluginView).not.toHaveBeenCalled();
+      unmount();
+    });
+
+    it('capacity modal has no cancel button (acknowledge-only)', async () => {
+      // The only path past this error is reducing nodes — "cancel" has
+      // no distinct meaning, so ConfirmDialog is invoked without a
+      // secondaryLabel and the cancel button is omitted entirely.
+      const tree = buildOversizedTree(51);
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      const insert = findPressable(renderer, 'Insert');
+      await act(async () => {
+        (insert.props.onPress as () => void)();
+        await flushPromises();
+        await flushPromises();
+      });
+      expect(findHostByLabel(renderer, 'capacity-error-dialog').length).toBeGreaterThan(0);
+      expect(findHostByLabel(renderer, 'capacity-error-cancel')).toHaveLength(0);
+      unmount();
+    });
+
+    it('also routes Save failures with MarkerCapacityError into the modal', async () => {
+      // The save path shares handleInsertError so both entry points
+      // must produce the same modal. The regression guard is cheap —
+      // just drive Save with an oversized tree and assert the same
+      // modal surfaces.
+      const tree = buildOversizedTree(51);
+      const preEdit = {
+        preEditPageBboxes: new Map(
+          Array.from(tree.nodesById.keys()).map(id => [
+            id,
+            {x: id * 100, y: id * 100, w: 220, h: 96},
+          ]),
+        ),
+        strokesByNodePage: new Map(),
+      };
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} isEditMode preEdit={preEdit} />,
+      );
+      const save = findPressable(renderer, 'Save');
+      await act(async () => {
+        (save.props.onPress as () => void)();
+        await flushPromises();
+        await flushPromises();
+      });
+      expect(findHostByLabel(renderer, 'capacity-error-dialog').length).toBeGreaterThan(0);
+      // Save ran deleteLassoElements first (§F-ED-7 step 0 happens
+      // before emit), but no new geometry landed on the page.
+      expect(PluginCommAPI.insertGeometry).not.toHaveBeenCalled();
+      expect(PluginManager.closePluginView).not.toHaveBeenCalled();
+      unmount();
+    });
+
+    it('at-cap tree (= MARKER_PUBLISHED_NODE_CAP) does not open the capacity modal', async () => {
+      // Sanity boundary: exactly MARKER_PUBLISHED_NODE_CAP nodes must
+      // succeed — the error is for > cap only.
+      const tree = buildOversizedTree(50);
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      const insert = findPressable(renderer, 'Insert');
+      await act(async () => {
+        (insert.props.onPress as () => void)();
+        await flushPromises();
+        await flushPromises();
+      });
+      expect(findHostByLabel(renderer, 'capacity-error-dialog')).toHaveLength(0);
+      // Normal success path: plugin closed.
+      expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
+      unmount();
+    });
+  });
 });
