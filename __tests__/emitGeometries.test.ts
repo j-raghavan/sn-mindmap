@@ -1,9 +1,10 @@
 /**
- * Tests for src/rendering/emitGeometries.ts — Phase 2 (§F-IN-2).
+ * Tests for src/rendering/emitGeometries.ts — Phase 2 (§F-IN-2) plus
+ * Phase 3.4 marker wire-up.
  *
  * Coverage:
- *   - Emit order: outlines → connectors → (marker spliced in Phase 3)
- *     → preserved label strokes (§F-IN-2).
+ *   - Emit order: outlines → connectors → marker → preserved label
+ *     strokes (§F-IN-2, §6.4).
  *   - Every emitted geometry sets showLassoAfterInsert: false (§F-IN-3).
  *   - Per-shape outline selection follows the node's stored shape kind
  *     (§6.3 → §F-IN-2 step 1): OVAL/RECTANGLE/ROUNDED_RECTANGLE map
@@ -12,14 +13,18 @@
  *     PEN_DEFAULTS, pen width = STANDARD_PEN_WIDTH (§F-IN-2 step 2),
  *     exactly 2 points, endpoints land on the parent's and child's
  *     bbox borders (clipping, §F-IN-2 step 2 "stopping at outlines").
+ *   - Marker geometries: §6.4 pen style, grid alignment from
+ *     layout.unionBbox.topleft, positioned AFTER connectors and
+ *     BEFORE preserved strokes (§F-IN-2 step 3/4).
  *   - Fully-expanded auto-expansion: a collapsed subtree still emits
  *     every descendant (§8.6, §F-IN-2 auto-expansion).
  *   - Preserved-stroke pass-through: bucket contents emitted after
- *     outlines+connectors, NodeId-ascending order, showLassoAfterInsert
- *     overridden even when the input stroke carried true.
- *   - unionRect bounds every emitted point.
- *   - Capacity-cap is Phase 3's concern; Phase 2 only has to handle
- *     small trees correctly, so no cap-tests here.
+ *     outlines+connectors+marker, NodeId-ascending order,
+ *     showLassoAfterInsert overridden even when input stroke carried
+ *     true.
+ *   - unionRect bounds every emitted point (including marker strokes).
+ *   - MarkerCapacityError surfaces through emitGeometries when the
+ *     tree exceeds MARKER_PUBLISHED_NODE_CAP (§F-PE-4).
  */
 import {emitGeometries} from '../src/rendering/emitGeometries';
 import {
@@ -43,6 +48,16 @@ import {
   type PolygonGeometry,
   type Rect,
 } from '../src/geometry';
+import {
+  MARKER_BIT_STROKE_LEN,
+  MARKER_CELL_PX,
+  MARKER_GRID,
+  MARKER_PEN_COLOR,
+  MARKER_PEN_TYPE,
+  MARKER_PEN_WIDTH,
+  MARKER_PUBLISHED_NODE_CAP,
+  MarkerCapacityError,
+} from '../src/marker/encode';
 
 const EPS = 1e-6;
 
@@ -52,6 +67,24 @@ function isPolygon(g: Geometry): g is PolygonGeometry {
 
 function isLine(g: Geometry): g is LineGeometry {
   return g.type === 'straightLine';
+}
+
+/**
+ * Marker strokes are tagged by pen color 0x9D (§6.4) — this is the
+ * same discriminator the decoder uses to pick them out of a mixed
+ * Geometry[] at decode time.
+ */
+function isMarkerStroke(g: Geometry): boolean {
+  return g.type === 'straightLine' && g.penColor === MARKER_PEN_COLOR;
+}
+
+/** Non-marker geometries — the outlines, connectors, and preserved
+ * strokes. Convenient for tests that care about the "primary" emit
+ * mix and want to assert counts without the marker bits polluting
+ * them.
+ */
+function nonMarker(geometries: Geometry[]): Geometry[] {
+  return geometries.filter(g => !isMarkerStroke(g));
 }
 
 function rectContains(rect: Rect, x: number, y: number, eps = EPS): boolean {
@@ -105,13 +138,14 @@ describe('emitGeometries — module surface', () => {
 });
 
 describe('emitGeometries — single-node tree (root only)', () => {
-  it('emits exactly one polygon (the root Oval) and zero connectors', () => {
+  it('emits exactly one polygon (the root Oval) and zero connectors (non-marker only)', () => {
     const tree = createTree();
     const layout = radialLayout(tree);
     const {geometries} = emitGeometries({tree, layout});
 
-    expect(geometries).toHaveLength(1);
-    const root = geometries[0];
+    const primary = nonMarker(geometries);
+    expect(primary).toHaveLength(1);
+    const root = primary[0];
     expect(isPolygon(root)).toBe(true);
     if (!isPolygon(root)) {
       return;
@@ -122,7 +156,7 @@ describe('emitGeometries — single-node tree (root only)', () => {
     expect(root.showLassoAfterInsert).toBe(false);
   });
 
-  it('unionRect equals the root bbox', () => {
+  it('unionRect covers both the root bbox and the marker footprint', () => {
     const tree = createTree();
     const layout = radialLayout(tree);
     const {unionRect} = emitGeometries({tree, layout});
@@ -130,10 +164,14 @@ describe('emitGeometries — single-node tree (root only)', () => {
     if (!rootBbox) {
       throw new Error('root bbox missing — test setup bug');
     }
-    expect(unionRect.x).toBeCloseTo(rootBbox.x, 6);
-    expect(unionRect.y).toBeCloseTo(rootBbox.y, 6);
-    expect(unionRect.w).toBeCloseTo(rootBbox.w, 6);
-    expect(unionRect.h).toBeCloseTo(rootBbox.h, 6);
+    // Marker origin is at unionBbox.topleft, so unionRect.topleft
+    // matches the node unionBbox topleft exactly. Width/height can be
+    // larger because the 288×288 marker footprint exceeds the single
+    // root's 220×96.
+    expect(unionRect.x).toBeCloseTo(layout.unionBbox.x, 6);
+    expect(unionRect.y).toBeCloseTo(layout.unionBbox.y, 6);
+    expect(unionRect.w).toBeGreaterThanOrEqual(rootBbox.w - 1e-6);
+    expect(unionRect.h).toBeGreaterThanOrEqual(rootBbox.h - 1e-6);
   });
 });
 
@@ -143,11 +181,12 @@ describe('emitGeometries — shape-kind dispatch (§F-IN-2 step 1)', () => {
     const layout = radialLayout(tree);
     const {geometries} = emitGeometries({tree, layout});
 
-    // 3 nodes -> 3 outlines (first) + 2 connectors (after).
-    expect(geometries).toHaveLength(5);
+    // 3 nodes -> 3 outlines (first) + 2 connectors (after) + marker.
+    const primary = nonMarker(geometries);
+    expect(primary).toHaveLength(5);
 
     // First three are outlines, in pre-order: root, childId, siblingId.
-    const outlines = geometries.slice(0, 3);
+    const outlines = primary.slice(0, 3);
     for (const g of outlines) {
       expect(isPolygon(g)).toBe(true);
     }
@@ -188,7 +227,10 @@ describe('emitGeometries — connectors (§F-IN-2 step 2)', () => {
     const layout = radialLayout(tree);
     const {geometries} = emitGeometries({tree, layout});
 
-    const connectors = geometries.slice(3);
+    // Connectors are the black-fineliner straightLines; marker
+    // strokes are straightLines too but with penColor 0x9D, so
+    // filter them out first.
+    const connectors = nonMarker(geometries).slice(3);
     expect(connectors).toHaveLength(2);
     for (const g of connectors) {
       expect(isLine(g)).toBe(true);
@@ -209,8 +251,9 @@ describe('emitGeometries — connectors (§F-IN-2 step 2)', () => {
     const {geometries} = emitGeometries({tree, layout});
 
     // Connector in pre-order: first non-root node is childId, so the
-    // first connector is root -> childId.
-    const [, , , firstConnector] = geometries;
+    // first connector is root -> childId. Filter out marker strokes
+    // (same straightLine type but penColor 0x9D) first.
+    const [, , , firstConnector] = nonMarker(geometries);
     if (!isLine(firstConnector)) {
       throw new Error('expected a straightLine connector');
     }
@@ -242,14 +285,15 @@ describe('emitGeometries — connectors (§F-IN-2 step 2)', () => {
     const layout = radialLayout(tree);
     const {geometries} = emitGeometries({tree, layout});
 
-    const lastOutlineIdx = geometries.findIndex(isLine) - 1;
-    const firstConnectorIdx = geometries.findIndex(isLine);
+    const primary = nonMarker(geometries);
+    const lastOutlineIdx = primary.findIndex(isLine) - 1;
+    const firstConnectorIdx = primary.findIndex(isLine);
     expect(firstConnectorIdx).toBeGreaterThan(0);
     for (let i = 0; i <= lastOutlineIdx; i += 1) {
-      expect(isPolygon(geometries[i])).toBe(true);
+      expect(isPolygon(primary[i])).toBe(true);
     }
-    for (let i = firstConnectorIdx; i < geometries.length; i += 1) {
-      expect(isLine(geometries[i])).toBe(true);
+    for (let i = firstConnectorIdx; i < primary.length; i += 1) {
+      expect(isLine(primary[i])).toBe(true);
     }
   });
 });
@@ -280,10 +324,11 @@ describe('emitGeometries — §8.6 auto-expansion', () => {
     const layout = radialLayout(tree);
     const {geometries} = emitGeometries({tree, layout});
 
-    // 5 nodes total → 5 outlines + 4 connectors = 9 geometries.
-    expect(geometries).toHaveLength(9);
-    const outlines = geometries.filter(isPolygon);
-    const connectors = geometries.filter(isLine);
+    // 5 nodes total → 5 outlines + 4 connectors = 9 non-marker geometries.
+    const primary = nonMarker(geometries);
+    expect(primary).toHaveLength(9);
+    const outlines = primary.filter(isPolygon);
+    const connectors = primary.filter(isLine);
     expect(outlines).toHaveLength(5);
     expect(connectors).toHaveLength(4);
   });
@@ -306,20 +351,21 @@ describe('emitGeometries — unionRect (§F-IN-3)', () => {
       }
     }
 
-    // Sanity: unionRect must match layout.unionBbox's extent for a
-    // nodes-only tree (no preserved strokes). Connectors are strictly
-    // inside node-to-node segments, so they never extend unionRect
-    // beyond the node bboxes.
+    // unionRect.topleft matches layout.unionBbox.topleft because
+    // markerOrigin = unionBbox.topleft and all node bboxes are ≥ that
+    // coordinate by definition. unionRect extent is the MAX of the
+    // node unionBbox extent and the marker footprint — so we only
+    // assert the outer bound here.
     const u = layout.unionBbox;
     expect(unionRect.x).toBeCloseTo(u.x, 6);
     expect(unionRect.y).toBeCloseTo(u.y, 6);
-    expect(unionRect.w).toBeCloseTo(u.w, 6);
-    expect(unionRect.h).toBeCloseTo(u.h, 6);
+    expect(unionRect.w).toBeGreaterThanOrEqual(u.w - EPS);
+    expect(unionRect.h).toBeGreaterThanOrEqual(u.h - EPS);
   });
 });
 
 describe('emitGeometries — preserved label strokes (§F-IN-2 step 4)', () => {
-  it('emits buckets in ascending NodeId order, after outlines + connectors', () => {
+  it('emits buckets in ascending NodeId order, after outlines + connectors + marker', () => {
     const {tree, childId, siblingId} = threeNodeTree();
     const layout = radialLayout(tree);
 
@@ -355,14 +401,20 @@ describe('emitGeometries — preserved label strokes (§F-IN-2 step 4)', () => {
       preservedStrokesByNode,
     });
 
-    // 3 outlines + 2 connectors + 2 preserved strokes = 7 geometries.
-    expect(geometries).toHaveLength(7);
+    // 3 outlines + 2 connectors + 2 preserved strokes = 7 non-marker
+    // geometries, plus the marker's "1"-bit strokes (penColor 0x9D)
+    // wedged between the connectors and the preserved strokes.
+    const primary = nonMarker(geometries);
+    expect(primary).toHaveLength(7);
 
-    // Last two geometries are the preserved strokes, in ascending
-    // NodeId order: childId (lower) first, siblingId (higher) second.
+    // Preserved strokes (default-pen black, NOT 0x9D) are the LAST
+    // two elements of the full geometries list. No marker strokes or
+    // other payload can follow them — preserved strokes must come
+    // AFTER marker so the user's handwriting sits on top visually.
     const lastTwo = geometries.slice(-2);
     for (const g of lastTwo) {
       expect(isLine(g)).toBe(true);
+      expect(isMarkerStroke(g)).toBe(false);
       expect(g.showLassoAfterInsert).toBe(false);
     }
     if (!isLine(lastTwo[0]) || !isLine(lastTwo[1])) {
@@ -372,6 +424,15 @@ describe('emitGeometries — preserved label strokes (§F-IN-2 step 4)', () => {
     expect(childId).toBeLessThan(siblingId);
     expect(lastTwo[0].points).toEqual(strokeForChild.points);
     expect(lastTwo[1].points).toEqual(strokeForSibling.points);
+
+    // Order check: every marker stroke sits before both preserved
+    // strokes in the geometries array.
+    const preservedIdxStart = geometries.length - 2;
+    for (let i = 0; i < preservedIdxStart; i += 1) {
+      if (isMarkerStroke(geometries[i])) {
+        expect(i).toBeLessThan(preservedIdxStart);
+      }
+    }
   });
 
   it('skips empty buckets and empty maps cleanly', () => {
@@ -389,14 +450,187 @@ describe('emitGeometries — preserved label strokes (§F-IN-2 step 4)', () => {
       preservedStrokesByNode,
     });
 
-    // 3 outlines + 2 connectors + 0 strokes = 5 geometries.
-    expect(geometries).toHaveLength(5);
+    // 3 outlines + 2 connectors + 0 strokes = 5 non-marker geometries.
+    const primary = nonMarker(geometries);
+    expect(primary).toHaveLength(5);
   });
 
   it('omitting preservedStrokesByNode is supported (first-insert path)', () => {
     const {tree} = threeNodeTree();
     const layout = radialLayout(tree);
     const {geometries} = emitGeometries({tree, layout});
-    expect(geometries).toHaveLength(5);
+    const primary = nonMarker(geometries);
+    expect(primary).toHaveLength(5);
+  });
+});
+
+describe('emitGeometries — marker emission (§6 / Phase 3.4)', () => {
+  it('emits at least one marker stroke for any non-empty tree', () => {
+    const tree = createTree();
+    const layout = radialLayout(tree);
+    const {geometries} = emitGeometries({tree, layout});
+    const markerStrokes = geometries.filter(isMarkerStroke);
+    // Even a single-node tree has a 16-byte logical message + 510-byte
+    // zero-padded block with RS parity; the bit population count is
+    // always > 0 in practice.
+    expect(markerStrokes.length).toBeGreaterThan(0);
+  });
+
+  it('marker strokes use §6.4 pen style (color 0x9D, type 10, width 100)', () => {
+    const {tree} = threeNodeTree();
+    const layout = radialLayout(tree);
+    const {geometries} = emitGeometries({tree, layout});
+
+    const markerStrokes = geometries.filter(isMarkerStroke);
+    expect(markerStrokes.length).toBeGreaterThan(0);
+    for (const g of markerStrokes) {
+      if (!isLine(g)) {
+        throw new Error('marker stroke should be straightLine');
+      }
+      expect(g.penColor).toBe(MARKER_PEN_COLOR);
+      expect(g.penType).toBe(MARKER_PEN_TYPE);
+      expect(g.penWidth).toBe(MARKER_PEN_WIDTH);
+      expect(g.showLassoAfterInsert).toBe(false);
+      expect(g.points).toHaveLength(2);
+    }
+  });
+
+  it('marker strokes are horizontal 3-px segments on the 4-px grid', () => {
+    const {tree} = threeNodeTree();
+    const layout = radialLayout(tree);
+    const {geometries} = emitGeometries({tree, layout});
+
+    const markerStrokes = geometries.filter(isMarkerStroke);
+    const originX = layout.unionBbox.x;
+    const originY = layout.unionBbox.y;
+
+    for (const g of markerStrokes) {
+      if (!isLine(g)) {
+        continue;
+      }
+      const [p0, p1] = g.points;
+      expect(p1.y).toBeCloseTo(p0.y, 6); // horizontal
+      expect(p1.x - p0.x).toBeCloseTo(MARKER_BIT_STROKE_LEN, 6);
+
+      // Cell alignment: (x - origin.x) should be a multiple of
+      // MARKER_CELL_PX; same for y. We don't care which cell, just
+      // that it lands on the grid.
+      const colReal = (p0.x - originX) / MARKER_CELL_PX;
+      const rowReal = (p0.y - originY) / MARKER_CELL_PX;
+      expect(colReal).toBeCloseTo(Math.round(colReal), 6);
+      expect(rowReal).toBeCloseTo(Math.round(rowReal), 6);
+      expect(Math.round(colReal)).toBeGreaterThanOrEqual(0);
+      expect(Math.round(colReal)).toBeLessThan(MARKER_GRID);
+      expect(Math.round(rowReal)).toBeGreaterThanOrEqual(0);
+      expect(Math.round(rowReal)).toBeLessThan(MARKER_GRID);
+    }
+  });
+
+  it('marker strokes sit between connectors and preserved strokes in emit order', () => {
+    const {tree, childId} = threeNodeTree();
+    const layout = radialLayout(tree);
+    const preservedStrokesByNode = new Map<NodeId, Geometry[]>([
+      [
+        childId,
+        [
+          {
+            ...PEN_DEFAULTS,
+            type: 'straightLine',
+            points: [
+              {x: 0, y: 0},
+              {x: 1, y: 1},
+            ],
+          } as LineGeometry,
+        ],
+      ],
+    ]);
+    const {geometries} = emitGeometries({
+      tree,
+      layout,
+      preservedStrokesByNode,
+    });
+
+    // Find the marker block start/end and verify everything before it
+    // is outlines/connectors (no marker pen color) and everything after
+    // the last marker stroke is preserved-stroke (non-marker).
+    const firstMarkerIdx = geometries.findIndex(isMarkerStroke);
+    const lastMarkerIdx =
+      geometries.length - 1 - [...geometries].reverse().findIndex(isMarkerStroke);
+    expect(firstMarkerIdx).toBeGreaterThan(0);
+    expect(lastMarkerIdx).toBeLessThan(geometries.length - 1);
+    for (let i = 0; i < firstMarkerIdx; i += 1) {
+      expect(isMarkerStroke(geometries[i])).toBe(false);
+    }
+    for (let i = lastMarkerIdx + 1; i < geometries.length; i += 1) {
+      expect(isMarkerStroke(geometries[i])).toBe(false);
+    }
+  });
+
+  it('translates page-coord bboxes to mindmap-local before marker encoding', () => {
+    // Shift the whole map by a known offset using the layout, then
+    // verify the marker stroke positions still land on the grid
+    // anchored at the new unionBbox topleft (i.e. emitGeometries
+    // picks up markerOrigin internally from layout.unionBbox).
+    const tree = createTree();
+    const base = radialLayout(tree);
+
+    const shift = {x: 500, y: 700};
+    const shifted = {
+      centers: new Map(
+        [...base.centers].map(([id, c]) => [
+          id,
+          {x: c.x + shift.x, y: c.y + shift.y},
+        ]),
+      ),
+      bboxes: new Map(
+        [...base.bboxes].map(([id, r]) => [
+          id,
+          {x: r.x + shift.x, y: r.y + shift.y, w: r.w, h: r.h},
+        ]),
+      ),
+      unionBbox: {
+        x: base.unionBbox.x + shift.x,
+        y: base.unionBbox.y + shift.y,
+        w: base.unionBbox.w,
+        h: base.unionBbox.h,
+      },
+    };
+
+    const {geometries} = emitGeometries({tree, layout: shifted});
+    const markerStrokes = geometries.filter(isMarkerStroke);
+    expect(markerStrokes.length).toBeGreaterThan(0);
+    for (const g of markerStrokes) {
+      if (!isLine(g)) {
+        continue;
+      }
+      const [p0] = g.points;
+      // Cells must index from the SHIFTED unionBbox topleft.
+      const col = (p0.x - shifted.unionBbox.x) / MARKER_CELL_PX;
+      const row = (p0.y - shifted.unionBbox.y) / MARKER_CELL_PX;
+      expect(col).toBeCloseTo(Math.round(col), 6);
+      expect(row).toBeCloseTo(Math.round(row), 6);
+      expect(Math.round(col)).toBeGreaterThanOrEqual(0);
+      expect(Math.round(row)).toBeGreaterThanOrEqual(0);
+    }
+  });
+
+  it('throws MarkerCapacityError when the tree exceeds the published node cap (§F-PE-4)', () => {
+    const tree = createTree();
+    // Add children to push the node count past the cap. +1 to exceed.
+    for (let i = 0; i < MARKER_PUBLISHED_NODE_CAP; i += 1) {
+      addChild(tree, tree.rootId);
+    }
+    const layout = radialLayout(tree);
+
+    let thrown: unknown;
+    try {
+      emitGeometries({tree, layout});
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(MarkerCapacityError);
+    if (thrown instanceof MarkerCapacityError) {
+      expect(thrown.nodeCount).toBe(MARKER_PUBLISHED_NODE_CAP + 1);
+    }
   });
 });

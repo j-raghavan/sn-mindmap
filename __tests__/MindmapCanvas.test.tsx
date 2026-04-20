@@ -58,7 +58,25 @@ jest.mock('sn-plugin-lib', () => ({
 
 import MindmapCanvas from '../src/MindmapCanvas';
 import {PluginCommAPI, PluginManager} from 'sn-plugin-lib';
+import {MARKER_PEN_COLOR} from '../src/marker/encode';
 import {addChild, addSibling, createTree} from '../src/model/tree';
+
+/**
+ * Filter insertGeometry mock calls down to the "primary" emit mix
+ * (outlines + connectors + preserved strokes). Marker strokes share
+ * the straightLine type but carry pen color 0x9D (§6.4); every insert
+ * produces several hundred of them, so assertions that care about the
+ * structural geometry count filter them out.
+ */
+function nonMarkerInsertCount(mock: jest.Mock): number {
+  return mock.mock.calls.filter(
+    ([geometry]) =>
+      !(
+        geometry?.type === 'straightLine' &&
+        geometry?.penColor === MARKER_PEN_COLOR
+      ),
+  ).length;
+}
 
 function flushPromises(): Promise<void> {
   return new Promise(resolve =>
@@ -712,9 +730,13 @@ describe('MindmapCanvas', () => {
         await flushPromises();
       });
 
-      // 2 outlines + 1 connector = 3 geometries, then a single lasso
-      // and a single close.
-      expect(PluginCommAPI.insertGeometry).toHaveBeenCalledTimes(3);
+      // 2 outlines + 1 connector = 3 non-marker geometries, then a
+      // single lasso and a single close. Marker bits (§6.4, penColor
+      // 0x9D) are emitted alongside but filtered out of this count
+      // so the assertion stays stable if the marker payload shifts.
+      expect(
+        nonMarkerInsertCount(PluginCommAPI.insertGeometry as jest.Mock),
+      ).toBe(3);
       expect(PluginCommAPI.lassoElements).toHaveBeenCalledTimes(1);
       expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
       unmount();

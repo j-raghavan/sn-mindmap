@@ -122,7 +122,15 @@ export async function insertMindmap(input: InsertInput): Promise<void> {
   );
 
   // §F-IN-2 — assemble the geometry list (outlines, connectors,
-  // Phase-3 marker splice, preserved strokes on re-insert).
+  // marker, preserved strokes on re-insert).
+  //
+  // §F-PE-4: emitGeometries calls encodeMarker, which throws
+  // MarkerCapacityError when the tree exceeds MARKER_PUBLISHED_NODE_CAP.
+  // We let that error propagate verbatim — the UI layer (MindmapCanvas)
+  // catches it and surfaces the capacity modal. Nothing is on the page
+  // yet at this point, so there is no cleanup to do; the general
+  // try/catch below only wraps the per-geometry insertion loop that
+  // follows.
   const {geometries, unionRect} = emitGeometries({
     tree: expanded,
     layout: pageLayout,

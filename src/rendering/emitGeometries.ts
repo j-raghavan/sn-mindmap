@@ -17,11 +17,13 @@
  *      Add-Child nodes, ROUNDED_RECTANGLE for Add-Sibling nodes)
  *   2. connectors      — straightLine parent-border -> child-border,
  *      pen width follows the CHILD's node border (§F-IN-2 step 2)
- *   3. marker          — fixed-position binary grid in the top-left
- *      of the union-bbox (§6). Emission deferred to Phase 3: this
- *      module leaves an explicit splice point after connectors so
- *      Phase 3 can drop the marker Geometry[] in without touching
- *      the ordering contract.
+ *   3. marker          — fixed-position binary grid anchored at the
+ *      top-left of the node union-bbox (§6.1). One straightLine per
+ *      "1" bit in the 72×72 grid, pen color 0x9D, pen width 100.
+ *      The per-node bboxes written into the marker bytes are stored
+ *      mindmap-local (origin = marker top-left, per §6.3) — we
+ *      translate them here so encodeMarker stays spec-aligned and
+ *      oblivious to where the mindmap ended up on the page.
  *   4. preserved label strokes (only on re-insert from edit) — each
  *      node's strokes translated by that node's move delta by the
  *      caller (§F-ED-7) before being handed to this module; we just
@@ -48,6 +50,7 @@ import {
   type Point,
   type Rect,
 } from '../geometry';
+import {encodeMarker} from '../marker/encode';
 import {flattenForEmit, type NodeId, type Tree} from '../model/tree';
 import type {LayoutResult} from '../layout/radial';
 import type {StrokeBucket} from '../model/strokes';
@@ -149,12 +152,38 @@ export function emitGeometries(input: EmitInput): EmitOutput {
   }
 
   // -----------------------------------------------------------------
-  // 3. Marker. Intentionally empty splice point; Phase 3 (§6) will
-  // call encodeMarker({tree, nodeBboxesById: layout.bboxes,
-  // markerOrigin}) and push the returned Geometry[] here. Keeping
-  // the comment in source ensures grep hits this location when the
-  // marker work picks up.
+  // 3. Marker (§6).
   // -----------------------------------------------------------------
+  // Marker origin = top-left of the node union-bbox (§6.1). The
+  // spec permits a "small fixed offset" to guard against
+  // marker-vs-node confusion; we don't apply one here because the
+  // marker pen-color discriminator (0x9D) already keeps marker
+  // candidates separate from the black-fineliner outlines, and a
+  // zero offset makes lasso-bbox-topleft → marker-origin inference
+  // exact when the user's lasso covers the whole block (decoder
+  // still has a ±2-cell retry loop for on-device jitter).
+  //
+  // §6.3 stores per-node bboxes in mindmap-local coords (origin =
+  // marker top-left). layout.bboxes is in page coords, so we
+  // translate here; width/height pass through unchanged.
+  const markerOrigin: Point = {x: layout.unionBbox.x, y: layout.unionBbox.y};
+  const nodeBboxesRel = new Map<NodeId, Rect>();
+  for (const [id, r] of layout.bboxes) {
+    nodeBboxesRel.set(id, {
+      x: r.x - markerOrigin.x,
+      y: r.y - markerOrigin.y,
+      w: r.w,
+      h: r.h,
+    });
+  }
+  const markerGeoms = encodeMarker({
+    tree,
+    nodeBboxesById: nodeBboxesRel,
+    markerOrigin,
+  });
+  for (const g of markerGeoms) {
+    geometries.push(g);
+  }
 
   // -----------------------------------------------------------------
   // 4. Preserved label strokes.

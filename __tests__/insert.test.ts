@@ -48,11 +48,32 @@ import {
 } from '../src/insert';
 import {radialLayout} from '../src/layout/radial';
 import {
+  MARKER_PEN_COLOR,
+  MARKER_PUBLISHED_NODE_CAP,
+  MarkerCapacityError,
+} from '../src/marker/encode';
+import {
   addChild,
   createTree,
   setCollapsed,
   type Tree,
 } from '../src/model/tree';
+
+/**
+ * Marker strokes are recognizable by pen color 0x9D (§6.4). The
+ * phase-3 wire-up means every insert emits outlines + connectors +
+ * several hundred marker bits; tests that care about the "primary"
+ * emit list (outlines + connectors + preserved strokes) filter these
+ * out with `nonMarkerInserts` before counting.
+ */
+function nonMarkerInserts(
+  insertCalls: Array<[{penColor?: number; type?: string}]>,
+): Array<[{penColor?: number; type?: string}]> {
+  return insertCalls.filter(
+    ([geometry]) =>
+      !(geometry.type === 'straightLine' && geometry.penColor === MARKER_PEN_COLOR),
+  );
+}
 
 type AnyMock = jest.Mock;
 const asMock = (fn: unknown) => fn as AnyMock;
@@ -118,8 +139,11 @@ describe('insertMindmap — happy path (§F-IN-1..F-IN-4)', () => {
     await insertMindmap({tree});
 
     const insertCalls = asMock(PluginCommAPI.insertGeometry).mock.calls;
-    // 4 outlines (root + 3 children) + 3 connectors = 7.
-    expect(insertCalls.length).toBe(7);
+    // 4 outlines (root + 3 children) + 3 connectors = 7 non-marker;
+    // the balance is marker strokes (penColor 0x9D). Plus at least one
+    // marker stroke — the root-containing tree always produces some.
+    expect(nonMarkerInserts(insertCalls).length).toBe(7);
+    expect(insertCalls.length).toBeGreaterThan(7);
     expect(PluginCommAPI.lassoElements).toHaveBeenCalledTimes(1);
     expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
 
@@ -194,9 +218,13 @@ describe('insertMindmap — auto-expansion (§F-IN-2 / §8.6)', () => {
 
     await insertMindmap({tree});
 
-    // 4 nodes × 1 outline + 3 connectors = 7 geometries, same as the
-    // small tree above — i.e., collapse did not hide any node.
-    expect(PluginCommAPI.insertGeometry).toHaveBeenCalledTimes(7);
+    // 4 nodes × 1 outline + 3 connectors = 7 non-marker geometries,
+    // same as the small tree above — i.e., collapse did not hide
+    // any node. Marker strokes are filtered out of the count so an
+    // unrelated change in the marker bit-population doesn't break
+    // the auto-expansion assertion.
+    const insertCalls = asMock(PluginCommAPI.insertGeometry).mock.calls;
+    expect(nonMarkerInserts(insertCalls).length).toBe(7);
   });
 
   it('does not mutate the caller\'s collapse state', async () => {
@@ -438,5 +466,50 @@ describe('insertMindmap — error + cleanup (§F-IN-5)', () => {
     expect(PluginManager.closePluginView).not.toHaveBeenCalled();
     // Cleanup ran because every insertGeometry succeeded first.
     expect(PluginCommAPI.deleteLassoElements).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('insertMindmap — marker capacity (§F-PE-4)', () => {
+  it('throws MarkerCapacityError before touching the page when tree exceeds the cap', async () => {
+    // MARKER_PUBLISHED_NODE_CAP + 1 nodes (root + cap-many children
+    // trips the ceiling by one).
+    const tree = createTree();
+    for (let i = 0; i < MARKER_PUBLISHED_NODE_CAP; i += 1) {
+      addChild(tree, tree.rootId);
+    }
+
+    let thrown: unknown;
+    try {
+      await insertMindmap({tree});
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(MarkerCapacityError);
+    if (thrown instanceof MarkerCapacityError) {
+      // N = 1 (root) + MARKER_PUBLISHED_NODE_CAP children.
+      expect(thrown.nodeCount).toBe(MARKER_PUBLISHED_NODE_CAP + 1);
+    }
+
+    // No geometry was ever inserted: emitGeometries throws before
+    // the insertion loop. No lasso, no cleanup, no plugin close.
+    expect(PluginCommAPI.insertGeometry).not.toHaveBeenCalled();
+    expect(PluginCommAPI.lassoElements).not.toHaveBeenCalled();
+    expect(PluginCommAPI.deleteLassoElements).not.toHaveBeenCalled();
+    expect(PluginManager.closePluginView).not.toHaveBeenCalled();
+  });
+
+  it('accepts a tree exactly at the published node cap', async () => {
+    // MARKER_PUBLISHED_NODE_CAP total nodes: root + (cap-1) children.
+    const tree = createTree();
+    for (let i = 0; i < MARKER_PUBLISHED_NODE_CAP - 1; i += 1) {
+      addChild(tree, tree.rootId);
+    }
+
+    await expect(insertMindmap({tree})).resolves.toBeUndefined();
+    const insertCalls = asMock(PluginCommAPI.insertGeometry).mock.calls;
+    // cap nodes × 1 outline + (cap-1) connectors = 2*cap - 1 non-marker.
+    expect(nonMarkerInserts(insertCalls).length).toBe(
+      2 * MARKER_PUBLISHED_NODE_CAP - 1,
+    );
   });
 });
