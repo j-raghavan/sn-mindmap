@@ -35,7 +35,7 @@ import {
   MARKER_PEN_WIDTH,
   MARKER_PUBLISHED_NODE_CAP,
   MARKER_ROOT_PARENT,
-  MARKER_THEORETICAL_NODE_CAP,
+  MARKER_CAPACITY_MESSAGE,
   MarkerCapacityError,
   encodeMarker,
   encodeMarkerBytes,
@@ -135,9 +135,8 @@ describe('marker encode wire constants (§6)', () => {
     expect(MARKER_FORMAT_VERSION).toBe(0x02);
   });
 
-  it('node cap: published 50, theoretical 53 (§6.2, §F-PE-4, §8.3)', () => {
+  it('published node cap is 50 per §F-PE-4', () => {
     expect(MARKER_PUBLISHED_NODE_CAP).toBe(50);
-    expect(MARKER_THEORETICAL_NODE_CAP).toBe(53);
   });
 
   it('interleaved RS layout: 3 × 216 bytes, 170 msg + 46 parity per chunk', () => {
@@ -149,14 +148,18 @@ describe('marker encode wire constants (§6)', () => {
     expect(MARKER_NUM_CHUNKS * MARKER_CHUNK_BYTES).toBe(MARKER_CHANNEL_BYTES);
   });
 
-  it('MarkerCapacityError carries the offending node count', () => {
+  it('MarkerCapacityError surfaces the §F-PE-4 user-facing message', () => {
     const err = new MarkerCapacityError(51);
     expect(err).toBeInstanceOf(Error);
     expect(err).toBeInstanceOf(MarkerCapacityError);
     expect(err.name).toBe('MarkerCapacityError');
+    // Node count is a diagnostic field; the message is the spec text
+    // verbatim so the UI can render it straight into the capacity
+    // modal without any reformatting that could drift from §F-PE-4.
     expect(err.nodeCount).toBe(51);
-    expect(err.message).toMatch(/51/);
-    expect(err.message).toMatch(/50/);
+    expect(err.message).toBe(MARKER_CAPACITY_MESSAGE);
+    expect(err.message).toMatch(/Reduce nodes/);
+    expect(err.message).not.toMatch(/§/); // no internal spec references
   });
 });
 

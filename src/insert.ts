@@ -72,7 +72,8 @@ import type {LayoutResult} from './layout/radial';
 import {radialLayout} from './layout/radial';
 import {translateStrokes, type StrokeBucket} from './model/strokes';
 import {cloneTree, type NodeId, type Tree} from './model/tree';
-import {emitGeometries} from './rendering/emitGeometries';
+import {emitGeometries, unionRectOfGeometries} from './rendering/emitGeometries';
+import type {ApiRes} from './pluginApi';
 
 /**
  * Nomad portrait defaults, mirrored from sn-shapes/src/ShapePalette.tsx.
@@ -88,17 +89,6 @@ export const DEFAULT_PAGE_HEIGHT = 1872;
  * past a node's outline.
  */
 export const INSERT_MARGIN_PX = 80;
-
-/**
- * Local narrow type for sn-plugin-lib responses. The SDK declares its
- * methods as returning the generic `Object` type, so TS doesn't know
- * about the `{success, result}` envelope the firmware actually
- * returns. Same shape as sn-shapes/src/ShapePalette.tsx.
- */
-type ApiRes<T> =
-  | {success: boolean; result?: T; error?: {message?: string}}
-  | null
-  | undefined;
 
 /**
  * Pre-edit context needed to translate preserved label strokes from
@@ -492,71 +482,3 @@ async function attemptCleanup(inserted: Geometry[]): Promise<void> {
   }
 }
 
-/**
- * Axis-aligned bounding rectangle of every geometry's points. Used
- * by the cleanup path for the partial insert subset, where we can't
- * reuse emitGeometries' unionRect (that one covers the full set). The
- * logic is a duplicate of the similarly-named helper inside
- * emitGeometries, kept local so the cleanup path doesn't reach into
- * another module's private helpers.
- */
-function unionRectOfGeometries(geometries: Geometry[]): Rect {
-  if (geometries.length === 0) {
-    return {x: 0, y: 0, w: 0, h: 0};
-  }
-  let minX = Infinity;
-  let minY = Infinity;
-  let maxX = -Infinity;
-  let maxY = -Infinity;
-
-  const extend = (x: number, y: number): void => {
-    if (x < minX) {
-      minX = x;
-    }
-    if (y < minY) {
-      minY = y;
-    }
-    if (x > maxX) {
-      maxX = x;
-    }
-    if (y > maxY) {
-      maxY = y;
-    }
-  };
-
-  for (const g of geometries) {
-    switch (g.type) {
-      case 'GEO_polygon':
-      case 'straightLine': {
-        for (const p of g.points) {
-          extend(p.x, p.y);
-        }
-        break;
-      }
-      case 'GEO_circle':
-      case 'GEO_ellipse': {
-        const c = g.ellipseCenterPoint;
-        const r = Math.max(
-          g.ellipseMajorAxisRadius,
-          g.ellipseMinorAxisRadius,
-        );
-        extend(c.x - r, c.y - r);
-        extend(c.x + r, c.y + r);
-        break;
-      }
-      default: {
-        const _exhaustive: never = g;
-        throw new Error(
-          `insert.unionRectOfGeometries: unknown geometry variant ${
-            (_exhaustive as {type: string}).type
-          }`,
-        );
-      }
-    }
-  }
-
-  if (minX === Infinity) {
-    return {x: 0, y: 0, w: 0, h: 0};
-  }
-  return {x: minX, y: minY, w: maxX - minX, h: maxY - minY};
-}

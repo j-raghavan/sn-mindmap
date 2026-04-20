@@ -41,7 +41,6 @@ export const MARKER_CHANNEL_BYTES = 648; // 72*72/8, §6.2
 export const MARKER_NODE_RECORD_BYTES = 10; // §6.3
 export const MARKER_FORMAT_VERSION = 0x02; // v2 header byte, §6.2
 export const MARKER_PUBLISHED_NODE_CAP = 50; // §F-PE-4
-export const MARKER_THEORETICAL_NODE_CAP = 53; // §6.2 at ≥ 20% parity
 
 /**
  * Interleaved-chunk RS layout constants.
@@ -113,12 +112,22 @@ export const MARKER_PEN_TYPE = 10;
  */
 export const MARKER_BIT_STROKE_LEN = 3;
 
+/**
+ * User-facing capacity message verbatim from §F-PE-4. This is the
+ * string the UI shows in the capacity modal — no spec references, no
+ * numeric counts. A bare message means the same error bubbles up
+ * through the insert pipeline, gets caught in MindmapCanvas, and is
+ * rendered into the modal without any translation step that could
+ * drift from the spec's exact wording. `nodeCount` is still attached
+ * as an instance field for diagnostics / logcat.
+ */
+export const MARKER_CAPACITY_MESSAGE =
+  'This mindmap has more structure than can be embedded. Reduce ' +
+  'nodes, or split across multiple mindmaps.';
+
 export class MarkerCapacityError extends Error {
   constructor(public readonly nodeCount: number) {
-    super(
-      `Mindmap has ${nodeCount} nodes, exceeding the v0.1 cap of ` +
-        `${MARKER_PUBLISHED_NODE_CAP}. (See §F-PE-4 / §8.3.)`,
-    );
+    super(MARKER_CAPACITY_MESSAGE);
     this.name = 'MarkerCapacityError';
   }
 }

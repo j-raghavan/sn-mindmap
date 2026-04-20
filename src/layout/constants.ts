@@ -6,6 +6,18 @@
  * (1920×TBD per §10). §10 also tracks Manta pixel-height
  * verification — values that assume a 2560 height must not be frozen
  * until that is confirmed.
+ *
+ * Note: a few constants that used to live here were consolidated
+ * elsewhere during the Phase 5 cleanup because they duplicated the
+ * source-of-truth definition in their primary module:
+ *   - MARKER_PEN_WIDTH      → src/marker/encode.ts (§6.4 codec owner)
+ *   - PAGE_MARGIN           → INSERT_MARGIN_PX in src/insert.ts
+ *                             (fit-to-page scaler owner, §F-LY-6)
+ *   - NODE_INTERNAL_PADDING → decoder uses bbox-contains, not padded
+ *                             offsets; unused by the emit path
+ *   - RECENTER_ANIMATION_MS → the §F-AC-6 animation budget lives in
+ *                             MindmapCanvas's withLayoutTiming helper
+ *                             (not a shared constant)
  */
 
 /** First-level children orbit radius (distance from root to first ring). */
@@ -25,14 +37,6 @@ export const NODE_WIDTH = 220;
 export const NODE_HEIGHT = 96;
 
 /**
- * Internal padding inside every node outline per §8.1 — the user
- * needs visible writing room well inside the outline bbox so
- * handwritten labels naturally stay contained, which is what the
- * decode-time centroid rule relies on.
- */
-export const NODE_INTERNAL_PADDING = 12;
-
-/**
  * Rounded-rectangle corner radius for Add-Sibling nodes (§F-AC-3).
  * The root's Oval uses a corner radius ≥ half the shorter side
  * (§F-AC-2) — computed from NODE_HEIGHT at emit time, not stored here
@@ -46,14 +50,3 @@ export const SIBLING_CORNER_RADIUS = 15;
  */
 export const STANDARD_PEN_WIDTH = 400; // non-root node outlines + connectors
 export const ROOT_PEN_WIDTH = 500; // root Oval darker border (§F-AC-2, min ≥ 500)
-export const MARKER_PEN_WIDTH = 100; // marker cell strokes (§6.4, firmware min)
-
-/** Default page margin when fit-scaling on insert (§F-LY-6). */
-export const PAGE_MARGIN = 80;
-
-/**
- * Animation budget on mutation (§F-AC-6). Canvas re-runs the radial
- * layout and animates the re-center within this budget; devices in
- * fast-refresh mode may skip the animation entirely.
- */
-export const RECENTER_ANIMATION_MS = 250;

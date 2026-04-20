@@ -78,21 +78,3 @@ export function subscribeToButtonEvents(fn: ButtonSubscriber): () => void {
     subscribers.delete(fn);
   };
 }
-
-// --- Test-only helpers -----------------------------------------------------
-// Jest resets modules between suites, but if a single test wants a clean
-// slate without tearing down the whole module cache (e.g. for replay tests)
-// it can use these. NOT exported for production use.
-export const __testing__ = {
-  reset(): void {
-    lastEvent = null;
-    subscribers.clear();
-    installed = false;
-  },
-  getSubscriberCount(): number {
-    return subscribers.size;
-  },
-  isInstalled(): boolean {
-    return installed;
-  },
-};

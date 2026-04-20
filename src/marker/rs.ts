@@ -73,7 +73,7 @@ function gfMul(a: number, b: number): number {
 
 function gfDiv(a: number, b: number): number {
   if (b === 0) {
-    throw new Error('GF(256) division by zero');
+    throw new Error('rs: GF(256) division by zero');
   }
   if (a === 0) {
     return 0;

@@ -215,7 +215,7 @@ export function emitGeometries(input: EmitInput): EmitOutput {
 
   return {
     geometries,
-    unionRect: unionRectOf(geometries),
+    unionRect: unionRectOfGeometries(geometries),
   };
 }
 
@@ -363,8 +363,13 @@ function slabIntersect(
  * which does not appear in Phase 2's emit mix (the stadium Oval is
  * emitted as a GEO_polygon, not a GEO_ellipse — see
  * nodeFrame's §10 tuning note).
+ *
+ * Exported so insert.ts's §F-IN-5 cleanup path can compute the union
+ * rect of the PARTIAL insert subset (which emitGeometries itself
+ * can't reveal after the fact — its returned unionRect is always the
+ * full geometry list).
  */
-function unionRectOf(geometries: Geometry[]): Rect {
+export function unionRectOfGeometries(geometries: Geometry[]): Rect {
   if (geometries.length === 0) {
     return {x: 0, y: 0, w: 0, h: 0};
   }

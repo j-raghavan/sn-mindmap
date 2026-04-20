@@ -60,17 +60,7 @@ import {
   type OutOfMapStrokes,
   type StrokeBucket,
 } from './model/strokes';
-
-/**
- * Local narrow type for sn-plugin-lib's `{success, result}` envelope.
- * The SDK declares return values as the generic `Object` — same
- * shape as ./insert.ts's ApiRes, duplicated here so the two call
- * sites stay self-contained.
- */
-type ApiRes<T> =
-  | {success: boolean; result?: T; error?: {message?: string}}
-  | null
-  | undefined;
+import type {ApiRes} from './pluginApi';
 
 /**
  * Outer view phases — purely a UI concern, not tied to the decoder's

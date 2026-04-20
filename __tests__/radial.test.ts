@@ -17,15 +17,13 @@
 import {radialLayout} from '../src/layout/radial';
 import {
   LEVEL_RADIUS_INCREMENT,
-  MARKER_PEN_WIDTH,
   NODE_HEIGHT,
-  NODE_INTERNAL_PADDING,
   NODE_WIDTH,
-  PAGE_MARGIN,
   R1,
   ROOT_PEN_WIDTH,
   STANDARD_PEN_WIDTH,
 } from '../src/layout/constants';
+import {MARKER_PEN_WIDTH} from '../src/marker/encode';
 import {
   addChild,
   addSibling,
@@ -44,17 +42,15 @@ describe('radial layout', () => {
       expect(LEVEL_RADIUS_INCREMENT).toBeGreaterThan(0);
       expect(NODE_WIDTH).toBeGreaterThan(0);
       expect(NODE_HEIGHT).toBeGreaterThan(0);
-      // §8.1 internal padding: 12 px so handwriting stays inside the
-      // outline naturally.
-      expect(NODE_INTERNAL_PADDING).toBe(12);
       // §F-AC-2 root oval pen width ≥ 500.
       expect(ROOT_PEN_WIDTH).toBeGreaterThanOrEqual(500);
       // §11 standard outline weight.
       expect(STANDARD_PEN_WIDTH).toBe(400);
       // §6.4 marker pen width = firmware MIN_PEN_WIDTH = 100.
+      // Lives in marker/encode.ts since Phase 5 — the codec owns it.
+      // (§F-LY-6 fit-to-page margin is asserted in insert.test.ts,
+      // where INSERT_MARGIN_PX is actually consumed.)
       expect(MARKER_PEN_WIDTH).toBe(100);
-      // §F-LY-6 default insert margin.
-      expect(PAGE_MARGIN).toBe(80);
     });
   });
 
