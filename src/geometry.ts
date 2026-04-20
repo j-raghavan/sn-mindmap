@@ -80,13 +80,23 @@ export type Rect = {
 
 /**
  * Default pen style for sn-mindmap emissions. Per the conventions
- * inherited from sn-shapes (§11): black, pen width 400, standard
- * pen type. Overridden per-emission for the root Oval darker border
+ * inherited from sn-shapes (§11): black, Fineliner pen type, pen
+ * width 400. Overridden per-emission for the root Oval darker border
  * (pen width ≥ 500, §F-AC-2) and the marker cells (0x9D, pen width
  * 100, §6.4).
+ *
+ * `penType: 10` is **required** — the firmware rejects insertGeometry
+ * calls with an "invalid pen type" error for any value outside its
+ * allow-list {1=Pressure, 10=Fineliner, 11=Marker, 14=Calligraphy}
+ * (PEN_TYPE_PRESETS in sn-shapes/src/ShapeOptionsPanel.tsx:141-145).
+ * Earlier drafts of this file used `penType: 0`, which passes our
+ * jest suite (we don't validate the allow-list in unit tests) but
+ * fails on Nomad/Manta as soon as the first outline reaches
+ * PluginCommAPI. sn-shapes anchors this same default in
+ * PEN_DEFAULTS at sn-shapes/src/shapes.ts:82-90.
  */
 export const PEN_DEFAULTS: PenStyle = {
   penColor: 0x00,
-  penType: 0,
+  penType: 10,
   penWidth: 400,
 };

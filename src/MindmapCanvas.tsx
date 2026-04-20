@@ -16,9 +16,16 @@
  *   - Delete subtree (small × top-right, only on selected node) —
  *     hidden on the root (use Cancel)
  *
- * Top bar (§F-AC-8): Cancel | Insert. Insert is always enabled
- * because the tree always has ≥ 1 node (§F-AC-8 — no committed-
- * strokes precondition since the plugin does not own labels).
+ * Top bar (§F-AC-8): Cancel | Clear | Insert. Insert is always
+ * enabled because the tree always has ≥ 1 node (§F-AC-8 — no
+ * committed-strokes precondition since the plugin does not own
+ * labels). Clear resets the tree back to a single-root fresh state
+ * for "start over" authoring; because it's destructive, it uses a
+ * two-tap confirm pattern (first tap arms the button, second tap
+ * within CLEAR_CONFIRM_MS commits — matches the sn-shapes approach
+ * of avoiding RN `Alert.alert` on e-ink firmware, where the native
+ * modal's flashing animation looks poor and has never been verified
+ * on Nomad/Manta).
  *
  * On Insert tap this component hands off to ./insert.ts.
  *
@@ -124,6 +131,18 @@ const VIEWPORT_PADDING = 48;
  */
 const INSERT_ERROR_DISPLAY_MS = 2000;
 
+/**
+ * Two-tap confirm window for the destructive Clear button. A first
+ * tap swaps the label to "Confirm Clear"; a second tap within this
+ * window commits the reset. After the window elapses with no second
+ * tap the button silently disarms back to "Clear".
+ *
+ * 3 s is long enough for an authoring user to take a breath and
+ * confirm on purpose, short enough that a stale armed state never
+ * sits around long enough to catch the next tap by surprise.
+ */
+const CLEAR_CONFIRM_MS = 3000;
+
 export type MindmapCanvasProps = {
   /**
    * Optional preloaded tree for the edit round-trip (§F-ED-6) or for
@@ -142,7 +161,8 @@ type Action =
   | {type: 'ADD_CHILD'; parentId: NodeId}
   | {type: 'ADD_SIBLING'; nodeId: NodeId}
   | {type: 'DELETE_SUBTREE'; nodeId: NodeId}
-  | {type: 'TOGGLE_COLLAPSE'; nodeId: NodeId};
+  | {type: 'TOGGLE_COLLAPSE'; nodeId: NodeId}
+  | {type: 'CLEAR'};
 
 /**
  * Pure reducer: clones the previous tree and applies the mutators
@@ -151,6 +171,11 @@ type Action =
  * immutable-style state transition.
  */
 function treeReducer(state: Tree, action: Action): Tree {
+  // CLEAR discards the previous state entirely — no point cloning it
+  // only to overwrite — so it short-circuits before the clone.
+  if (action.type === 'CLEAR') {
+    return createTree();
+  }
   const next = cloneTree(state);
   switch (action.type) {
     case 'ADD_CHILD':
@@ -308,6 +333,46 @@ export default function MindmapCanvas({
     );
   }, []);
 
+  // Clear-button two-tap confirm state. `clearArmed` flips to true on
+  // the first tap, re-rendering the button label as "Confirm Clear".
+  // A second tap within CLEAR_CONFIRM_MS commits the reset; otherwise
+  // the disarm timer silently puts the button back to "Clear".
+  const [clearArmed, setClearArmed] = useState(false);
+  const clearArmedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    return () => {
+      if (clearArmedTimerRef.current) {
+        clearTimeout(clearArmedTimerRef.current);
+      }
+    };
+  }, []);
+
+  const handleClear = useCallback(() => {
+    // Refuse to clear mid-insert — the insert pipeline reads `tree`
+    // from the render that kicked it off, but a confused user
+    // shouldn't be able to wipe the canvas while the device is still
+    // painting the previous map.
+    if (insertingRef.current) {
+      return;
+    }
+    if (clearArmedTimerRef.current) {
+      clearTimeout(clearArmedTimerRef.current);
+      clearArmedTimerRef.current = null;
+    }
+    if (!clearArmed) {
+      setClearArmed(true);
+      clearArmedTimerRef.current = setTimeout(() => {
+        setClearArmed(false);
+        clearArmedTimerRef.current = null;
+      }, CLEAR_CONFIRM_MS);
+      return;
+    }
+    // Second tap within the confirm window — commit.
+    dispatch({type: 'CLEAR'});
+    setSelectedId(null);
+    setClearArmed(false);
+  }, [clearArmed]);
+
   /**
    * Handle Insert tap. Delegates the whole §F-IN-* pipeline to
    * ./insert.ts; the canvas only owns the pending/error UX. On
@@ -348,6 +413,35 @@ export default function MindmapCanvas({
             pressed && styles.topBarBtnPressed,
           ]}>
           <Text style={styles.topBarBtnText}>Cancel</Text>
+        </Pressable>
+        {/*
+         * Clear — two-tap destructive reset. Label swaps to
+         * "Confirm Clear" after first tap; second tap within
+         * CLEAR_CONFIRM_MS wipes the tree back to a single-root
+         * fresh state. Disabled while an insert is in flight so the
+         * canvas state doesn't change out from under the pipeline.
+         */}
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={clearArmed ? 'Confirm Clear' : 'Clear'}
+          accessibilityState={{disabled: isInserting}}
+          disabled={isInserting}
+          onPress={handleClear}
+          style={({pressed}) => [
+            styles.topBarBtn,
+            styles.topBarBtnAdjacent,
+            pressed && !isInserting && styles.topBarBtnPressed,
+            clearArmed && styles.topBarBtnArmed,
+            isInserting && styles.topBarBtnDisabled,
+          ]}>
+          <Text
+            style={[
+              styles.topBarBtnText,
+              clearArmed && styles.topBarBtnTextArmed,
+              isInserting && styles.topBarBtnTextDisabled,
+            ]}>
+            {clearArmed ? 'Confirm Clear' : 'Clear'}
+          </Text>
         </Pressable>
         <View style={styles.topBarSpacer} />
         {/*
@@ -874,16 +968,29 @@ const styles = StyleSheet.create({
     borderColor: '#000',
     borderRadius: 4,
   },
+  topBarBtnAdjacent: {
+    marginLeft: 8,
+  },
   topBarBtnPressed: {
     backgroundColor: '#eee',
   },
   topBarBtnDisabled: {
     borderColor: '#999',
   },
+  // Armed state for the Clear button: inverted black-on-white → white-
+  // on-black so the "this is about to destroy your work" signal is
+  // impossible to miss even on e-ink.
+  topBarBtnArmed: {
+    backgroundColor: '#000',
+    borderColor: '#000',
+  },
   topBarBtnText: {
     fontSize: 14,
     fontWeight: '500',
     color: '#000',
+  },
+  topBarBtnTextArmed: {
+    color: '#fff',
   },
   topBarBtnTextDisabled: {
     color: '#999',

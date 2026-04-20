@@ -571,6 +571,106 @@ describe('MindmapCanvas', () => {
     });
   });
 
+  describe('Clear button — destructive reset with two-tap confirm', () => {
+    beforeEach(() => {
+      jest.useFakeTimers();
+    });
+    afterEach(() => {
+      act(() => {
+        jest.runOnlyPendingTimers();
+      });
+      jest.useRealTimers();
+    });
+
+    it('renders a Clear button with accessibilityLabel in the top bar', () => {
+      const {renderer, unmount} = renderCanvas(<MindmapCanvas />);
+      expect(findHostByLabel(renderer, 'Clear')).toHaveLength(1);
+      unmount();
+    });
+
+    it('first tap arms the button (label swaps to "Confirm Clear"); tree unchanged', () => {
+      const tree = createTree();
+      addChild(tree, tree.rootId);
+      addChild(tree, tree.rootId);
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      // Before tap: three nodes visible, "Clear" label present.
+      expect(findHostByLabel(renderer, 'Clear')).toHaveLength(1);
+      expect(findHostByLabel(renderer, 'Confirm Clear')).toHaveLength(0);
+      expect(findHostByLabel(renderer, 'node-1')).toHaveLength(1);
+      expect(findHostByLabel(renderer, 'node-2')).toHaveLength(1);
+      // First tap arms — children are still present.
+      pressByLabel(renderer, 'Clear');
+      expect(findHostByLabel(renderer, 'Clear')).toHaveLength(0);
+      expect(findHostByLabel(renderer, 'Confirm Clear')).toHaveLength(1);
+      expect(findHostByLabel(renderer, 'node-1')).toHaveLength(1);
+      expect(findHostByLabel(renderer, 'node-2')).toHaveLength(1);
+      unmount();
+    });
+
+    it('second tap within the confirm window wipes the tree back to a single root', () => {
+      const tree = createTree();
+      addChild(tree, tree.rootId);
+      addChild(tree, tree.rootId);
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      pressByLabel(renderer, 'Clear');
+      pressByLabel(renderer, 'Confirm Clear');
+      // Only the fresh root (id=0) should remain. Previous ids 1 and
+      // 2 are gone.
+      expect(findHostByLabel(renderer, 'node-0')).toHaveLength(1);
+      expect(findHostByLabel(renderer, 'node-1')).toHaveLength(0);
+      expect(findHostByLabel(renderer, 'node-2')).toHaveLength(0);
+      // Button disarms back to "Clear" after commit.
+      expect(findHostByLabel(renderer, 'Clear')).toHaveLength(1);
+      expect(findHostByLabel(renderer, 'Confirm Clear')).toHaveLength(0);
+      unmount();
+    });
+
+    it('clears selection when the tree is reset (no stale selectedId pointing at a dead node)', () => {
+      const tree = createTree();
+      const a = addChild(tree, tree.rootId);
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      // Select `a` so its Delete × appears — this is our selection
+      // tell.
+      pressByLabel(renderer, `node-${a}`);
+      expect(findHostByLabel(renderer, `delete-${a}`)).toHaveLength(1);
+      pressByLabel(renderer, 'Clear');
+      pressByLabel(renderer, 'Confirm Clear');
+      // After clear: node `a` is gone AND the fresh root is not
+      // selected (no delete icon renders anywhere — the root is never
+      // deletable regardless of selection, but we also assert that
+      // the old id doesn't leak back as a dangling selection that
+      // would break assumptions downstream).
+      expect(findHostByLabel(renderer, `node-${a}`)).toHaveLength(0);
+      expect(findHostByLabel(renderer, `delete-${a}`)).toHaveLength(0);
+      unmount();
+    });
+
+    it('auto-disarms after CLEAR_CONFIRM_MS with no second tap (tree unchanged)', () => {
+      const tree = createTree();
+      addChild(tree, tree.rootId);
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      pressByLabel(renderer, 'Clear');
+      expect(findHostByLabel(renderer, 'Confirm Clear')).toHaveLength(1);
+      // Advance past the confirm window; the disarm timer fires and
+      // the button reverts to "Clear" without touching the tree.
+      act(() => {
+        jest.advanceTimersByTime(3500);
+      });
+      expect(findHostByLabel(renderer, 'Clear')).toHaveLength(1);
+      expect(findHostByLabel(renderer, 'Confirm Clear')).toHaveLength(0);
+      expect(findHostByLabel(renderer, 'node-1')).toHaveLength(1);
+      unmount();
+    });
+  });
+
   describe('Phase 2.2 — Insert button wires to insertMindmap (§F-IN-*)', () => {
     beforeEach(() => {
       (PluginCommAPI.insertGeometry as jest.Mock).mockClear();

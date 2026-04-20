@@ -183,6 +183,18 @@ describe('nodeFrame', () => {
         expect(geo.penType).toBe(PEN_DEFAULTS.penType);
       }
     });
+
+    // Regression guard against the "invalid pen type" on-device error
+    // seen in April 2026: the firmware's insertGeometry only accepts
+    // penType values {1=Pressure, 10=Fineliner, 11=Marker,
+    // 14=Calligraphy} (sn-shapes/src/ShapeOptionsPanel.tsx:141-145).
+    // Any other value fails at insert with "invalid pen type". Since
+    // our emitters all spread PEN_DEFAULTS, pinning PEN_DEFAULTS.penType
+    // to the allow-list here catches the regression in unit tests.
+    it('PEN_DEFAULTS.penType is in the firmware allow-list', () => {
+      const FIRMWARE_PEN_TYPE_ALLOW_LIST = new Set([1, 10, 11, 14]);
+      expect(FIRMWARE_PEN_TYPE_ALLOW_LIST.has(PEN_DEFAULTS.penType)).toBe(true);
+    });
   });
 
   describe('error handling', () => {
