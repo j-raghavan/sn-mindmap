@@ -1,3 +1,4 @@
+/* eslint-disable no-bitwise */
 /**
  * Marker encoder — Tree -> binary records -> RS codeword -> bit
  * matrix -> Geometry[] (§6).
@@ -30,7 +31,8 @@
  * can detect this case explicitly.
  */
 import type {Geometry, Point, Rect} from '../geometry';
-import type {Tree, NodeId} from '../model/tree';
+import {ShapeKind, type Tree, type NodeId} from '../model/tree';
+import {crc32, rsEncode} from './rs';
 
 export const MARKER_GRID = 72; // cells per side, §6.1
 export const MARKER_CELL_PX = 4; // px per cell, §6.1
@@ -40,6 +42,50 @@ export const MARKER_NODE_RECORD_BYTES = 10; // §6.3
 export const MARKER_FORMAT_VERSION = 0x02; // v2 header byte, §6.2
 export const MARKER_PUBLISHED_NODE_CAP = 50; // §F-PE-4
 export const MARKER_THEORETICAL_NODE_CAP = 53; // §6.2 at ≥ 20% parity
+
+/**
+ * Interleaved-chunk RS layout constants.
+ *
+ * §6.2 describes the 648-byte channel as a single RS codeword, but
+ * GF(256) caps codewords at 255 bytes — so a pure single-block
+ * encoding is not representable in the field the codec actually uses.
+ * The smallest adjustment that preserves §6.2's capacity math
+ * (N ≤ 50 at ≥ 20% parity) is to interleave K = 3 independent
+ * RS(216, 170) codewords across the 648-byte channel:
+ *
+ *   chunk 0 : buf[  0 .. 215]  (first 170 = message, last 46 = parity)
+ *   chunk 1 : buf[216 .. 431]
+ *   chunk 2 : buf[432 .. 647]
+ *
+ * Global logical message (510 bytes total) is the concatenation of
+ * each chunk's message region: logicalMsg[k*170 + j] <-> buf[k*216 + j].
+ * Per-chunk parity is fixed at 46 bytes (≈27% ratio) regardless of
+ * node count; the decoder never has to guess the split from the
+ * (possibly corrupted) raw byte 1 as a result. Channel bytes beyond
+ * the actual encoded message get zero-padded — RS treats the pad as
+ * ordinary message bytes, so those zeros are corrected along with
+ * everything else.
+ *
+ * This diverges from the letter of §6.2 (which describes a single
+ * contiguous parity tail at buf[2+10N+4..647]); §10 tracks the spec
+ * update required to codify the interleaved layout. The capacity
+ * table in §6.2 still applies: max N with fixed 138-byte global
+ * parity is exactly 50.
+ */
+export const MARKER_NUM_CHUNKS = 3;
+export const MARKER_CHUNK_BYTES = MARKER_CHANNEL_BYTES / MARKER_NUM_CHUNKS; // 216
+export const MARKER_CHUNK_PARITY = 46;
+export const MARKER_CHUNK_MESSAGE =
+  MARKER_CHUNK_BYTES - MARKER_CHUNK_PARITY; // 170
+export const MARKER_LOGICAL_MESSAGE_BYTES =
+  MARKER_NUM_CHUNKS * MARKER_CHUNK_MESSAGE; // 510
+
+/**
+ * Root node uses 0xFF as a sentinel parent index. Non-root nodes
+ * always have parent < self in the serialized array, so 0xFF can
+ * never collide with a valid parent index.
+ */
+export const MARKER_ROOT_PARENT = 0xff;
 
 export class MarkerCapacityError extends Error {
   constructor(public readonly nodeCount: number) {
@@ -62,23 +108,184 @@ export type EncodeInput = {
 /**
  * Pack a Tree into the on-paper marker geometries.
  *
- * TODO(Phase 3, §6): implement — tree -> binary records -> CRC32 ->
- * RS encode -> bit matrix -> Geometry[] of length-3-px straightLines.
- *
- * Throws MarkerCapacityError if tree.nodesById.size >
- * MARKER_PUBLISHED_NODE_CAP.
+ * TODO(Phase 3.3, §6.4): implement bit-matrix -> Geometry[] renderer
+ * on top of encodeMarkerBytes. This function exists to make the
+ * module exports stable; Phase 3.3 turns the 648-byte buffer into
+ * length-3-px straightLines at the §6.4 pen color / width.
  */
 export function encodeMarker(_input: EncodeInput): Geometry[] {
-  throw new Error('TODO(Phase 3, §6): encodeMarker not implemented');
+  throw new Error('TODO(Phase 3.3, §6.4): encodeMarker not implemented');
 }
 
 /**
- * Encode just the binary record buffer (header + length + node
- * records + CRC32 + RS parity). Exposed separately so unit tests can
- * round-trip bytes without going through the bit-matrix renderer.
+ * Encode a tree into the 648-byte marker channel buffer — header +
+ * length + node records + CRC32, RS-protected via interleaved
+ * RS(216, 170) chunks (see MARKER_NUM_CHUNKS and friends).
  *
- * TODO(Phase 3, §6.2 / §6.3): implement.
+ * Traversal order: BFS from the root. The root lives at index 0 with
+ * parent = 0xFF (MARKER_ROOT_PARENT); every non-root node has
+ * parent index < its own index by construction. BFS is deterministic
+ * because Tree.nodesById uses insertion-ordered Maps and childIds is
+ * an ordered array.
+ *
+ * Throws MarkerCapacityError if the tree has more than
+ * MARKER_PUBLISHED_NODE_CAP nodes; callers surface the §F-PE-4
+ * modal and abort insert.
  */
-export function encodeMarkerBytes(_input: EncodeInput): Uint8Array {
-  throw new Error('TODO(Phase 3, §6.2 / §6.3): encodeMarkerBytes not implemented');
+export function encodeMarkerBytes(input: EncodeInput): Uint8Array {
+  const {tree, nodeBboxesById} = input;
+  const orderedIds = bfsOrder(tree);
+  const N = orderedIds.length;
+  if (N === 0) {
+    throw new Error('encodeMarkerBytes: empty tree (no nodes)');
+  }
+  if (N > MARKER_PUBLISHED_NODE_CAP) {
+    throw new MarkerCapacityError(N);
+  }
+  if (N > 0xff) {
+    // Belt-and-braces: MARKER_PUBLISHED_NODE_CAP is 50 so we're
+    // nowhere near 0xFF (255), but N is stored in a single byte so
+    // the ceiling is hard-capped at 255 regardless of what the
+    // published cap eventually grows to.
+    throw new MarkerCapacityError(N);
+  }
+
+  // Build logical message: header + records + CRC + zero pad.
+  const logicalMsg = new Uint8Array(MARKER_LOGICAL_MESSAGE_BYTES);
+  logicalMsg[0] = MARKER_FORMAT_VERSION;
+  logicalMsg[1] = N;
+
+  const idxById = new Map<NodeId, number>();
+  for (let i = 0; i < orderedIds.length; i += 1) {
+    idxById.set(orderedIds[i], i);
+  }
+
+  for (let i = 0; i < N; i += 1) {
+    const id = orderedIds[i];
+    const node = tree.nodesById.get(id);
+    if (!node) {
+      throw new Error(`encodeMarkerBytes: orphan id ${id} in orderedIds`);
+    }
+    const bbox = nodeBboxesById.get(id);
+    if (!bbox) {
+      throw new Error(`encodeMarkerBytes: no bbox for node ${id}`);
+    }
+    const parentIdx =
+      node.parentId === null
+        ? MARKER_ROOT_PARENT
+        : idxById.get(node.parentId) ?? MARKER_ROOT_PARENT;
+    writeRecord(
+      logicalMsg,
+      2 + i * MARKER_NODE_RECORD_BYTES,
+      parentIdx,
+      node.shape,
+      bbox,
+    );
+  }
+
+  // CRC32 covers header + records (bytes 0..2+10N-1).
+  const crcScope = 2 + N * MARKER_NODE_RECORD_BYTES;
+  const crc = crc32(logicalMsg.subarray(0, crcScope));
+  writeUint32BE(logicalMsg, crcScope, crc);
+
+  // Interleaved RS encode: one chunk at a time into the channel.
+  const channel = new Uint8Array(MARKER_CHANNEL_BYTES);
+  for (let k = 0; k < MARKER_NUM_CHUNKS; k += 1) {
+    const msgStart = k * MARKER_CHUNK_MESSAGE;
+    const chunkMsg = logicalMsg.subarray(
+      msgStart,
+      msgStart + MARKER_CHUNK_MESSAGE,
+    );
+    const chunkCw = rsEncode(chunkMsg, MARKER_CHUNK_PARITY);
+    channel.set(chunkCw, k * MARKER_CHUNK_BYTES);
+  }
+  return channel;
+}
+
+// -------------------------------------------------------------------
+// internal helpers
+// -------------------------------------------------------------------
+
+/**
+ * BFS the tree starting at the root. The resulting array establishes
+ * the (node id -> record index) mapping used throughout the marker
+ * codec.
+ */
+function bfsOrder(tree: Tree): NodeId[] {
+  const out: NodeId[] = [];
+  const queue: NodeId[] = [tree.rootId];
+  const seen = new Set<NodeId>([tree.rootId]);
+  while (queue.length > 0) {
+    const id = queue.shift() as NodeId;
+    out.push(id);
+    const node = tree.nodesById.get(id);
+    if (!node) {
+      continue;
+    }
+    for (const childId of node.childIds) {
+      if (seen.has(childId)) {
+        continue;
+      }
+      seen.add(childId);
+      queue.push(childId);
+    }
+  }
+  return out;
+}
+
+/**
+ * Write a single 10-byte node record into `buf` at `offset`. Layout:
+ *
+ *   [0]    parent index (uint8, 0xFF for root)
+ *   [1]    shape kind (uint8, ShapeKind enum)
+ *   [2..3] bbox x (uint16 big-endian)
+ *   [4..5] bbox y (uint16 big-endian)
+ *   [6..7] bbox w (uint16 big-endian)
+ *   [8..9] bbox h (uint16 big-endian)
+ *
+ * Per §6.3 coords must fit uint16. We clamp negative values to 0
+ * defensively — mindmap-local coords after the origin shift in §F-IN-2
+ * are guaranteed non-negative, but a caller bug that passes a raw
+ * page-space bbox with a negative x shouldn't produce undefined
+ * behavior silently.
+ */
+function writeRecord(
+  buf: Uint8Array,
+  offset: number,
+  parentIdx: number,
+  shape: ShapeKind,
+  bbox: Rect,
+): void {
+  buf[offset + 0] = parentIdx & 0xff;
+  buf[offset + 1] = shape & 0xff;
+  writeUint16BE(buf, offset + 2, clampU16(bbox.x));
+  writeUint16BE(buf, offset + 4, clampU16(bbox.y));
+  writeUint16BE(buf, offset + 6, clampU16(bbox.w));
+  writeUint16BE(buf, offset + 8, clampU16(bbox.h));
+}
+
+function writeUint16BE(buf: Uint8Array, offset: number, value: number): void {
+  buf[offset + 0] = (value >>> 8) & 0xff;
+  buf[offset + 1] = value & 0xff;
+}
+
+function writeUint32BE(buf: Uint8Array, offset: number, value: number): void {
+  buf[offset + 0] = (value >>> 24) & 0xff;
+  buf[offset + 1] = (value >>> 16) & 0xff;
+  buf[offset + 2] = (value >>> 8) & 0xff;
+  buf[offset + 3] = value & 0xff;
+}
+
+function clampU16(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+  const v = Math.round(value);
+  if (v < 0) {
+    return 0;
+  }
+  if (v > 0xffff) {
+    return 0xffff;
+  }
+  return v;
 }
