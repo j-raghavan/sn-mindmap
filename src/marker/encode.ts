@@ -87,6 +87,32 @@ export const MARKER_LOGICAL_MESSAGE_BYTES =
  */
 export const MARKER_ROOT_PARENT = 0xff;
 
+/**
+ * §6.4 marker pen style. Pen color 0x9D is the "invisible-ish" channel
+ * the firmware provides for technical/metadata strokes — it's how we
+ * keep the marker strokes out of the authoring viewport while still
+ * persisting them to the page's stroke list. Pen width 100 keeps the
+ * per-cell stroke well under the 4 px cell footprint.
+ *
+ * penType: 10 (Fineliner) is **required** by the firmware allow-list
+ * — the insertGeometry API rejects anything outside
+ * {1=Pressure, 10=Fineliner, 11=Marker, 14=Calligraphy}. See the same
+ * note in geometry.ts's PEN_DEFAULTS for the on-device fallout of
+ * getting this wrong.
+ */
+export const MARKER_PEN_COLOR = 0x9d;
+export const MARKER_PEN_WIDTH = 100;
+export const MARKER_PEN_TYPE = 10;
+
+/**
+ * Length (in pixels) of each per-bit straightLine inside its 4-px
+ * cell (§6.4). Keeping it strictly less than the cell size means
+ * adjacent "1" bits never touch — the decoder projects stroke
+ * midpoints to cells without risk of a single stroke being claimed
+ * by two cells.
+ */
+export const MARKER_BIT_STROKE_LEN = 3;
+
 export class MarkerCapacityError extends Error {
   constructor(public readonly nodeCount: number) {
     super(
@@ -106,15 +132,51 @@ export type EncodeInput = {
 };
 
 /**
- * Pack a Tree into the on-paper marker geometries.
+ * Pack a Tree into the on-paper marker geometries (§6.4).
  *
- * TODO(Phase 3.3, §6.4): implement bit-matrix -> Geometry[] renderer
- * on top of encodeMarkerBytes. This function exists to make the
- * module exports stable; Phase 3.3 turns the 648-byte buffer into
- * length-3-px straightLines at the §6.4 pen color / width.
+ * Delegates to encodeMarkerBytes for the 648-byte channel, then
+ * unpacks the 5184 bits in row-major order and emits one
+ * MARKER_BIT_STROKE_LEN-px horizontal straightLine per "1" bit at
+ * the cell's top-left corner. Cells holding a "0" bit emit nothing —
+ * the decoder treats absent cells as 0 bits.
+ *
+ * Bit packing convention (matched in decodeMarker): bit index
+ * `row * MARKER_GRID + col` lands in byte `bitIndex >>> 3`,
+ * MSB-first (bit 0 is the 0x80 mask). Row 0 spans bytes [0..8]
+ * inclusive (72 bits = 9 bytes), row 1 spans bytes [9..17], etc.
+ *
+ * Every emitted geometry has showLassoAfterInsert=false — the caller
+ * in insert.ts lassos the union rect of outlines + marker explicitly
+ * at the end of the emit pipeline (§F-IN-3).
  */
-export function encodeMarker(_input: EncodeInput): Geometry[] {
-  throw new Error('TODO(Phase 3.3, §6.4): encodeMarker not implemented');
+export function encodeMarker(input: EncodeInput): Geometry[] {
+  const bytes = encodeMarkerBytes(input);
+  const {markerOrigin} = input;
+  const out: Geometry[] = [];
+  for (let row = 0; row < MARKER_GRID; row += 1) {
+    for (let col = 0; col < MARKER_GRID; col += 1) {
+      const bitIndex = row * MARKER_GRID + col;
+      const byteIdx = bitIndex >>> 3;
+      const bitMask = 0x80 >>> (bitIndex & 7);
+      if ((bytes[byteIdx] & bitMask) === 0) {
+        continue;
+      }
+      const x = markerOrigin.x + col * MARKER_CELL_PX;
+      const y = markerOrigin.y + row * MARKER_CELL_PX;
+      out.push({
+        type: 'straightLine',
+        points: [
+          {x, y},
+          {x: x + MARKER_BIT_STROKE_LEN, y},
+        ],
+        penColor: MARKER_PEN_COLOR,
+        penType: MARKER_PEN_TYPE,
+        penWidth: MARKER_PEN_WIDTH,
+        showLassoAfterInsert: false,
+      });
+    }
+  }
+  return out;
 }
 
 /**

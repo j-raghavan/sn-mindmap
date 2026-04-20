@@ -19,14 +19,18 @@
 import {decodeMarker, decodeMarkerBytes} from '../src/marker/decode';
 import type {DecodeResult} from '../src/marker/decode';
 import {
+  MARKER_CELL_PX,
   MARKER_CHANNEL_BYTES,
   MARKER_CHUNK_BYTES,
   MARKER_CHUNK_MESSAGE,
   MARKER_CHUNK_PARITY,
+  MARKER_FOOTPRINT_PX,
   MARKER_LOGICAL_MESSAGE_BYTES,
   MARKER_NODE_RECORD_BYTES,
   MARKER_NUM_CHUNKS,
+  MARKER_PEN_COLOR,
   MARKER_PUBLISHED_NODE_CAP,
+  encodeMarker,
   encodeMarkerBytes,
 } from '../src/marker/encode';
 import {
@@ -37,7 +41,7 @@ import {
   type NodeId,
   type Tree,
 } from '../src/model/tree';
-import type {Rect} from '../src/geometry';
+import type {Geometry, Rect} from '../src/geometry';
 
 // ---------------------------------------------------------------------
 // helpers
@@ -115,14 +119,10 @@ function expectErr(
 // tests
 // ---------------------------------------------------------------------
 
-describe('decodeMarker (Phase 3.3 scaffold)', () => {
+describe('decodeMarker (bit-matrix pipeline, §6.5)', () => {
   it('exposes decodeMarker and decodeMarkerBytes', () => {
     expect(typeof decodeMarker).toBe('function');
     expect(typeof decodeMarkerBytes).toBe('function');
-  });
-
-  it('decodeMarker still throws — the bit-matrix recovery is a Phase 3.3 TODO', () => {
-    expect(() => decodeMarker([])).toThrow(/Phase 3\.3/);
   });
 
   it('DecodeResult type accepts every §F-ED-4 reason code', () => {
@@ -139,6 +139,175 @@ describe('decodeMarker (Phase 3.3 scaffold)', () => {
       {ok: false, reason: 'bad_record', message: 'Invalid node record'},
     ];
     expect(reasons).toHaveLength(5);
+  });
+
+  it('empty input -> no_candidates', () => {
+    expectErr(decodeMarker([]), 'no_candidates');
+  });
+
+  it('non-marker strokes only -> no_candidates', () => {
+    const nonMarker: Geometry[] = [
+      {
+        type: 'straightLine',
+        points: [
+          {x: 0, y: 0},
+          {x: 100, y: 0},
+        ],
+        penColor: 0x00, // black, not 0x9D
+        penType: 10,
+        penWidth: 400,
+      },
+      {
+        type: 'GEO_polygon',
+        points: [
+          {x: 0, y: 0},
+          {x: 10, y: 0},
+          {x: 10, y: 10},
+        ],
+        penColor: 0x9d, // right color but wrong type — shouldn't match
+        penType: 10,
+        penWidth: 100,
+      },
+    ];
+    expectErr(decodeMarker(nonMarker), 'no_candidates');
+  });
+
+  it('filters out too-long strokes that happen to share the pen color', () => {
+    // Strokes with pen color 0x9D but > 4 px long are not marker cells.
+    const g: Geometry = {
+      type: 'straightLine',
+      points: [
+        {x: 0, y: 0},
+        {x: 10, y: 0}, // 10 px — too long for a cell
+      ],
+      penColor: MARKER_PEN_COLOR,
+      penType: 10,
+      penWidth: 100,
+    };
+    expectErr(decodeMarker([g]), 'no_candidates');
+  });
+
+  it('full round-trip at origin (0, 0)', () => {
+    const {tree, nodeBboxesById} = buildTree(t => {
+      addChild(t, 0);
+      const b = addChild(t, 0);
+      addSibling(t, b);
+    });
+    const geoms = encodeMarker({
+      tree,
+      nodeBboxesById,
+      markerOrigin: {x: 0, y: 0},
+    });
+    const result = decodeMarker(geoms);
+    expectOk(result);
+    expectTreesEquivalent(result.tree, tree);
+    expectBboxesEquivalent(result.nodeBboxesById, nodeBboxesById);
+  });
+
+  it('full round-trip at a non-zero origin (100, 200)', () => {
+    const {tree, nodeBboxesById} = buildTree(t => {
+      const a = addChild(t, 0);
+      addSibling(t, a);
+      addChild(t, a);
+    });
+    const origin = {x: 100, y: 200};
+    const geoms = encodeMarker({tree, nodeBboxesById, markerOrigin: origin});
+    const result = decodeMarker(geoms);
+    expectOk(result);
+    expectTreesEquivalent(result.tree, tree);
+    // markerOriginPage should come back within a cell of the true
+    // origin. Min-endpoint inference snaps to the leftmost set-bit
+    // column; for the search loop to lock in, the returned origin
+    // equals origin.x - dx*CELL for some dx in [0, 2].
+    expect(Math.abs(result.markerOriginPage.x - origin.x)).toBeLessThanOrEqual(
+      2 * MARKER_CELL_PX,
+    );
+    expect(Math.abs(result.markerOriginPage.y - origin.y)).toBeLessThanOrEqual(
+      2 * MARKER_CELL_PX,
+    );
+  });
+
+  it('stroke ordering does not affect the decoded tree', () => {
+    const {tree, nodeBboxesById} = buildTree(t => {
+      addChild(t, 0);
+      addChild(t, 0);
+    });
+    const geoms = encodeMarker({
+      tree,
+      nodeBboxesById,
+      markerOrigin: {x: 0, y: 0},
+    });
+    // Reverse the stroke order.
+    const shuffled = geoms.slice().reverse();
+    const original = decodeMarker(geoms);
+    const flipped = decodeMarker(shuffled);
+    expectOk(original);
+    expectOk(flipped);
+    expectTreesEquivalent(flipped.tree, original.tree);
+  });
+
+  it('round-trips a capacity-cap tree (N = 50)', () => {
+    const {tree, nodeBboxesById} = buildTree(t => {
+      let cursor: NodeId = 0;
+      for (let i = 0; i < MARKER_PUBLISHED_NODE_CAP - 1; i += 1) {
+        cursor = addChild(t, cursor);
+      }
+    });
+    expect(tree.nodesById.size).toBe(MARKER_PUBLISHED_NODE_CAP);
+    const geoms = encodeMarker({
+      tree,
+      nodeBboxesById,
+      markerOrigin: {x: 0, y: 0},
+    });
+    const result = decodeMarker(geoms);
+    expectOk(result);
+    expectTreesEquivalent(result.tree, tree);
+  });
+
+  it('ignores foreign strokes mixed into the lasso selection', () => {
+    const {tree, nodeBboxesById} = buildTree(t => {
+      addChild(t, 0);
+    });
+    const markerGeoms = encodeMarker({
+      tree,
+      nodeBboxesById,
+      markerOrigin: {x: 0, y: 0},
+    });
+    const foreign: Geometry[] = [
+      // Node outline (black fineliner).
+      {
+        type: 'GEO_polygon',
+        points: [
+          {x: 0, y: 0},
+          {x: 100, y: 0},
+          {x: 100, y: 40},
+        ],
+        penColor: 0x00,
+        penType: 10,
+        penWidth: 400,
+      },
+      // Hand-drawn label stroke (black fineliner).
+      {
+        type: 'straightLine',
+        points: [
+          {x: 50, y: 50},
+          {x: 60, y: 60},
+        ],
+        penColor: 0x00,
+        penType: 10,
+        penWidth: 200,
+      },
+    ];
+    const mixed = [...foreign, ...markerGeoms, ...foreign];
+    const result = decodeMarker(mixed);
+    expectOk(result);
+    expectTreesEquivalent(result.tree, tree);
+  });
+});
+
+describe('decodeMarker (bit-matrix scaffold constants)', () => {
+  it('footprint is MARKER_GRID × MARKER_CELL_PX = 288 px', () => {
+    expect(MARKER_FOOTPRINT_PX).toBe(288);
   });
 });
 

@@ -18,6 +18,7 @@
  *     throw so Phase 3.3 has a signal if it forgets to wire it up.
  */
 import {
+  MARKER_BIT_STROKE_LEN,
   MARKER_CELL_PX,
   MARKER_CHANNEL_BYTES,
   MARKER_CHUNK_BYTES,
@@ -29,6 +30,9 @@ import {
   MARKER_LOGICAL_MESSAGE_BYTES,
   MARKER_NODE_RECORD_BYTES,
   MARKER_NUM_CHUNKS,
+  MARKER_PEN_COLOR,
+  MARKER_PEN_TYPE,
+  MARKER_PEN_WIDTH,
   MARKER_PUBLISHED_NODE_CAP,
   MARKER_ROOT_PARENT,
   MARKER_THEORETICAL_NODE_CAP,
@@ -339,17 +343,144 @@ describe('encodeMarkerBytes', () => {
   });
 });
 
-describe('encodeMarker (bit-matrix renderer)', () => {
-  // Phase 3.3 picks this up. Explicit placeholder throw so that if
-  // Phase 3.3 ever ships a half-wired renderer, at least one test
-  // fires a red flag immediately.
-  it('is still a Phase 3.3 TODO', () => {
+describe('encodeMarker (bit-matrix renderer, §6.4)', () => {
+  it('emits only straightLine geometries with §6.4 pen style', () => {
+    const {tree, nodeBboxesById} = buildTree(t => {
+      addChild(t, 0);
+      addChild(t, 0);
+    });
+    const geoms = encodeMarker({
+      tree,
+      nodeBboxesById,
+      markerOrigin: {x: 0, y: 0},
+    });
+    expect(geoms.length).toBeGreaterThan(0);
+    for (const g of geoms) {
+      expect(g.type).toBe('straightLine');
+      expect(g.penColor).toBe(MARKER_PEN_COLOR);
+      expect(g.penType).toBe(MARKER_PEN_TYPE);
+      expect(g.penWidth).toBe(MARKER_PEN_WIDTH);
+      expect(g.showLassoAfterInsert).toBe(false);
+    }
+  });
+
+  it('emits one geometry per set bit (popcount match)', () => {
+    const {tree, nodeBboxesById} = buildTree(t => {
+      addChild(t, 0);
+      addSibling(t, 1);
+    });
+    const bytes = encodeMarkerBytes({
+      tree,
+      nodeBboxesById,
+      markerOrigin: {x: 0, y: 0},
+    });
+    let popcount = 0;
+    for (let i = 0; i < bytes.length; i += 1) {
+      let v = bytes[i];
+      while (v !== 0) {
+        v &= v - 1;
+        popcount += 1;
+      }
+    }
+    const geoms = encodeMarker({
+      tree,
+      nodeBboxesById,
+      markerOrigin: {x: 0, y: 0},
+    });
+    expect(geoms.length).toBe(popcount);
+  });
+
+  it('each stroke is MARKER_BIT_STROKE_LEN px long and grid-aligned', () => {
+    const {tree, nodeBboxesById} = buildTree(t => {
+      addChild(t, 0);
+    });
+    const origin = {x: 100, y: 200};
+    const geoms = encodeMarker({tree, nodeBboxesById, markerOrigin: origin});
+    for (const g of geoms) {
+      expect(g.type).toBe('straightLine');
+      if (g.type !== 'straightLine') {
+        return;
+      }
+      expect(g.points).toHaveLength(2);
+      const [p0, p1] = g.points;
+      // Horizontal stroke of length MARKER_BIT_STROKE_LEN.
+      expect(p0.y).toBe(p1.y);
+      expect(p1.x - p0.x).toBe(MARKER_BIT_STROKE_LEN);
+      // Top-left corner (p0) aligns to the origin + cell grid.
+      const col = (p0.x - origin.x) / MARKER_CELL_PX;
+      const row = (p0.y - origin.y) / MARKER_CELL_PX;
+      expect(Number.isInteger(col)).toBe(true);
+      expect(Number.isInteger(row)).toBe(true);
+      expect(col).toBeGreaterThanOrEqual(0);
+      expect(col).toBeLessThan(MARKER_GRID);
+      expect(row).toBeGreaterThanOrEqual(0);
+      expect(row).toBeLessThan(MARKER_GRID);
+    }
+  });
+
+  it('markerOrigin translates every stroke by the same offset', () => {
+    const {tree, nodeBboxesById} = buildTree(t => {
+      addChild(t, 0);
+      addSibling(t, 1);
+    });
+    const a = encodeMarker({
+      tree,
+      nodeBboxesById,
+      markerOrigin: {x: 0, y: 0},
+    });
+    const b = encodeMarker({
+      tree,
+      nodeBboxesById,
+      markerOrigin: {x: 40, y: 80},
+    });
+    expect(a).toHaveLength(b.length);
+    for (let i = 0; i < a.length; i += 1) {
+      const ga = a[i];
+      const gb = b[i];
+      if (ga.type !== 'straightLine' || gb.type !== 'straightLine') {
+        throw new Error('expected straightLine');
+      }
+      for (let p = 0; p < 2; p += 1) {
+        expect(gb.points[p].x - ga.points[p].x).toBe(40);
+        expect(gb.points[p].y - ga.points[p].y).toBe(80);
+      }
+    }
+  });
+
+  it('is deterministic: same input -> identical geometry array', () => {
+    const build = () =>
+      buildTree(t => {
+        addChild(t, 0);
+        const b = addChild(t, 0);
+        addSibling(t, b);
+      });
+    const first = build();
+    const second = build();
+    const a = encodeMarker({
+      tree: first.tree,
+      nodeBboxesById: first.nodeBboxesById,
+      markerOrigin: {x: 0, y: 0},
+    });
+    const b = encodeMarker({
+      tree: second.tree,
+      nodeBboxesById: second.nodeBboxesById,
+      markerOrigin: {x: 0, y: 0},
+    });
+    expect(a).toEqual(b);
+  });
+
+  it('throws MarkerCapacityError when the tree is over-capacity', () => {
+    const {tree, nodeBboxesById} = buildTree(t => {
+      for (let i = 0; i < MARKER_PUBLISHED_NODE_CAP; i += 1) {
+        addChild(t, 0);
+      }
+    });
     expect(() =>
       encodeMarker({
-        tree: createTree(),
-        nodeBboxesById: new Map([[0, {x: 0, y: 0, w: 10, h: 10}]]),
+        tree,
+        nodeBboxesById,
         markerOrigin: {x: 0, y: 0},
       }),
-    ).toThrow(/Phase 3\.3/);
+    ).toThrow(MarkerCapacityError);
   });
 });
