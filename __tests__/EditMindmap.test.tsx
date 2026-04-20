@@ -61,6 +61,11 @@ jest.mock('sn-plugin-lib', () => ({
         success: true,
         result: {width: 1404, height: 1872},
       }),
+    // Batched insert path (§F-IN-3 fast path) — Save drives insertMindmap
+    // which prefers PluginFileAPI.insertElements when the note context
+    // is resolvable. Tests below assert on this mock instead of the
+    // sequential insertGeometry fallback.
+    insertElements: jest.fn().mockResolvedValue({success: true}),
   },
 }));
 
@@ -77,7 +82,7 @@ jest.mock('../src/marker/decode', () => ({
 }));
 
 import EditMindmap from '../src/EditMindmap';
-import {PluginCommAPI, PluginManager} from 'sn-plugin-lib';
+import {PluginCommAPI, PluginFileAPI, PluginManager} from 'sn-plugin-lib';
 import {decodeMarker} from '../src/marker/decode';
 import {createTree, addChild, ShapeKind, type NodeId, type Tree} from '../src/model/tree';
 import type {Rect} from '../src/geometry';
@@ -725,6 +730,7 @@ describe('EditMindmap (Phase 4.5) — Save end-to-end (§F-ED-7)', () => {
   // plugin view open with a visible error — echoing the first-insert
   // error UX the Insert button already has.
   const mockInsertGeometry = PluginCommAPI.insertGeometry as jest.Mock;
+  const mockInsertElements = PluginFileAPI.insertElements as jest.Mock;
   const mockLassoElements = PluginCommAPI.lassoElements as jest.Mock;
   const mockDelete = PluginCommAPI.deleteLassoElements as jest.Mock;
   const mockGetFile = PluginCommAPI.getCurrentFilePath as jest.Mock;
@@ -735,6 +741,7 @@ describe('EditMindmap (Phase 4.5) — Save end-to-end (§F-ED-7)', () => {
     mockClose.mockReset();
     mockDecode.mockReset();
     mockInsertGeometry.mockReset();
+    mockInsertElements.mockReset();
     mockLassoElements.mockReset();
     mockDelete.mockReset();
     mockGetFile.mockReset();
@@ -743,6 +750,7 @@ describe('EditMindmap (Phase 4.5) — Save end-to-end (§F-ED-7)', () => {
     mockGetLasso.mockResolvedValue({success: true, result: []});
     mockClose.mockResolvedValue(true);
     mockInsertGeometry.mockResolvedValue({success: true});
+    mockInsertElements.mockResolvedValue({success: true});
     mockLassoElements.mockResolvedValue({success: true});
     mockDelete.mockResolvedValue({success: true});
     mockGetFile.mockResolvedValue({
@@ -793,7 +801,7 @@ describe('EditMindmap (Phase 4.5) — Save end-to-end (§F-ED-7)', () => {
     });
   });
 
-  it('tapping Save calls deleteLassoElements BEFORE any insertGeometry', async () => {
+  it('tapping Save calls deleteLassoElements BEFORE the batched insertElements', async () => {
     const ref: {current?: ReactTestRenderer} = {};
     await mountForSave(ref);
     // Track call order by recording the call index as a side-effect.
@@ -802,7 +810,7 @@ describe('EditMindmap (Phase 4.5) — Save end-to-end (§F-ED-7)', () => {
       order.push('delete');
       return {success: true};
     });
-    mockInsertGeometry.mockImplementation(async () => {
+    mockInsertElements.mockImplementation(async () => {
       order.push('insert');
       return {success: true};
     });
@@ -821,10 +829,12 @@ describe('EditMindmap (Phase 4.5) — Save end-to-end (§F-ED-7)', () => {
       }
     });
     expect(mockDelete).toHaveBeenCalledTimes(1);
-    expect(mockInsertGeometry.mock.calls.length).toBeGreaterThan(0);
-    // Order: delete must precede the first insertGeometry call.
-    expect(order[0]).toBe('delete');
-    expect(order.slice(1).every(x => x === 'insert')).toBe(true);
+    // Batched path: a single insertElements carries every emitted
+    // geometry. Sequential insertGeometry is the fallback only.
+    expect(mockInsertElements).toHaveBeenCalledTimes(1);
+    expect(mockInsertGeometry).not.toHaveBeenCalled();
+    // Order: delete must precede the batched insert call.
+    expect(order).toEqual(['delete', 'insert']);
     // And the plugin view closes at the end.
     expect(mockLassoElements).toHaveBeenCalledTimes(1);
     expect(mockClose).toHaveBeenCalledTimes(1);
@@ -854,6 +864,7 @@ describe('EditMindmap (Phase 4.5) — Save end-to-end (§F-ED-7)', () => {
     // ran and the plugin view stays open so the user can retry.
     expect(mockDelete).toHaveBeenCalledTimes(1);
     expect(mockInsertGeometry).not.toHaveBeenCalled();
+    expect(PluginFileAPI.insertElements).not.toHaveBeenCalled();
     expect(mockLassoElements).not.toHaveBeenCalled();
     expect(mockClose).not.toHaveBeenCalled();
     // The Save button's error banner uses MindmapCanvas's insertError
@@ -900,6 +911,7 @@ describe('EditMindmap (Phase 4.6) — pre-Save out-of-map confirmation (§8.1)',
   // can back out and re-lasso wider (§8.1 line 369).
 
   const mockInsertGeometry = PluginCommAPI.insertGeometry as jest.Mock;
+  const mockInsertElements = PluginFileAPI.insertElements as jest.Mock;
   const mockLassoElements = PluginCommAPI.lassoElements as jest.Mock;
   const mockDelete = PluginCommAPI.deleteLassoElements as jest.Mock;
 
@@ -908,12 +920,14 @@ describe('EditMindmap (Phase 4.6) — pre-Save out-of-map confirmation (§8.1)',
     mockClose.mockReset();
     mockDecode.mockReset();
     mockInsertGeometry.mockReset();
+    mockInsertElements.mockReset();
     mockLassoElements.mockReset();
     mockDelete.mockReset();
 
     mockGetLasso.mockResolvedValue({success: true, result: []});
     mockClose.mockResolvedValue(true);
     mockInsertGeometry.mockResolvedValue({success: true});
+    mockInsertElements.mockResolvedValue({success: true});
     mockLassoElements.mockResolvedValue({success: true});
     mockDelete.mockResolvedValue({success: true});
   });
@@ -987,6 +1001,7 @@ describe('EditMindmap (Phase 4.6) — pre-Save out-of-map confirmation (§8.1)',
     // And critically: none of the pipeline work ran.
     expect(mockDelete).not.toHaveBeenCalled();
     expect(mockInsertGeometry).not.toHaveBeenCalled();
+    expect(mockInsertElements).not.toHaveBeenCalled();
     expect(mockLassoElements).not.toHaveBeenCalled();
     expect(mockClose).not.toHaveBeenCalled();
     act(() => {
@@ -1024,7 +1039,8 @@ describe('EditMindmap (Phase 4.6) — pre-Save out-of-map confirmation (§8.1)',
     // insertMindmap itself; here we just check the whole thing
     // reached closePluginView.
     expect(mockDelete).toHaveBeenCalledTimes(1);
-    expect(mockInsertGeometry.mock.calls.length).toBeGreaterThan(0);
+    // Batched insert path: one insertElements call carries the batch.
+    expect(mockInsertElements).toHaveBeenCalledTimes(1);
     expect(mockClose).toHaveBeenCalledTimes(1);
     act(() => {
       renderer.unmount();

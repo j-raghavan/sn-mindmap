@@ -53,30 +53,67 @@ jest.mock('sn-plugin-lib', () => ({
     getPageSize: jest
       .fn()
       .mockResolvedValue({success: true, result: {width: 1404, height: 1872}}),
+    // Batched insert path — insertMindmap prefers PluginFileAPI.insertElements
+    // when the note context resolves cleanly (default mocks above return
+    // success). Sequential insertGeometry is only used in the fallback
+    // path forced by rejecting getCurrentFilePath.
+    insertElements: jest.fn().mockResolvedValue({success: true}),
   },
 }));
 
 import MindmapCanvas from '../src/MindmapCanvas';
-import {PluginCommAPI, PluginManager} from 'sn-plugin-lib';
+import {PluginCommAPI, PluginFileAPI, PluginManager} from 'sn-plugin-lib';
 import {MARKER_PEN_COLOR} from '../src/marker/encode';
 import {addChild, addSibling, createTree} from '../src/model/tree';
 
 /**
- * Filter insertGeometry mock calls down to the "primary" emit mix
+ * Collect the geometries that insertMindmap emitted, independent of
+ * the firmware path used. The batched path (PluginFileAPI.insertElements)
+ * wraps each geometry as `{type:700, geometry}` and submits the array
+ * in a single call; the sequential fallback (PluginCommAPI.insertGeometry)
+ * calls once per geometry. This helper normalizes both shapes to a
+ * single flat list of geometries so count / filter assertions stay
+ * path-agnostic.
+ */
+function collectInsertedGeometries(): Array<{
+  type?: string;
+  penColor?: number;
+}> {
+  const batchCalls = (PluginFileAPI.insertElements as jest.Mock).mock.calls;
+  if (batchCalls.length > 0) {
+    const out: Array<{type?: string; penColor?: number}> = [];
+    for (const call of batchCalls) {
+      const elements = call[2] as Array<{geometry: {type?: string; penColor?: number}}>;
+      for (const element of elements) {
+        out.push(element.geometry);
+      }
+    }
+    return out;
+  }
+  return (PluginCommAPI.insertGeometry as jest.Mock).mock.calls.map(
+    ([geometry]) => geometry,
+  );
+}
+
+/**
+ * Filter inserted geometries down to the "primary" emit mix
  * (outlines + connectors + preserved strokes). Marker strokes share
  * the straightLine type but carry pen color 0x9D (§6.4); every insert
  * produces several hundred of them, so assertions that care about the
- * structural geometry count filter them out.
+ * structural geometry count filter them out. Path-agnostic: works
+ * with both the batched insertElements and sequential insertGeometry
+ * mocks.
  */
-function nonMarkerInsertCount(mock: jest.Mock): number {
-  return mock.mock.calls.filter(
-    ([geometry]) =>
+function nonMarkerInsertCount(): number {
+  return collectInsertedGeometries().filter(
+    geometry =>
       !(
         geometry?.type === 'straightLine' &&
         geometry?.penColor === MARKER_PEN_COLOR
       ),
   ).length;
 }
+
 
 function flushPromises(): Promise<void> {
   return new Promise(resolve =>
@@ -695,6 +732,10 @@ describe('MindmapCanvas', () => {
       (PluginCommAPI.insertGeometry as jest.Mock).mockResolvedValue({
         success: true,
       });
+      (PluginFileAPI.insertElements as jest.Mock).mockClear();
+      (PluginFileAPI.insertElements as jest.Mock).mockResolvedValue({
+        success: true,
+      });
       (PluginCommAPI.lassoElements as jest.Mock).mockClear();
       (PluginCommAPI.lassoElements as jest.Mock).mockResolvedValue({
         success: true,
@@ -734,16 +775,14 @@ describe('MindmapCanvas', () => {
       // single lasso and a single close. Marker bits (§6.4, penColor
       // 0x9D) are emitted alongside but filtered out of this count
       // so the assertion stays stable if the marker payload shifts.
-      expect(
-        nonMarkerInsertCount(PluginCommAPI.insertGeometry as jest.Mock),
-      ).toBe(3);
+      expect(nonMarkerInsertCount()).toBe(3);
       expect(PluginCommAPI.lassoElements).toHaveBeenCalledTimes(1);
       expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
       unmount();
     });
 
     it('shows an error banner when insert fails and keeps the plugin view open', async () => {
-      (PluginCommAPI.insertGeometry as jest.Mock).mockResolvedValueOnce({
+      (PluginFileAPI.insertElements as jest.Mock).mockResolvedValueOnce({
         success: false,
         error: {message: 'simulated insert failure'},
       });
@@ -764,9 +803,9 @@ describe('MindmapCanvas', () => {
     });
 
     it('debounces rapid double-taps so only one insert runs at a time', async () => {
-      // Make insertGeometry slow enough that a second tap can land
-      // while the first is still in flight. Using a promise we resolve
-      // manually to avoid timing flake.
+      // Make the batched insertElements slow enough that a second tap
+      // can land while the first is still in flight. Using a promise
+      // we resolve manually to avoid timing flake.
       // TS's flow analysis can't see that the Promise executor fires
       // synchronously, so we initialize resolveFirst with a no-op and
       // reassign inside the executor to keep the type `() => void`.
@@ -774,7 +813,7 @@ describe('MindmapCanvas', () => {
       const firstPending = new Promise<void>(r => {
         resolveFirst = r;
       });
-      (PluginCommAPI.insertGeometry as jest.Mock).mockImplementationOnce(
+      (PluginFileAPI.insertElements as jest.Mock).mockImplementationOnce(
         async () => {
           await firstPending;
           return {success: true};
@@ -794,9 +833,9 @@ describe('MindmapCanvas', () => {
         await flushPromises();
       });
 
-      // At this point insertGeometry has been called exactly once —
+      // At this point insertElements has been called exactly once —
       // the second tap was debounced via insertingRef.
-      expect(PluginCommAPI.insertGeometry).toHaveBeenCalledTimes(1);
+      expect(PluginFileAPI.insertElements).toHaveBeenCalledTimes(1);
 
       // Let the first insert complete cleanly.
       resolveFirst();
@@ -1315,6 +1354,10 @@ describe('MindmapCanvas', () => {
       (PluginCommAPI.insertGeometry as jest.Mock).mockResolvedValue({
         success: true,
       });
+      (PluginFileAPI.insertElements as jest.Mock).mockClear();
+      (PluginFileAPI.insertElements as jest.Mock).mockResolvedValue({
+        success: true,
+      });
       (PluginCommAPI.lassoElements as jest.Mock).mockClear();
       (PluginCommAPI.lassoElements as jest.Mock).mockResolvedValue({
         success: true,
@@ -1380,25 +1423,23 @@ describe('MindmapCanvas', () => {
         await flushPromises();
       });
 
-      // deleteLassoElements fires first (before any insertGeometry).
+      // deleteLassoElements fires first (before any insert call).
       expect(PluginCommAPI.deleteLassoElements).toHaveBeenCalledTimes(1);
       // 2 outlines + 1 connector = 3 non-marker geometries emitted.
-      expect(
-        nonMarkerInsertCount(PluginCommAPI.insertGeometry as jest.Mock),
-      ).toBe(3);
+      expect(nonMarkerInsertCount()).toBe(3);
       expect(PluginCommAPI.lassoElements).toHaveBeenCalledTimes(1);
       expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
       unmount();
     });
 
     it('shows "Saving…" while the save is in flight', async () => {
-      // Keep insertGeometry pending so we can observe the mid-flight
+      // Keep insertElements pending so we can observe the mid-flight
       // button state. Matches the Insert-path debounce tests below.
       let resolveFirst: () => void = () => {};
       const pending = new Promise<void>(r => {
         resolveFirst = r;
       });
-      (PluginCommAPI.insertGeometry as jest.Mock).mockImplementationOnce(
+      (PluginFileAPI.insertElements as jest.Mock).mockImplementationOnce(
         async () => {
           await pending;
           return {success: true};
@@ -1450,8 +1491,9 @@ describe('MindmapCanvas', () => {
       expect(banners).toHaveLength(1);
       expect(PluginManager.closePluginView).not.toHaveBeenCalled();
       // No partial insert happened — the failure aborted before any
-      // insertGeometry call.
+      // insert call.
       expect(PluginCommAPI.insertGeometry).not.toHaveBeenCalled();
+      expect(PluginFileAPI.insertElements).not.toHaveBeenCalled();
       unmount();
     });
 
@@ -1463,7 +1505,7 @@ describe('MindmapCanvas', () => {
       const pending = new Promise<void>(r => {
         resolveFirst = r;
       });
-      (PluginCommAPI.insertGeometry as jest.Mock).mockImplementationOnce(
+      (PluginFileAPI.insertElements as jest.Mock).mockImplementationOnce(
         async () => {
           await pending;
           return {success: true};
@@ -1489,7 +1531,7 @@ describe('MindmapCanvas', () => {
       // deleteLassoElements only fired once despite two taps, because
       // insertingRef short-circuits handleSave's second entry.
       expect(PluginCommAPI.deleteLassoElements).toHaveBeenCalledTimes(1);
-      expect(PluginCommAPI.insertGeometry).toHaveBeenCalledTimes(1);
+      expect(PluginFileAPI.insertElements).toHaveBeenCalledTimes(1);
 
       resolveFirst();
       await flushAsync();
@@ -1517,9 +1559,7 @@ describe('MindmapCanvas', () => {
       // No delete (preEdit was undefined).
       expect(PluginCommAPI.deleteLassoElements).not.toHaveBeenCalled();
       // But the first-insert pipeline still ran to completion.
-      expect(
-        nonMarkerInsertCount(PluginCommAPI.insertGeometry as jest.Mock),
-      ).toBeGreaterThan(0);
+      expect(nonMarkerInsertCount()).toBeGreaterThan(0);
       expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
       unmount();
     });
@@ -1542,6 +1582,10 @@ describe('MindmapCanvas', () => {
     beforeEach(() => {
       (PluginCommAPI.insertGeometry as jest.Mock).mockClear();
       (PluginCommAPI.insertGeometry as jest.Mock).mockResolvedValue({
+        success: true,
+      });
+      (PluginFileAPI.insertElements as jest.Mock).mockClear();
+      (PluginFileAPI.insertElements as jest.Mock).mockResolvedValue({
         success: true,
       });
       (PluginCommAPI.lassoElements as jest.Mock).mockClear();
@@ -1720,9 +1764,7 @@ describe('MindmapCanvas', () => {
       expect(findHostByLabel(renderer, 'save-confirm-dialog')).toHaveLength(0);
       // …and the full pipeline ran.
       expect(PluginCommAPI.deleteLassoElements).toHaveBeenCalledTimes(1);
-      expect(
-        nonMarkerInsertCount(PluginCommAPI.insertGeometry as jest.Mock),
-      ).toBeGreaterThan(0);
+      expect(nonMarkerInsertCount()).toBeGreaterThan(0);
       expect(PluginCommAPI.lassoElements).toHaveBeenCalledTimes(1);
       expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
       unmount();
@@ -1854,6 +1896,10 @@ describe('MindmapCanvas', () => {
     beforeEach(() => {
       (PluginCommAPI.insertGeometry as jest.Mock).mockClear();
       (PluginCommAPI.insertGeometry as jest.Mock).mockResolvedValue({
+        success: true,
+      });
+      (PluginFileAPI.insertElements as jest.Mock).mockClear();
+      (PluginFileAPI.insertElements as jest.Mock).mockResolvedValue({
         success: true,
       });
       (PluginCommAPI.lassoElements as jest.Mock).mockClear();

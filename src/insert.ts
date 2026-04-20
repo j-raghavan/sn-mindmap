@@ -2,10 +2,12 @@
  * High-level insert flow (§5.3, §F-IN-1..F-IN-5; §F-ED-7 on re-insert).
  *
  * First-insert sequence:
- *   1. resolvePageSize() — the three-step fall-through from
+ *   1. resolvePageContext() — the three-step fall-through from
  *      sn-shapes/src/ShapePalette.tsx via PluginCommAPI
  *      getCurrentFilePath -> getCurrentPageNum -> PluginFileAPI
- *      getPageSize, with defaults if any step fails (§F-IN-1).
+ *      getPageSize. Also captures notePath + page for the batched
+ *      insertElements fast path (§F-IN-3). Defaults kick in if any
+ *      step fails (§F-IN-1).
  *   2. Auto-expand every subtree in the tree so no node is hidden
  *      at emit time (§F-IN-2 / §8.6).
  *   3. Run radial layout (./layout/radial.ts).
@@ -16,11 +18,18 @@
  *   5. Emit geometries via ./rendering/emitGeometries.ts — outlines,
  *      connectors, marker, and on re-insert preserved label strokes.
  *      Every emission sets showLassoAfterInsert: false (§F-IN-3).
- *   6. Insert via PluginCommAPI.insertGeometry one-at-a-time. We do
- *      NOT batch via PluginFileAPI.insertElements yet — §F-IN-3
- *      flags it as a future path ("when stable"), and a partial
- *      sequential failure is easier to clean up (we know exactly how
- *      many geometries went in).
+ *   6. Insert every geometry as a single batched
+ *      PluginFileAPI.insertElements call (§F-IN-3). Each emitted
+ *      Geometry is wrapped as an Element of TYPE_GEO (700). The
+ *      batched path is massively faster than sequential
+ *      insertGeometry calls — the marker alone emits ~2500 per-bit
+ *      straight-lines and a per-geometry loop stalls the plugin for
+ *      tens of seconds on device (the user sees this as "Insert
+ *      hangs after the mindmap appears"). If the note context is
+ *      unavailable (resolvePageContext fell through to defaults) we
+ *      fall back to sequential PluginCommAPI.insertGeometry so the
+ *      code still works in environments where the file bridge hasn't
+ *      been wired up.
  *   7. Call PluginCommAPI.lassoElements(unionRect) explicitly to
  *      auto-select the whole block (§F-IN-3 / §11).
  *   8. PluginManager.closePluginView() to dismiss (§F-IN-4).
@@ -91,6 +100,15 @@ export const DEFAULT_PAGE_HEIGHT = 1872;
 export const INSERT_MARGIN_PX = 80;
 
 /**
+ * Firmware Element-type code for a Geometry record
+ * (Element.TYPE_GEO == 700; see sn-plugin-lib's Element.d.ts). We
+ * re-declare it locally rather than importing the runtime Element
+ * class so unit tests can exercise the batched path without pulling
+ * the whole ElementDataAccessor/native-cache machinery into jsdom.
+ */
+export const ELEMENT_TYPE_GEO = 700;
+
+/**
  * Pre-edit context needed to translate preserved label strokes from
  * the pre-edit layout into the post-edit layout's coordinates on
  * Save. Supplied by EditMindmap on the §F-ED-7 round-trip — the
@@ -147,7 +165,8 @@ export type InsertInput = {
  * error, after best-effort cleanup (§F-IN-5).
  */
 export async function insertMindmap(input: InsertInput): Promise<void> {
-  const {width: pageWidth, height: pageHeight} = await resolvePageSize();
+  const pageCtx = await resolvePageContext();
+  const {width: pageWidth, height: pageHeight} = pageCtx;
 
   // §F-ED-7 step 0 — re-insert path only. Delete the pre-edit
   // mindmap from the page BEFORE we start emitting the new one. The
@@ -221,20 +240,51 @@ export async function insertMindmap(input: InsertInput): Promise<void> {
     preservedStrokesByNode,
   });
 
-  // §F-IN-3 — sequential insertGeometry with showLassoAfterInsert
-  // forced to false on every geometry (done inside emitGeometries).
-  // We track the count so cleanup on mid-insert failure only tries
-  // to reclaim the geometries that actually made it onto the page.
+  // §F-IN-3 — hand every emitted geometry to the firmware. Two
+  // paths:
+  //   - Fast path (preferred): when we successfully resolved the
+  //     current note's path and page, wrap every Geometry as an
+  //     Element of TYPE_GEO (700) and call PluginFileAPI.insertElements
+  //     once. This is a SINGLE RPC to the native side regardless of
+  //     how many geometries the emit produced. Essential for the
+  //     marker payload, which alone is ~2500 per-bit straightLines —
+  //     a sequential loop there stalls the plugin by tens of seconds
+  //     on device (each insertGeometry over the JS-to-native bridge
+  //     costs ~200–300 ms wall clock, per the 21:20 session in the
+  //     Nomad logcat).
+  //   - Fallback: if no note context is available (e.g. the
+  //     three-step chain in resolvePageContext fell through to
+  //     defaults, or a future unit test runs without mocking the
+  //     file bridge), use the original per-geometry insertGeometry
+  //     loop. It's slow but semantically equivalent, and keeps
+  //     resolvePageContext's defaults path working.
+  // On success, `insertedCount` is set to the full geometry count so
+  // the cleanup path has the full list if lassoElements fails next.
+  // The fast path either inserts everything atomically or nothing,
+  // which matches the semantics insertElements provides on device.
   let insertedCount = 0;
   try {
-    for (const geometry of geometries) {
-      const res = (await PluginCommAPI.insertGeometry(
-        geometry,
+    if (pageCtx.notePath !== null && pageCtx.page !== null) {
+      const elements = geometries.map(wrapGeometryAsElement);
+      const res = (await PluginFileAPI.insertElements(
+        pageCtx.notePath,
+        pageCtx.page,
+        elements,
       )) as ApiRes<boolean>;
       if (!res?.success) {
-        throw new Error(res?.error?.message ?? 'insertGeometry failed');
+        throw new Error(res?.error?.message ?? 'insertElements failed');
       }
-      insertedCount += 1;
+      insertedCount = geometries.length;
+    } else {
+      for (const geometry of geometries) {
+        const res = (await PluginCommAPI.insertGeometry(
+          geometry,
+        )) as ApiRes<boolean>;
+        if (!res?.success) {
+          throw new Error(res?.error?.message ?? 'insertGeometry failed');
+        }
+        insertedCount += 1;
+      }
     }
 
     // §F-IN-3 — single explicit lasso call over the union rect of
@@ -255,7 +305,7 @@ export async function insertMindmap(input: InsertInput): Promise<void> {
     await PluginManager.closePluginView();
   } catch (err) {
     // §F-IN-5 — best-effort cleanup. Only attempted when something
-    // actually landed on the page; a failed resolvePageSize or a
+    // actually landed on the page; a failed resolvePageContext or a
     // zeroth-geometry failure leaves the page untouched and there's
     // nothing to clean up.
     if (insertedCount > 0) {
@@ -266,12 +316,55 @@ export async function insertMindmap(input: InsertInput): Promise<void> {
 }
 
 /**
- * Resolve the current note page's dimensions via the §F-IN-1
- * three-step fall-through. Mirrors sn-shapes/src/ShapePalette.tsx
- * verbatim: any null-ish/failure result at any step, or a thrown
- * exception at any step, returns the Nomad portrait defaults.
+ * Wrap a Geometry into the Element envelope that
+ * PluginFileAPI.insertElements expects (type = TYPE_GEO / 700,
+ * geometry = the original record). The firmware tolerates unknown
+ * fields (`allowUnknown: true` in sn-plugin-lib's ElementSchema),
+ * so we don't have to mint uuids or fill the stroke/contours
+ * accessors here — the native side generates those when the element
+ * lands.
+ *
+ * `showLassoAfterInsert` is carried through from the geometry
+ * (emitGeometries sets it to false on every entry, §F-IN-3), so the
+ * batched insert does not auto-lasso individual elements — the
+ * plugin's single explicit lassoElements call is what selects the
+ * whole block post-insert.
  */
-async function resolvePageSize(): Promise<{width: number; height: number}> {
+function wrapGeometryAsElement(geometry: Geometry): {
+  type: number;
+  geometry: Geometry;
+} {
+  return {type: ELEMENT_TYPE_GEO, geometry};
+}
+
+/**
+ * Resolve everything insertMindmap needs to know about the current
+ * page: its dimensions (for fit-to-page scale), its file path and
+ * page index (for the batched PluginFileAPI.insertElements call).
+ *
+ * Mirrors the three-step fall-through from sn-shapes verbatim for
+ * the dimensions — any null-ish/failure result at any step, or a
+ * thrown exception, returns the Nomad portrait defaults. When the
+ * note context is unavailable (path / page / size unresolvable), we
+ * still return dimensions-only with `notePath: null` and
+ * `page: null` so the caller falls back to the slower per-geometry
+ * insertGeometry loop (which only needs the firmware's implicit
+ * "current page" context via PluginCommAPI, not an explicit path).
+ */
+type PageContext = {
+  width: number;
+  height: number;
+  notePath: string | null;
+  page: number | null;
+};
+
+async function resolvePageContext(): Promise<PageContext> {
+  const defaults: PageContext = {
+    width: DEFAULT_PAGE_WIDTH,
+    height: DEFAULT_PAGE_HEIGHT,
+    notePath: null,
+    page: null,
+  };
   try {
     const pathRes = (await PluginCommAPI.getCurrentFilePath()) as ApiRes<string>;
     const pageRes = (await PluginCommAPI.getCurrentPageNum()) as ApiRes<number>;
@@ -281,18 +374,25 @@ async function resolvePageSize(): Promise<{width: number; height: number}> {
       typeof pathRes.result === 'string' &&
       typeof pageRes.result === 'number'
     ) {
+      const notePath = pathRes.result;
+      const page = pageRes.result;
       const sizeRes = (await PluginFileAPI.getPageSize(
-        pathRes.result,
-        pageRes.result,
+        notePath,
+        page,
       )) as ApiRes<{width: number; height: number}>;
       if (sizeRes?.success && sizeRes.result) {
-        return sizeRes.result;
+        return {
+          width: sizeRes.result.width,
+          height: sizeRes.result.height,
+          notePath,
+          page,
+        };
       }
     }
   } catch {
     // Fall through to defaults.
   }
-  return {width: DEFAULT_PAGE_WIDTH, height: DEFAULT_PAGE_HEIGHT};
+  return defaults;
 }
 
 /**
