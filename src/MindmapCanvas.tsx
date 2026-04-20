@@ -150,6 +150,18 @@ export type MindmapCanvasProps = {
    * fresh tree with just the root Oval.
    */
   initialTree?: Tree;
+  /**
+   * When true, the canvas is running inside the edit round-trip
+   * (§5.4). Current behavior:
+   *   - The Insert button is hidden. "Save" (§F-ED-7) lands in Phase
+   *     4.5; until then, edit-mode is Cancel-only and any topology
+   *     edits are discarded on Cancel. This is an intentional WIP
+   *     state — EditMindmap notes the same caveat.
+   *
+   * Authoring (isEditMode false / omitted) is the §F-AC-* flow: the
+   * Insert button runs the full §F-IN-* pipeline.
+   */
+  isEditMode?: boolean;
 };
 
 /**
@@ -207,6 +219,7 @@ function treeReducer(state: Tree, action: Action): Tree {
 
 export default function MindmapCanvas({
   initialTree,
+  isEditMode = false,
 }: MindmapCanvasProps = {}): React.JSX.Element {
   // The initial-state arg is called lazily by React, so cloning only
   // happens on mount. The clone is important: callers may reuse the
@@ -449,26 +462,34 @@ export default function MindmapCanvas({
          * always has ≥ 1 node; the only reason it's locally disabled
          * is while an insert is already in flight, to debounce double
          * taps during the §F-NF-2 ≤ 2.0 s budget.
+         *
+         * Hidden entirely in edit mode (Phase 4.3 WIP state — see
+         * MindmapCanvasProps.isEditMode): Save lands in Phase 4.5.
+         * Rendering the button with a Save label now would mislead
+         * users into thinking their edits persist, when in fact
+         * Phase 4.3 through early Phase 4.5 has no round-trip save.
          */}
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel="Insert"
-          accessibilityState={{disabled: isInserting}}
-          disabled={isInserting}
-          onPress={handleInsert}
-          style={({pressed}) => [
-            styles.topBarBtn,
-            pressed && !isInserting && styles.topBarBtnPressed,
-            isInserting && styles.topBarBtnDisabled,
-          ]}>
-          <Text
-            style={[
-              styles.topBarBtnText,
-              isInserting && styles.topBarBtnTextDisabled,
+        {!isEditMode && (
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Insert"
+            accessibilityState={{disabled: isInserting}}
+            disabled={isInserting}
+            onPress={handleInsert}
+            style={({pressed}) => [
+              styles.topBarBtn,
+              pressed && !isInserting && styles.topBarBtnPressed,
+              isInserting && styles.topBarBtnDisabled,
             ]}>
-            {isInserting ? 'Inserting…' : 'Insert'}
-          </Text>
-        </Pressable>
+            <Text
+              style={[
+                styles.topBarBtnText,
+                isInserting && styles.topBarBtnTextDisabled,
+              ]}>
+              {isInserting ? 'Inserting…' : 'Insert'}
+            </Text>
+          </Pressable>
+        )}
       </View>
       {insertError !== null && (
         <View accessibilityLabel="insert-error" style={styles.errorBanner}>

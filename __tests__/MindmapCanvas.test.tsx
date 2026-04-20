@@ -804,4 +804,70 @@ describe('MindmapCanvas', () => {
       unmount();
     });
   });
+
+  describe('Phase 4.3 — isEditMode top-bar gating', () => {
+    // Until §F-ED-7 Save lands (Phase 4.5), edit-mode is Cancel-only.
+    // These tests lock in that contract so Phase 4.4/4.5 edits can't
+    // regress it without a visible test churn.
+
+    it('hides the Insert button when isEditMode=true', () => {
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas isEditMode />,
+      );
+      const insertBtns = renderer.root.findAllByProps({
+        accessibilityLabel: 'Insert',
+      });
+      expect(insertBtns.length).toBe(0);
+      unmount();
+    });
+
+    it('still renders the Cancel button when isEditMode=true', () => {
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas isEditMode />,
+      );
+      const cancelBtns = renderer.root.findAllByProps({
+        accessibilityLabel: 'Cancel',
+      });
+      // One Pressable is registered with the accessibilityLabel; the
+      // host View underneath forwards the prop so the host layer
+      // surfaces it too. Either way the user-facing affordance must
+      // be present.
+      expect(cancelBtns.length).toBeGreaterThan(0);
+      unmount();
+    });
+
+    it('still renders the Clear button when isEditMode=true', () => {
+      // Clear is topology-only ("reset to fresh root") and remains
+      // useful in edit mode for "start this edit over". Phase 4.5
+      // revisits whether Clear should also be gated; for now it is
+      // explicitly allowed.
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas isEditMode />,
+      );
+      const clearBtns = renderer.root.findAllByProps({
+        accessibilityLabel: 'Clear',
+      });
+      expect(clearBtns.length).toBeGreaterThan(0);
+      unmount();
+    });
+
+    it('shows the Insert button when isEditMode is omitted (authoring default)', () => {
+      // Regression guard: isEditMode defaults to false, so the
+      // authoring canvas is unaffected by this new prop.
+      const {renderer, unmount} = renderCanvas(<MindmapCanvas />);
+      const insertBtns = renderer.root.findAllByProps({
+        accessibilityLabel: 'Insert',
+      });
+      expect(insertBtns.length).toBeGreaterThan(0);
+      unmount();
+    });
+
+    it('does not call insertGeometry when isEditMode=true (Insert is unreachable)', async () => {
+      (PluginCommAPI.insertGeometry as jest.Mock).mockClear();
+      const {unmount} = renderCanvas(<MindmapCanvas isEditMode />);
+      await flushAsync();
+      expect(PluginCommAPI.insertGeometry).not.toHaveBeenCalled();
+      unmount();
+    });
+  });
 });
