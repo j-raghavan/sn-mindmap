@@ -43,7 +43,13 @@
  * on-device.
  */
 import React, {useCallback, useMemo, useReducer, useState} from 'react';
-import {Pressable, StyleSheet, Text, View} from 'react-native';
+import {
+  type LayoutChangeEvent,
+  Pressable,
+  StyleSheet,
+  Text,
+  View,
+} from 'react-native';
 import {PluginManager} from 'sn-plugin-lib';
 import {
   addChild,
@@ -89,6 +95,18 @@ const ICON_SIZE = 28;
 
 /** Gap between node outline and the action icons that sit alongside it. */
 const ICON_GAP = 8;
+
+/**
+ * Pixels of viewport margin left around the mindmap when fit-scaling
+ * on open (§F-AC-2 "centered on screen"). Chosen large enough that
+ * the action icons — which sit OUTSIDE each node's bbox by ICON_GAP
+ * + ICON_SIZE — never clip against the surface edges on e-ink, and
+ * small enough to feel close to edge-to-edge on small trees.
+ *
+ * Applied on each side, so the effective inner viewport is
+ * (surfaceW - 2 * VIEWPORT_PADDING) × (surfaceH - 2 * VIEWPORT_PADDING).
+ */
+const VIEWPORT_PADDING = 48;
 
 export type MindmapCanvasProps = {
   /**
@@ -163,7 +181,49 @@ export default function MindmapCanvas({
   // reuse it.
   const [selectedId, setSelectedId] = useState<NodeId | null>(null);
 
+  // Measured surface dimensions (inner viewport below the top bar).
+  // Starts at 0×0 — the first paint uses fitScale=1 which is the
+  // correct default for a lone root; onLayout fires immediately after
+  // mount and re-renders at the right scale for larger trees.
+  const [viewport, setViewport] = useState<{w: number; h: number}>({
+    w: 0,
+    h: 0,
+  });
+  const handleSurfaceLayout = useCallback((e: LayoutChangeEvent) => {
+    const {width, height} = e.nativeEvent.layout;
+    // Guard against a no-op setState loop on re-layouts that report
+    // identical dimensions — otherwise we'd trigger an extra render
+    // every time the tree mutates and the surface re-measures itself.
+    setViewport(prev =>
+      prev.w === width && prev.h === height ? prev : {w: width, h: height},
+    );
+  }, []);
+
   const layout = useMemo(() => radialLayout(tree), [tree]);
+
+  /**
+   * Fit-to-view scale so the whole mindmap is visible on open per
+   * §F-AC-2 ("centered on screen"). Capped at 1 so a lone root stays
+   * at its designed 220×96 proportions rather than blowing up to fill
+   * the viewport; action-icon hit targets would otherwise scale with
+   * the canvas and the 28×28 Pressables would become awkward.
+   *
+   * Scale-down kicks in as soon as unionBbox (plus a VIEWPORT_PADDING
+   * margin on each side) exceeds the viewport along either axis. Pan
+   * and manual zoom land in §F-AC-7 (Phase 1.4c); until then this
+   * auto-fit keeps the whole map on-screen for any tree that still
+   * fits readably at a single scale.
+   */
+  const fitScale = useMemo(() => {
+    if (viewport.w <= 0 || viewport.h <= 0) {
+      return 1;
+    }
+    const stageW = Math.max(1, layout.unionBbox.w);
+    const stageH = Math.max(1, layout.unionBbox.h);
+    const innerW = Math.max(1, viewport.w - 2 * VIEWPORT_PADDING);
+    const innerH = Math.max(1, viewport.h - 2 * VIEWPORT_PADDING);
+    return Math.min(1, innerW / stageW, innerH / stageH);
+  }, [layout.unionBbox, viewport]);
 
   // Visible set: fully-expanded layout minus nodes that live inside
   // a collapsed subtree. A node is visible iff every ancestor is
@@ -231,18 +291,34 @@ export default function MindmapCanvas({
       <Pressable
         accessibilityLabel="mindmap-background"
         style={styles.surface}
+        onLayout={handleSurfaceLayout}
         onPress={handleBackgroundPress}>
-        <Stage
-          tree={tree}
-          layout={layout}
-          visibleIds={visibleIds}
-          selectedId={selectedId}
-          onSelect={handleSelect}
-          onAddChild={handleAddChild}
-          onAddSibling={handleAddSibling}
-          onDelete={handleDelete}
-          onToggleCollapse={handleToggleCollapse}
-        />
+        {/*
+         * Fit-to-view wrapper. Transform scales the Stage around its
+         * own layout center (RN's default origin), so flexbox
+         * centering on the surface places the scaled Stage right in
+         * the middle of the viewport with a VIEWPORT_PADDING margin
+         * on the tight axis. Layout size of the wrapper stays equal
+         * to the Stage's un-scaled size — we rely on visual transform
+         * only, which matches how React Native's Animated library
+         * handles the same "fit one content box inside another"
+         * pattern.
+         */}
+        <View
+          accessibilityLabel="mindmap-fit-wrapper"
+          style={[styles.stageWrapper, {transform: [{scale: fitScale}]}]}>
+          <Stage
+            tree={tree}
+            layout={layout}
+            visibleIds={visibleIds}
+            selectedId={selectedId}
+            onSelect={handleSelect}
+            onAddChild={handleAddChild}
+            onAddSibling={handleAddSibling}
+            onDelete={handleDelete}
+            onToggleCollapse={handleToggleCollapse}
+          />
+        </View>
       </Pressable>
     </View>
   );
@@ -724,6 +800,11 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     overflow: 'hidden',
+  },
+  stageWrapper: {
+    // Layout-only wrapper; the dynamic `transform: [{scale: fitScale}]`
+    // is composed into a style array so the no-inline-styles lint
+    // rule stays happy without having to disable it per-line.
   },
   nodeFrame: {
     position: 'absolute',

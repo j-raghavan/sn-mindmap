@@ -439,4 +439,104 @@ describe('MindmapCanvas', () => {
       unmount();
     });
   });
+
+  describe('Phase 1.4b.1 — auto-fit to viewport (§F-AC-2)', () => {
+    // Pulls the scale value out of the fit-wrapper's transform array.
+    // Matches the `transform: [{scale: n}]` shape the canvas writes.
+    function readFitScale(renderer: Renderer): number {
+      const wrapper = findHostSingle(renderer, 'mindmap-fit-wrapper');
+      const style = flattenStyle(wrapper.props.style);
+      const transform = style.transform as unknown;
+      if (!Array.isArray(transform)) {
+        throw new Error(
+          'readFitScale: expected transform array on fit-wrapper',
+        );
+      }
+      const scaleEntry = transform.find(
+        (t: unknown): t is {scale: number} =>
+          typeof t === 'object' &&
+          t !== null &&
+          typeof (t as {scale?: unknown}).scale === 'number',
+      );
+      if (!scaleEntry) {
+        throw new Error('readFitScale: no {scale: n} in transform array');
+      }
+      return scaleEntry.scale;
+    }
+
+    // Invokes the Pressable-level onLayout with a synthetic event so
+    // the canvas measures the viewport and re-computes fitScale.
+    // react-test-renderer does not run native layout itself.
+    function fireSurfaceLayout(
+      renderer: Renderer,
+      width: number,
+      height: number,
+    ): void {
+      const hits = renderer.root.findAll(
+        node =>
+          typeof node.type !== 'string' &&
+          node.props.accessibilityLabel === 'mindmap-background' &&
+          typeof node.props.onLayout === 'function',
+      );
+      if (hits.length === 0) {
+        throw new Error(
+          'fireSurfaceLayout: no onLayout on mindmap-background',
+        );
+      }
+      const onLayout = hits[0].props.onLayout as (e: unknown) => void;
+      act(() => {
+        onLayout({nativeEvent: {layout: {x: 0, y: 0, width, height}}});
+      });
+    }
+
+    it('default (pre-layout) scale is 1', () => {
+      const {renderer, unmount} = renderCanvas(<MindmapCanvas />);
+      expect(readFitScale(renderer)).toBe(1);
+      unmount();
+    });
+
+    it('small tree (lone root) stays at scale 1 even in a large viewport', () => {
+      const {renderer, unmount} = renderCanvas(<MindmapCanvas />);
+      fireSurfaceLayout(renderer, 1404, 1800); // Nomad-ish authoring area.
+      // A 220×96 root with 48-px padding fits trivially; scale caps
+      // at 1 so the root stays at its designed size.
+      expect(readFitScale(renderer)).toBe(1);
+      unmount();
+    });
+
+    it('big tree scales down to fit the viewport with padding', () => {
+      // Build a tree wider than a typical viewport so auto-fit kicks
+      // in. 20 first-level children on a R1=340 orbit gives a
+      // unionBbox of ~900 wide × ~900 tall even before NODE_WIDTH;
+      // we squeeze it into a 400×400 viewport to force scale < 1.
+      const tree = createTree();
+      for (let i = 0; i < 20; i += 1) {
+        addChild(tree, tree.rootId);
+      }
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      fireSurfaceLayout(renderer, 400, 400);
+      const scale = readFitScale(renderer);
+      expect(scale).toBeLessThan(1);
+      expect(scale).toBeGreaterThan(0);
+      unmount();
+    });
+
+    it('re-layout to a tighter viewport tightens the scale', () => {
+      const tree = createTree();
+      for (let i = 0; i < 20; i += 1) {
+        addChild(tree, tree.rootId);
+      }
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      fireSurfaceLayout(renderer, 800, 800);
+      const loose = readFitScale(renderer);
+      fireSurfaceLayout(renderer, 300, 300);
+      const tight = readFitScale(renderer);
+      expect(tight).toBeLessThan(loose);
+      unmount();
+    });
+  });
 });
