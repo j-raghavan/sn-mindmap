@@ -84,12 +84,10 @@ import {
   STANDARD_PEN_WIDTH,
 } from './layout/constants';
 import type {Point, Rect} from './geometry';
-import {insertMindmap, type PreEditContext} from './insert';
-import {
-  MARKER_CAPACITY_MESSAGE,
-  MarkerCapacityError,
-} from './marker/encode';
+import {type PreEditContext} from './insert';
+import {MARKER_CAPACITY_MESSAGE} from './marker/encode';
 import ConfirmDialog from './ConfirmDialog';
+import {useInsertFlow} from './useInsertFlow';
 import type {
   OutOfMapStrokes,
   PreservedStroke,
@@ -132,14 +130,6 @@ const ICON_GAP = 8;
  * (surfaceW - 2 * VIEWPORT_PADDING) × (surfaceH - 2 * VIEWPORT_PADDING).
  */
 const VIEWPORT_PADDING = 48;
-
-/**
- * How long to leave an insert-error banner on screen before auto-
- * dismissing. Matches sn-shapes' ERROR_DISPLAY_MS so the two plugins
- * feel consistent when the user hits an intermittent device-side
- * insert failure.
- */
-const INSERT_ERROR_DISPLAY_MS = 2000;
 
 /**
  * Two-tap confirm window for the destructive Clear button. A first
@@ -382,72 +372,18 @@ export default function MindmapCanvas({
     dispatch({type: 'TOGGLE_COLLAPSE', nodeId});
   }, []);
 
-  // Insert flow state (§F-IN-1..F-IN-5). `pending` ref + state is
-  // the same pattern sn-shapes/ShapePalette.tsx uses: the ref is
-  // read synchronously inside event handlers to debounce double-
-  // taps, while the state drives the render so the button dims and
-  // shows "Inserting…" during the 1-2 s insert budget (§F-NF-2).
-  const [isInserting, setIsInserting] = useState(false);
-  const insertingRef = useRef(false);
-  const [insertError, setInsertError] = useState<string | null>(null);
-  const errorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Cleanup the error timer on unmount so closures don't fire a
-  // setState against a torn-down component (no-op in current RN but
-  // matches ShapePalette.tsx's discipline and is the right shape for
-  // React 19's strict unmount semantics).
-  useEffect(() => {
-    return () => {
-      if (errorTimerRef.current) {
-        clearTimeout(errorTimerRef.current);
-      }
-    };
-  }, []);
-
-  const showInsertError = useCallback((msg: string) => {
-    setInsertError(msg);
-    if (errorTimerRef.current) {
-      clearTimeout(errorTimerRef.current);
-    }
-    errorTimerRef.current = setTimeout(
-      () => setInsertError(null),
-      INSERT_ERROR_DISPLAY_MS,
-    );
-  }, []);
-
-  // §F-PE-4 — marker-capacity error is a persistent modal, not the
-  // transient insert-error banner: the user must acknowledge it and
-  // reduce nodes before a retry can succeed, so the spec text stays
-  // on-screen until they tap OK. MarkerCapacityError bubbles up from
-  // encodeMarker (inside emitGeometries, called by insertMindmap)
-  // before any geometry has been committed to the page, so there is
-  // no partial cleanup to do when we switch routes from banner → modal.
-  const [capacityModalOpen, setCapacityModalOpen] = useState(false);
-  const handleCapacityAcknowledge = useCallback(() => {
-    setCapacityModalOpen(false);
-  }, []);
-
-  /**
-   * Route an error caught from insertMindmap to the correct UI
-   * surface. MarkerCapacityError → persistent capacity modal (§F-PE-4);
-   * everything else → the transient 2 s error banner used by the rest
-   * of the insert pipeline (§F-IN-5).
-   *
-   * Centralised so the Insert and Save paths can't drift apart — both
-   * must show the same modal for the same capacity failure, and both
-   * must keep the plugin view open (never closePluginView) so the
-   * user can return to authoring / editing and reduce the node count.
-   */
-  const handleInsertError = useCallback(
-    (err: unknown) => {
-      if (err instanceof MarkerCapacityError) {
-        setCapacityModalOpen(true);
-        return;
-      }
-      const message = err instanceof Error ? err.message : 'Insert failed';
-      showInsertError(message);
-    },
-    [showInsertError],
-  );
+  // Insert / Save pipeline state (§F-IN-*, §F-ED-7, §F-PE-4, §8.1).
+  // Extracted into useInsertFlow so the canvas renders topology +
+  // affordances + top bar, while the hook owns debounce, pending
+  // state, transient error banner, capacity modal, and out-of-map
+  // confirmation dialog. See src/useInsertFlow.ts for the SRP
+  // rationale; behavior is byte-identical to the pre-refactor inline
+  // code so the MindmapCanvas test suite keeps passing unchanged.
+  const flow = useInsertFlow({
+    tree,
+    preEdit,
+    outOfMapStrokes: initialOutOfMapStrokes,
+  });
 
   // Clear-button two-tap confirm state. `clearArmed` flips to true on
   // the first tap, re-rendering the button label as "Confirm Clear".
@@ -467,8 +403,10 @@ export default function MindmapCanvas({
     // Refuse to clear mid-insert — the insert pipeline reads `tree`
     // from the render that kicked it off, but a confused user
     // shouldn't be able to wipe the canvas while the device is still
-    // painting the previous map.
-    if (insertingRef.current) {
+    // painting the previous map. flow.isInserting is state rather
+    // than a ref, but Pressable onPress can't fire inside the same
+    // render cycle that set it, so the race window is zero in practice.
+    if (flow.isInserting) {
       return;
     }
     if (clearArmedTimerRef.current) {
@@ -487,116 +425,7 @@ export default function MindmapCanvas({
     dispatch({type: 'CLEAR'});
     setSelectedId(null);
     setClearArmed(false);
-  }, [clearArmed]);
-
-  /**
-   * Handle Insert tap. Delegates the whole §F-IN-* pipeline to
-   * ./insert.ts; the canvas only owns the pending/error UX. On
-   * success the plugin view has already been dismissed inside
-   * insertMindmap, so nothing more to do here.
-   */
-  const handleInsert = useCallback(async () => {
-    if (insertingRef.current) {
-      return;
-    }
-    insertingRef.current = true;
-    setIsInserting(true);
-    setInsertError(null);
-    if (errorTimerRef.current) {
-      clearTimeout(errorTimerRef.current);
-      errorTimerRef.current = null;
-    }
-    try {
-      await insertMindmap({tree});
-    } catch (err) {
-      handleInsertError(err);
-    } finally {
-      insertingRef.current = false;
-      setIsInserting(false);
-    }
-  }, [tree, handleInsertError]);
-
-  // Phase 4.6 — pre-Save out-of-map confirmation dialog (§8.1). When
-  // the user's lassoed region contained strokes whose centroid fell
-  // outside every node's bbox, Save opens this dialog first instead
-  // of calling insertMindmap directly. The user chooses between
-  //   - "Save anyway" → drop the out-of-map strokes and proceed;
-  //   - "Cancel"      → dismiss the dialog without saving so the user
-  //                     can close the plugin and re-lasso wider.
-  // The dialog is skipped entirely when outOfMap is empty (the common
-  // case) so simple edits don't grow an extra confirmation tap.
-  const [saveConfirmOpen, setSaveConfirmOpen] = useState(false);
-  const outOfMapCount = initialOutOfMapStrokes?.length ?? 0;
-
-  /**
-   * Run the actual §F-ED-7 Save pipeline. Factored out of handleSave
-   * so the same code path covers both the no-out-of-map fast path
-   * (tap Save → run directly) and the confirmed path (tap Save →
-   * dialog → tap "Save anyway" → run). Shares debounce/error-banner
-   * UX with handleInsert — the two buttons are mutually exclusive by
-   * isEditMode so there's no race between them.
-   */
-  const runSavePipeline = useCallback(async () => {
-    if (insertingRef.current) {
-      return;
-    }
-    insertingRef.current = true;
-    setIsInserting(true);
-    setInsertError(null);
-    if (errorTimerRef.current) {
-      clearTimeout(errorTimerRef.current);
-      errorTimerRef.current = null;
-    }
-    try {
-      await insertMindmap({tree, preEdit});
-    } catch (err) {
-      handleInsertError(err);
-    } finally {
-      insertingRef.current = false;
-      setIsInserting(false);
-    }
-  }, [tree, preEdit, handleInsertError]);
-
-  /**
-   * Handle Save tap (§F-ED-7, Phase 4.5 + 4.6). If any out-of-map
-   * strokes were carried through from the associator (§8.1), open
-   * the confirmation dialog instead of running the pipeline; the
-   * user's subsequent "Save anyway" tap calls runSavePipeline.
-   * Otherwise run the pipeline directly for the common no-out-of-map
-   * case.
-   */
-  const handleSave = useCallback(async () => {
-    if (insertingRef.current) {
-      return;
-    }
-    if (outOfMapCount > 0) {
-      setSaveConfirmOpen(true);
-      return;
-    }
-    await runSavePipeline();
-  }, [outOfMapCount, runSavePipeline]);
-
-  /**
-   * "Save anyway" from the out-of-map dialog — closes the dialog,
-   * drops the out-of-map strokes implicitly (they were never routed
-   * into the preEdit bucket to begin with) and runs the pipeline.
-   */
-  const handleSaveConfirm = useCallback(async () => {
-    setSaveConfirmOpen(false);
-    await runSavePipeline();
-  }, [runSavePipeline]);
-
-  /**
-   * "Cancel" from the out-of-map dialog — or tap-outside on the
-   * backdrop. Just closes the dialog; the plugin view stays open so
-   * the user can tap the top-bar Cancel to close the plugin entirely
-   * and re-lasso including the missed strokes. Intentional: we do
-   * NOT closePluginView from here because the user might simply want
-   * to make more topology edits first, then Save again.
-   */
-  const handleSaveCancel = useCallback(() => {
-    setSaveConfirmOpen(false);
-  }, []);
+  }, [clearArmed, flow.isInserting]);
 
   return (
     <View style={styles.root}>
@@ -621,21 +450,21 @@ export default function MindmapCanvas({
         <Pressable
           accessibilityRole="button"
           accessibilityLabel={clearArmed ? 'Confirm Clear' : 'Clear'}
-          accessibilityState={{disabled: isInserting}}
-          disabled={isInserting}
+          accessibilityState={{disabled: flow.isInserting}}
+          disabled={flow.isInserting}
           onPress={handleClear}
           style={({pressed}) => [
             styles.topBarBtn,
             styles.topBarBtnAdjacent,
-            pressed && !isInserting && styles.topBarBtnPressed,
+            pressed && !flow.isInserting && styles.topBarBtnPressed,
             clearArmed && styles.topBarBtnArmed,
-            isInserting && styles.topBarBtnDisabled,
+            flow.isInserting && styles.topBarBtnDisabled,
           ]}>
           <Text
             style={[
               styles.topBarBtnText,
               clearArmed && styles.topBarBtnTextArmed,
-              isInserting && styles.topBarBtnTextDisabled,
+              flow.isInserting && styles.topBarBtnTextDisabled,
             ]}>
             {clearArmed ? 'Confirm Clear' : 'Clear'}
           </Text>
@@ -655,55 +484,24 @@ export default function MindmapCanvas({
          * strokes translated by each node's move delta). The two
          * buttons are mutually exclusive — only one shape of this
          * button ever renders, with a distinct accessibilityLabel
-         * so tests and on-device tooling can target whichever flow
-         * they're exercising.
+         * ("Insert" vs "Save") so tests and on-device tooling can
+         * target whichever flow they're exercising.
+         *
+         * Both branches share identical top-bar styling + pending-
+         * state chrome, so InsertSaveButton deduplicates the two
+         * ~20-line Pressable definitions behind a single component
+         * whose only mode-dependent outputs are the label text and
+         * the pending label ("Inserting…" vs "Saving…").
          */}
-        {!isEditMode && (
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel="Insert"
-            accessibilityState={{disabled: isInserting}}
-            disabled={isInserting}
-            onPress={handleInsert}
-            style={({pressed}) => [
-              styles.topBarBtn,
-              pressed && !isInserting && styles.topBarBtnPressed,
-              isInserting && styles.topBarBtnDisabled,
-            ]}>
-            <Text
-              style={[
-                styles.topBarBtnText,
-                isInserting && styles.topBarBtnTextDisabled,
-              ]}>
-              {isInserting ? 'Inserting…' : 'Insert'}
-            </Text>
-          </Pressable>
-        )}
-        {isEditMode && (
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel="Save"
-            accessibilityState={{disabled: isInserting}}
-            disabled={isInserting}
-            onPress={handleSave}
-            style={({pressed}) => [
-              styles.topBarBtn,
-              pressed && !isInserting && styles.topBarBtnPressed,
-              isInserting && styles.topBarBtnDisabled,
-            ]}>
-            <Text
-              style={[
-                styles.topBarBtnText,
-                isInserting && styles.topBarBtnTextDisabled,
-              ]}>
-              {isInserting ? 'Saving…' : 'Save'}
-            </Text>
-          </Pressable>
-        )}
+        <InsertSaveButton
+          mode={isEditMode ? 'save' : 'insert'}
+          isPending={flow.isInserting}
+          onPress={isEditMode ? flow.triggerSave : flow.triggerInsert}
+        />
       </View>
-      {insertError !== null && (
+      {flow.insertError !== null && (
         <View accessibilityLabel="insert-error" style={styles.errorBanner}>
-          <Text style={styles.errorText}>{insertError}</Text>
+          <Text style={styles.errorText}>{flow.insertError}</Text>
         </View>
       )}
       <Pressable
@@ -751,18 +549,18 @@ export default function MindmapCanvas({
        */}
       <ConfirmDialog
         labelPrefix="save-confirm"
-        visible={isEditMode && saveConfirmOpen}
+        visible={isEditMode && flow.saveConfirmOpen}
         title="Some strokes are outside every node"
         body={[
-          outOfMapCount === 1
+          flow.outOfMapCount === 1
             ? '1 stroke fell outside every node and will not be saved. '
-            : `${outOfMapCount} strokes fell outside every node and will not be saved. `,
+            : `${flow.outOfMapCount} strokes fell outside every node and will not be saved. `,
           'Cancel to close the plugin and re-lasso with a wider selection, or save anyway to drop them.',
         ]}
         primaryLabel="Save anyway"
-        onPrimary={handleSaveConfirm}
+        onPrimary={flow.confirmSave}
         secondaryLabel="Cancel"
-        onSecondary={handleSaveCancel}
+        onSecondary={flow.cancelSave}
         primaryVariant="destructive"
       />
       {/*
@@ -776,13 +574,65 @@ export default function MindmapCanvas({
        */}
       <ConfirmDialog
         labelPrefix="capacity-error"
-        visible={capacityModalOpen}
+        visible={flow.capacityModalOpen}
         title="Mindmap too large"
         body={MARKER_CAPACITY_MESSAGE}
         primaryLabel="OK"
-        onPrimary={handleCapacityAcknowledge}
+        onPrimary={flow.acknowledgeCapacity}
       />
     </View>
+  );
+}
+
+/**
+ * InsertSaveButton — the top-bar primary-action button that toggles
+ * between authoring ("Insert", §F-AC-8) and edit ("Save", §F-ED-7)
+ * modes. Both modes share identical chrome: same top-bar pill
+ * styling, same pressed / disabled state transitions, same pending-
+ * state "…" label swap. Before the extraction MindmapCanvas rendered
+ * two near-identical 20-line Pressable branches selected by
+ * `isEditMode`; DRY them into a single component whose only
+ * mode-dependent outputs are the accessibilityLabel and the two
+ * labels displayed on the Text child.
+ *
+ * Kept inside MindmapCanvas.tsx rather than extracted to its own file
+ * because it consumes the module-scoped `styles` object — the whole
+ * point of the refactor is to share the top-bar button styling, not
+ * to export a reusable primitive. A separate file would have to
+ * either re-declare the styles (duplication) or export them
+ * (accidental public surface).
+ */
+function InsertSaveButton({
+  mode,
+  isPending,
+  onPress,
+}: {
+  mode: 'insert' | 'save';
+  isPending: boolean;
+  onPress: () => void;
+}): React.JSX.Element {
+  const label = mode === 'insert' ? 'Insert' : 'Save';
+  const pendingLabel = mode === 'insert' ? 'Inserting…' : 'Saving…';
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={label}
+      accessibilityState={{disabled: isPending}}
+      disabled={isPending}
+      onPress={onPress}
+      style={({pressed}) => [
+        styles.topBarBtn,
+        pressed && !isPending && styles.topBarBtnPressed,
+        isPending && styles.topBarBtnDisabled,
+      ]}>
+      <Text
+        style={[
+          styles.topBarBtnText,
+          isPending && styles.topBarBtnTextDisabled,
+        ]}>
+        {isPending ? pendingLabel : label}
+      </Text>
+    </Pressable>
   );
 }
 
