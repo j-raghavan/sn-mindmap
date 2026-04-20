@@ -384,3 +384,330 @@ describe('EditMindmap (Phase 4.3)', () => {
     });
   });
 });
+
+describe('EditMindmap (Phase 4.4) — preserved-stroke wiring', () => {
+  // Phase 4.4 extends the §F-ED-3 ready branch with §F-ED-5
+  // associateStrokes + to-node-local projection. These tests cover:
+  //   - bboxes are projected to page coords (decoder returns
+  //     mindmap-local; raw strokes are in page).
+  //   - in-map strokes reach MindmapCanvas keyed on the right node
+  //     and render (validated via the §F-ED-6 rendering from
+  //     MindmapCanvas.tsx, whose own tests cover the render math).
+  //   - out-of-map strokes don't render in Phase 4.4 but are carried
+  //     through state to the initialOutOfMapStrokes prop (Phase 4.6
+  //     will consume them).
+
+  beforeEach(() => {
+    mockGetLasso.mockReset();
+    mockClose.mockReset();
+    mockDecode.mockReset();
+    mockGetLasso.mockResolvedValue({success: true, result: []});
+    mockClose.mockResolvedValue(true);
+  });
+
+  /**
+   * Build a two-node tree (root + one child) for the stroke-routing
+   * tests. Each test then defines its own stroke list to exercise
+   * routing to a specific bucket.
+   */
+  function buildTwoNodeTree(): {tree: Tree; childId: NodeId} {
+    const tree = createTree();
+    addChild(tree, tree.rootId);
+    const childId = tree.nodesById.get(tree.rootId)!.childIds[0];
+    return {tree, childId};
+  }
+
+  /**
+   * Bboxes in MINDMAP-LOCAL coords (what the decoder returns). Root
+   * at (0, 0); child bucketed off to (300, 0). Widths/heights are
+   * arbitrary but non-overlapping so association is unambiguous.
+   */
+  function buildTwoNodeBboxes(tree: Tree, childId: NodeId): Map<NodeId, Rect> {
+    const m = new Map<NodeId, Rect>();
+    m.set(tree.rootId, {x: 0, y: 0, w: 200, h: 100});
+    m.set(childId, {x: 300, y: 0, w: 200, h: 100});
+    return m;
+  }
+
+  it('projects decoder bboxes to page coords before association', async () => {
+    const {tree, childId} = buildTwoNodeTree();
+    const mindmapLocalBboxes = buildTwoNodeBboxes(tree, childId);
+    const markerOriginPage = {x: 1000, y: 2000};
+
+    // Raw lasso geometry: one polyline whose centroid lands inside
+    // the ROOT's bbox *after* page projection. Root's page bbox will
+    // be (1000, 2000, 200, 100), so a stroke centered at (1050, 2050)
+    // hits it. Without page projection (i.e. using mindmap-local
+    // bboxes directly) the centroid at (1050, 2050) would fall
+    // outside both (root is still at 0..200 mindmap-local; child at
+    // 300..500), so the stroke would end up in outOfMap — meaning a
+    // successful association assertion double-proves the projection
+    // happened.
+    const lassoStroke = {
+      type: 'GEO_polygon',
+      points: [
+        {x: 1020, y: 2020},
+        {x: 1080, y: 2080},
+      ],
+      penColor: 0x00,
+      penType: 10,
+      penWidth: 400,
+    };
+    mockGetLasso.mockResolvedValue({success: true, result: [lassoStroke]});
+    mockDecode.mockReturnValue({
+      ok: true,
+      tree,
+      nodeBboxesById: mindmapLocalBboxes,
+      markerOriginPage,
+    });
+
+    let renderer!: ReactTestRenderer;
+    act(() => {
+      renderer = create(<EditMindmap />);
+    });
+    await flushAsync(renderer);
+
+    // The §F-ED-6 render produces one `preserved-stroke-node-<rootId>`
+    // host View per polyline segment. One segment between two points
+    // → at least one host match (react-test-renderer surfaces both
+    // the composite and host for some wrappers, but a plain <View>
+    // with backgroundColor only surfaces at the host level, so
+    // counting by accessibility label matches user intent here).
+    const rootStrokes = renderer.root.findAllByProps({
+      accessibilityLabel: `preserved-stroke-node-${tree.rootId}`,
+    });
+    expect(rootStrokes.length).toBeGreaterThan(0);
+    // And the child bucket should NOT have received the stroke.
+    const childStrokes = renderer.root.findAllByProps({
+      accessibilityLabel: `preserved-stroke-node-${childId}`,
+    });
+    expect(childStrokes.length).toBe(0);
+    act(() => {
+      renderer.unmount();
+    });
+  });
+
+  it('routes strokes to the node whose projected page bbox contains their centroid', async () => {
+    const {tree, childId} = buildTwoNodeTree();
+    const mindmapLocalBboxes = buildTwoNodeBboxes(tree, childId);
+    const markerOriginPage = {x: 500, y: 600};
+    // Stroke 1 centroid at (600, 650) → inside root's page bbox
+    // (500..700 × 600..700). Stroke 2 centroid at (900, 650) → inside
+    // child's page bbox (800..1000 × 600..700).
+    const strokeA = {
+      type: 'GEO_polygon',
+      points: [
+        {x: 580, y: 630},
+        {x: 620, y: 670},
+      ],
+      penColor: 0x00,
+      penType: 10,
+      penWidth: 400,
+    };
+    const strokeB = {
+      type: 'GEO_polygon',
+      points: [
+        {x: 880, y: 630},
+        {x: 920, y: 670},
+      ],
+      penColor: 0x00,
+      penType: 10,
+      penWidth: 400,
+    };
+    mockGetLasso.mockResolvedValue({
+      success: true,
+      result: [strokeA, strokeB],
+    });
+    mockDecode.mockReturnValue({
+      ok: true,
+      tree,
+      nodeBboxesById: mindmapLocalBboxes,
+      markerOriginPage,
+    });
+
+    let renderer!: ReactTestRenderer;
+    act(() => {
+      renderer = create(<EditMindmap />);
+    });
+    await flushAsync(renderer);
+
+    // Each single-segment polyline produces one labeled host View in
+    // its own node's bucket.
+    const rootHits = renderer.root.findAllByProps({
+      accessibilityLabel: `preserved-stroke-node-${tree.rootId}`,
+    });
+    const childHits = renderer.root.findAllByProps({
+      accessibilityLabel: `preserved-stroke-node-${childId}`,
+    });
+    expect(rootHits.length).toBeGreaterThan(0);
+    expect(childHits.length).toBeGreaterThan(0);
+    act(() => {
+      renderer.unmount();
+    });
+  });
+
+  it('drops strokes whose centroid falls outside every bbox (outOfMap)', async () => {
+    const {tree, childId} = buildTwoNodeTree();
+    const mindmapLocalBboxes = buildTwoNodeBboxes(tree, childId);
+    const markerOriginPage = {x: 0, y: 0};
+    // Centroid at (-100, -100) — left/above every bbox.
+    const orphanStroke = {
+      type: 'GEO_polygon',
+      points: [
+        {x: -120, y: -120},
+        {x: -80, y: -80},
+      ],
+      penColor: 0x00,
+      penType: 10,
+      penWidth: 400,
+    };
+    mockGetLasso.mockResolvedValue({success: true, result: [orphanStroke]});
+    mockDecode.mockReturnValue({
+      ok: true,
+      tree,
+      nodeBboxesById: mindmapLocalBboxes,
+      markerOriginPage,
+    });
+
+    let renderer!: ReactTestRenderer;
+    act(() => {
+      renderer = create(<EditMindmap />);
+    });
+    await flushAsync(renderer);
+
+    // Neither node gets the orphan stroke; §F-ED-6 render surface
+    // stays empty of preserved-stroke labels. Phase 4.6 will surface
+    // the out-of-map bucket in a confirmation dialog, but that's
+    // explicitly scoped out of Phase 4.4.
+    expect(
+      renderer.root.findAllByProps({
+        accessibilityLabel: `preserved-stroke-node-${tree.rootId}`,
+      }).length,
+    ).toBe(0);
+    expect(
+      renderer.root.findAllByProps({
+        accessibilityLabel: `preserved-stroke-node-${childId}`,
+      }).length,
+    ).toBe(0);
+    act(() => {
+      renderer.unmount();
+    });
+  });
+
+  it('renders no strokes when the lasso result is empty', async () => {
+    // Regression for the Phase 4.3 baseline — an empty stroke list
+    // must still reach the ready phase cleanly, with no strokes
+    // rendered and no associateStrokes/translateStrokes errors.
+    const {tree, childId} = buildTwoNodeTree();
+    const mindmapLocalBboxes = buildTwoNodeBboxes(tree, childId);
+    mockGetLasso.mockResolvedValue({success: true, result: []});
+    mockDecode.mockReturnValue({
+      ok: true,
+      tree,
+      nodeBboxesById: mindmapLocalBboxes,
+      markerOriginPage: {x: 0, y: 0},
+    });
+    let renderer!: ReactTestRenderer;
+    act(() => {
+      renderer = create(<EditMindmap />);
+    });
+    await flushAsync(renderer);
+    // Canvas mounted (node labels exist)…
+    expect(
+      findByAccessibilityLabel(renderer, `node-${tree.rootId}`).length,
+    ).toBeGreaterThan(0);
+    // …but no preserved strokes.
+    const allStrokes = renderer.root.findAll(
+      node =>
+        typeof node.type === 'string' &&
+        typeof node.props.accessibilityLabel === 'string' &&
+        node.props.accessibilityLabel.startsWith('preserved-stroke-'),
+    );
+    expect(allStrokes).toHaveLength(0);
+    act(() => {
+      renderer.unmount();
+    });
+  });
+
+  it('translates each in-map stroke to its node\'s page-bbox-local frame for the canvas render', async () => {
+    // This test probes the to-node-local conversion step. We know:
+    //   decoder bbox (mindmap-local) root: (0, 0, 200, 100)
+    //   markerOriginPage:                   (500, 600)
+    //   root page bbox:                     (500, 600, 200, 100)
+    //   stroke polyline in page coords:
+    //     (550, 650) → (590, 650)   length = 40, thickness = 10
+    //
+    // After to-node-local conversion (subtract page bbox.topLeft):
+    //   (50, 50) → (90, 50)          same length/thickness
+    //
+    // The canvas then renders anchored to the root's CURRENT radial-
+    // layout bbox. For a lone-root tree the root bbox top-left is
+    // (-NODE_WIDTH/2, -NODE_HEIGHT/2) and the stage origin equals
+    // that same value, so bbox.x - origin.x = 0 / bbox.y - origin.y
+    // = 0 and the rendered segment sits at
+    //   left = midX - length/2 = 70 - 20 = 50
+    //   top  = midY - thickness/2 = 50 - 5 = 45
+    //
+    // Whereas without the to-node-local step (i.e. if the stroke were
+    // still in page coords), left would be 550 and top 645 — way
+    // outside the root bbox. An observed left=50, top=45 therefore
+    // directly proves the node-local conversion happened.
+    const tree = createTree();
+    const mindmapLocalBboxes = new Map<NodeId, Rect>([
+      [tree.rootId, {x: 0, y: 0, w: 200, h: 100}],
+    ]);
+    const markerOriginPage = {x: 500, y: 600};
+    const lassoStroke = {
+      type: 'GEO_polygon',
+      points: [
+        {x: 550, y: 650},
+        {x: 590, y: 650},
+      ],
+      penColor: 0x00,
+      penType: 10,
+      penWidth: 400,
+    };
+    mockGetLasso.mockResolvedValue({success: true, result: [lassoStroke]});
+    mockDecode.mockReturnValue({
+      ok: true,
+      tree,
+      nodeBboxesById: mindmapLocalBboxes,
+      markerOriginPage,
+    });
+
+    let renderer!: ReactTestRenderer;
+    act(() => {
+      renderer = create(<EditMindmap />);
+    });
+    await flushAsync(renderer);
+
+    const hits = renderer.root.findAll(
+      node =>
+        typeof node.type === 'string' &&
+        node.props.accessibilityLabel === `preserved-stroke-node-${tree.rootId}`,
+    );
+    expect(hits).toHaveLength(1);
+    const styleArr = hits[0].props.style;
+    // Flatten the style array into a single object (same pattern the
+    // canvas test suite uses).
+    const flat: Record<string, unknown> = {};
+    const flatten = (s: unknown): void => {
+      if (!s) {
+        return;
+      }
+      if (Array.isArray(s)) {
+        s.forEach(flatten);
+        return;
+      }
+      Object.assign(flat, s as Record<string, unknown>);
+    };
+    flatten(styleArr);
+    expect(flat.width).toBe(40);
+    expect(flat.left).toBe(50);
+    expect(flat.top).toBe(45);
+    expect(flat.height).toBe(10);
+    act(() => {
+      renderer.unmount();
+    });
+  });
+});

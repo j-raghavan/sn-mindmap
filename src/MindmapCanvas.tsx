@@ -85,6 +85,11 @@ import {
 } from './layout/constants';
 import type {Point, Rect} from './geometry';
 import {insertMindmap} from './insert';
+import type {
+  OutOfMapStrokes,
+  PreservedStroke,
+  StrokeBucket,
+} from './model/strokes';
 
 /**
  * Firmware pen-width (μm) → on-screen pixels. Matches sn-shapes'
@@ -162,6 +167,33 @@ export type MindmapCanvasProps = {
    * Insert button runs the full §F-IN-* pipeline.
    */
   isEditMode?: boolean;
+  /**
+   * Preserved label strokes bucketed by NodeId (Phase 4.4 / §F-ED-6).
+   *
+   * Coordinate convention: each stroke's points are stored in
+   * NODE-LOCAL coords — an offset from its owning node's pre-edit
+   * bbox top-left (in page coords, after EditMindmap projected the
+   * decoder's mindmap-local bboxes into page space by adding
+   * markerOriginPage). This lets the canvas render strokes anchored
+   * to each node's CURRENT radial-layout bbox, so strokes follow the
+   * node visually as the user adds, removes, or reshapes children.
+   *
+   * Render is read-only: preserved strokes paint on top of each
+   * node's outline but below the per-node action icons, and they
+   * never absorb taps. Nodes that appear as keys here but aren't in
+   * the rendered tree (e.g. after Clear) silently drop out —
+   * emitGeometries applies the same graceful behavior for re-emit.
+   *
+   * Only meaningful in edit mode (Phase 4.4). Omit for authoring.
+   */
+  initialPreservedStrokes?: StrokeBucket;
+  /**
+   * Strokes whose centroid fell outside every node's bbox during
+   * §F-ED-5 association. Carried through to Phase 4.6's pre-Save
+   * out-of-map confirmation dialog (§8.1). Phase 4.4 does not render
+   * these — the current scope is in-map strokes only.
+   */
+  initialOutOfMapStrokes?: OutOfMapStrokes;
 };
 
 /**
@@ -220,6 +252,14 @@ function treeReducer(state: Tree, action: Action): Tree {
 export default function MindmapCanvas({
   initialTree,
   isEditMode = false,
+  initialPreservedStrokes,
+  // initialOutOfMapStrokes is held on the props contract for Phase 4.6
+  // (pre-Save out-of-map confirmation dialog). Phase 4.4 intentionally
+  // does not consume it — the strokes aren't rendered and no Save path
+  // exists yet. Listed in destructuring so the contract stays visible
+  // in the component signature even though it's currently a no-op.
+  // The underscore prefix opts out of no-unused-vars for Phase 4.4.
+  initialOutOfMapStrokes: _initialOutOfMapStrokes,
 }: MindmapCanvasProps = {}): React.JSX.Element {
   // The initial-state arg is called lazily by React, so cloning only
   // happens on mount. The clone is important: callers may reuse the
@@ -520,6 +560,7 @@ export default function MindmapCanvas({
             layout={layout}
             visibleIds={visibleIds}
             selectedId={selectedId}
+            preservedStrokes={initialPreservedStrokes}
             onSelect={handleSelect}
             onAddChild={handleAddChild}
             onAddSibling={handleAddSibling}
@@ -584,6 +625,13 @@ type StageProps = {
   layout: LayoutResult;
   visibleIds: Set<NodeId>;
   selectedId: NodeId | null;
+  /**
+   * Node-local preserved strokes (Phase 4.4). See
+   * MindmapCanvasProps.initialPreservedStrokes for coord convention.
+   * Undefined on the authoring canvas; non-empty only under
+   * EditMindmap's §F-ED-6 mount.
+   */
+  preservedStrokes?: StrokeBucket;
   onSelect: (nodeId: NodeId) => void;
   onAddChild: (parentId: NodeId) => void;
   onAddSibling: (nodeId: NodeId) => void;
@@ -609,6 +657,7 @@ function Stage({
   layout,
   visibleIds,
   selectedId,
+  preservedStrokes,
   onSelect,
   onAddChild,
   onAddSibling,
@@ -680,6 +729,41 @@ function Stage({
           />
         );
       })}
+      {/*
+       * Phase 4.4 — preserved label strokes. Rendered AFTER
+       * NodeFrames so they sit on top of the node's white fill
+       * (matching how handwriting appears over the shape on-device),
+       * but BEFORE NodeActions so per-node icons stay tappable on the
+       * top layer. Only visible nodes get their bucket rendered;
+       * collapsed subtrees' strokes stay in memory for a possible
+       * Save path (Phase 4.5) but don't paint.
+       *
+       * Flat-mapped into the Stage so each segment is absolutely
+       * positioned directly in stage coords — wrapping each node's
+       * strokes in a container View would require the container to be
+       * zero-sized to keep the coord frame consistent, adding
+       * complexity without a rendering benefit.
+       */}
+      {preservedStrokes !== undefined &&
+        visibleNodes.flatMap(node => {
+          const bbox = layout.bboxes.get(node.id);
+          if (!bbox) {
+            return [];
+          }
+          const strokes = preservedStrokes.get(node.id);
+          if (!strokes || strokes.length === 0) {
+            return [];
+          }
+          return strokes.map((stroke, i) => (
+            <PreservedStrokeView
+              key={`stroke-${node.id}-${i}`}
+              nodeId={node.id}
+              stroke={stroke}
+              nodeBbox={bbox}
+              origin={origin}
+            />
+          ));
+        })}
       {visibleNodes.map(node => {
         const bbox = layout.bboxes.get(node.id);
         if (!bbox) {
@@ -915,6 +999,145 @@ function NodeActions({
 }
 
 /**
+ * Read-only rendering of a single preserved label stroke (Phase 4.4 /
+ * §F-ED-6). Input is expected in NODE-LOCAL coords (see
+ * MindmapCanvasProps.initialPreservedStrokes); we add the current
+ * node bbox top-left (minus stage origin) to every coordinate so the
+ * stroke anchors to the node's current radial-layout position.
+ *
+ * Rendering approach — no react-native-svg:
+ *   - Polyline / straightLine: each (p_i, p_{i+1}) segment renders as
+ *     a thin rotated <View>, same technique as the Connector
+ *     component. A polyline with N points produces N-1 segments.
+ *     Single-point or empty strokes are silently dropped
+ *     (firmware-captured strokes always have ≥ 2 points; this is a
+ *     defensive floor, not a user-visible case).
+ *   - Circle / ellipse: an absolute-positioned <View> with borderRadius
+ *     matching the minor axis. Rotated by ellipseAngle when the
+ *     firmware stored a non-axis-aligned orientation.
+ *
+ * Pen color: currently all strokes render in black. The firmware
+ * palette is {black, red, grey, darkgrey, white} encoded in a single
+ * byte (penColor), but on-device color values are device-specific and
+ * we lack a verified mapping. Black is the common case on Supernote —
+ * the vast majority of handwriting on e-ink notes is monochrome — so
+ * a black fallback gives good-enough visual fidelity for Phase 4.4.
+ * Expanding to a palette map is a §10 tuning item once we have
+ * on-device samples of each color.
+ */
+function PreservedStrokeView({
+  nodeId,
+  stroke,
+  nodeBbox,
+  origin,
+}: {
+  nodeId: NodeId;
+  stroke: PreservedStroke;
+  nodeBbox: Rect;
+  origin: Point;
+}): React.JSX.Element | null {
+  const offsetX = nodeBbox.x - origin.x;
+  const offsetY = nodeBbox.y - origin.y;
+  const thickness = penWidthToPx(stroke.penWidth);
+  const color = penColorToCss(stroke.penColor);
+  const strokeLabel = `preserved-stroke-node-${nodeId}`;
+  switch (stroke.type) {
+    case 'straightLine':
+    case 'GEO_polygon': {
+      const pts = stroke.points;
+      if (pts.length < 2) {
+        // Degenerate single-point or empty polyline — shouldn't happen
+        // in firmware output; silently drop so a corrupt stroke can't
+        // blow up the render.
+        return null;
+      }
+      const segments: React.JSX.Element[] = [];
+      for (let i = 0; i < pts.length - 1; i += 1) {
+        const from = pts[i];
+        const to = pts[i + 1];
+        const dx = to.x - from.x;
+        const dy = to.y - from.y;
+        const length = Math.hypot(dx, dy);
+        // Zero-length segment (two consecutive points at the same
+        // position) would render as a zero-width sliver — skip it so
+        // we don't emit empty Views for firmware's micro-sampling
+        // duplicates.
+        if (length === 0) {
+          continue;
+        }
+        const angle = Math.atan2(dy, dx);
+        const midX = (from.x + to.x) / 2;
+        const midY = (from.y + to.y) / 2;
+        segments.push(
+          <View
+            key={i}
+            accessibilityLabel={strokeLabel}
+            style={[
+              styles.preservedStrokeSegment,
+              {
+                left: offsetX + midX - length / 2,
+                top: offsetY + midY - thickness / 2,
+                width: length,
+                height: thickness,
+                backgroundColor: color,
+                transform: [{rotate: `${angle}rad`}],
+              },
+            ]}
+          />,
+        );
+      }
+      if (segments.length === 0) {
+        return null;
+      }
+      return <React.Fragment>{segments}</React.Fragment>;
+    }
+    case 'GEO_circle':
+    case 'GEO_ellipse': {
+      const c = stroke.ellipseCenterPoint;
+      const rx = stroke.ellipseMajorAxisRadius;
+      const ry = stroke.ellipseMinorAxisRadius;
+      // Guard against zero-radius ellipses: RN <View> with width=0 or
+      // borderRadius=0 still renders (as a rectangle of zero size,
+      // invisible), but we'd rather short-circuit explicitly.
+      if (rx <= 0 || ry <= 0) {
+        return null;
+      }
+      return (
+        <View
+          accessibilityLabel={strokeLabel}
+          style={[
+            styles.preservedStrokeEllipse,
+            {
+              left: offsetX + c.x - rx,
+              top: offsetY + c.y - ry,
+              width: rx * 2,
+              height: ry * 2,
+              // Taking the minor axis ensures the border curves fully
+              // at the tighter dimension; equals both for a circle.
+              borderRadius: Math.min(rx, ry),
+              borderWidth: thickness,
+              borderColor: color,
+              transform: [{rotate: `${stroke.ellipseAngle}rad`}],
+            },
+          ]}
+        />
+      );
+    }
+    default: {
+      // Exhaustiveness guard — PreservedStroke is the Geometry union,
+      // so any new variant (e.g. a future curve type) surfaces here
+      // at compile time before it can reach the render path.
+      const _exhaustive: never = stroke;
+      throw new Error(
+        `PreservedStrokeView: unknown geometry variant ${
+          (_exhaustive as {type: string}).type
+        }`,
+      );
+    }
+  }
+}
+
+/**
  * Convert a firmware pen width (μm) to on-screen pixels, clamped at
  * MIN_STROKE_PX so hairline strokes stay visible. Small helper kept
  * private because the ratio is a rendering concern, not a geometry
@@ -922,6 +1145,19 @@ function NodeActions({
  */
 function penWidthToPx(penWidth: number): number {
   return Math.max(MIN_STROKE_PX, penWidth * STROKE_PX_PER_PENWIDTH);
+}
+
+/**
+ * Map a firmware penColor byte to a CSS color for rendering.
+ *
+ * Supernote's pen palette is byte-coded and device-dependent. For
+ * Phase 4.4 we default every stroke to black — the dominant case in
+ * practice, and a safer fallback than guessing at non-black codes.
+ * Phase 10 tuning can expand this once we have on-device captures of
+ * each color code.
+ */
+function penColorToCss(_penColor: number): string {
+  return '#000';
 }
 
 /**
@@ -1047,6 +1283,21 @@ const styles = StyleSheet.create({
   connector: {
     position: 'absolute',
     backgroundColor: '#000',
+  },
+  // Preserved-stroke segment (§F-ED-6). Positioned absolutely like
+  // Connector; dynamic left/top/width/height/rotation composed into a
+  // style array at the call site. backgroundColor is also dynamic
+  // (per-stroke pen color) but today always resolves to black —
+  // penColorToCss is a single-case lookup until Phase 10 tuning.
+  preservedStrokeSegment: {
+    position: 'absolute',
+  },
+  // Preserved-stroke ellipse/circle. Rendered as a bordered View with
+  // borderRadius = min(rx, ry) so a circle gets fully-rounded edges
+  // and a non-square ellipse still reads as an oval.
+  preservedStrokeEllipse: {
+    position: 'absolute',
+    backgroundColor: 'transparent',
   },
   iconButton: {
     position: 'absolute',

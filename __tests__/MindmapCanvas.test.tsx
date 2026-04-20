@@ -870,4 +870,434 @@ describe('MindmapCanvas', () => {
       unmount();
     });
   });
+
+  describe('Phase 4.4 — preserved-stroke rendering (§F-ED-6)', () => {
+    // These tests lock in the read-only label-stroke rendering path.
+    // Preserved strokes come in bucketed per-node in NODE-LOCAL coords
+    // (offset from each node's pre-edit page bbox top-left, per the
+    // EditMindmap-side projection); the canvas must render them
+    // anchored to each node's CURRENT radial-layout bbox so strokes
+    // follow the node as the user edits topology.
+
+    // A minimal pen-style fixture — the sn-plugin-lib firmware allow
+    // list expects penType=10 (Fineliner) in emissions, but Phase 4.4
+    // read-only rendering doesn't touch penType; any numeric value
+    // is fine for these tests.
+    const PEN = {penColor: 0x00, penType: 10, penWidth: 400} as const;
+
+    it('renders polyline stroke segments with accessibilityLabel tagged by node id', () => {
+      // Root-only tree → one visible node. A 3-point polyline becomes
+      // 2 segments. The accessibility label lets us count segments
+      // per node without reading into style math.
+      const tree = createTree();
+      const strokes = new Map<number, Array<unknown>>();
+      strokes.set(tree.rootId, [
+        {
+          type: 'GEO_polygon',
+          points: [
+            {x: 5, y: 10},
+            {x: 15, y: 10},
+            {x: 25, y: 20},
+          ],
+          ...PEN,
+        },
+      ]);
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas
+          initialTree={tree}
+          isEditMode
+          initialPreservedStrokes={strokes as never}
+        />,
+      );
+      const segments = findHostByLabel(
+        renderer,
+        `preserved-stroke-node-${tree.rootId}`,
+      );
+      expect(segments).toHaveLength(2);
+      unmount();
+    });
+
+    it('anchors polyline stroke to the node\'s current bbox (left/top derived from layout)', () => {
+      // Single-segment polyline on the root. We can reason about the
+      // expected stage-coord position analytically: bbox top-left -
+      // origin + midX - length/2 for the segment.
+      const tree = createTree();
+      const from = {x: 10, y: 20};
+      const to = {x: 60, y: 20};
+      const strokes = new Map<number, Array<unknown>>();
+      strokes.set(tree.rootId, [
+        {type: 'GEO_polygon', points: [from, to], ...PEN},
+      ]);
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas
+          initialTree={tree}
+          isEditMode
+          initialPreservedStrokes={strokes as never}
+        />,
+      );
+      const segments = findHostByLabel(
+        renderer,
+        `preserved-stroke-node-${tree.rootId}`,
+      );
+      expect(segments).toHaveLength(1);
+      const style = flattenStyle(segments[0].props.style);
+      // length = 50, thickness = penWidth * 1/40 (10 px). midX=35,
+      // midY=20. Stage offset for the root depends on the union bbox
+      // — the root is centered on (0,0) so its bbox top-left is
+      // (-NODE_WIDTH/2, -NODE_HEIGHT/2), and that also equals the
+      // stage origin (unionBbox = rootBbox for a lone root), so
+      // bbox.x - origin.x = 0 and bbox.y - origin.y = 0. The segment
+      // renders at (midX - length/2, midY - thickness/2) = (10, 15).
+      expect(style.width).toBe(50);
+      expect(style.left).toBe(10);
+      // thickness = max(2, 400/40) = 10, so top = 20 - 5 = 15.
+      expect(style.top).toBe(15);
+      expect(style.height).toBe(10);
+      unmount();
+    });
+
+    it('renders ellipse stroke as a single bordered View', () => {
+      const tree = createTree();
+      const strokes = new Map<number, Array<unknown>>();
+      strokes.set(tree.rootId, [
+        {
+          type: 'GEO_ellipse',
+          ellipseCenterPoint: {x: 40, y: 30},
+          ellipseMajorAxisRadius: 20,
+          ellipseMinorAxisRadius: 12,
+          ellipseAngle: 0,
+          ...PEN,
+        },
+      ]);
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas
+          initialTree={tree}
+          isEditMode
+          initialPreservedStrokes={strokes as never}
+        />,
+      );
+      const hits = findHostByLabel(
+        renderer,
+        `preserved-stroke-node-${tree.rootId}`,
+      );
+      // Single ellipse → exactly one labeled host View (no per-segment
+      // breakdown like the polyline case).
+      expect(hits).toHaveLength(1);
+      const style = flattenStyle(hits[0].props.style);
+      expect(style.width).toBe(40);
+      expect(style.height).toBe(24);
+      // borderRadius = min(rx, ry) so an oval has rounded ends.
+      expect(style.borderRadius).toBe(12);
+      unmount();
+    });
+
+    it('renders each bucket\'s strokes against that bucket\'s node bbox', () => {
+      // Two-node tree: root + one child. Each node gets its own stroke
+      // with distinguishable pen widths; we assert each stroke's label
+      // resolves to exactly the node we stashed it on.
+      const tree = createTree();
+      addChild(tree, tree.rootId);
+      const childId = tree.nodesById.get(tree.rootId)!.childIds[0];
+      const strokes = new Map<number, Array<unknown>>();
+      strokes.set(tree.rootId, [
+        {
+          type: 'GEO_polygon',
+          points: [
+            {x: 0, y: 0},
+            {x: 10, y: 0},
+          ],
+          ...PEN,
+        },
+      ]);
+      strokes.set(childId, [
+        {
+          type: 'GEO_polygon',
+          points: [
+            {x: 0, y: 0},
+            {x: 5, y: 5},
+          ],
+          penColor: 0x00,
+          penType: 10,
+          // Different pen width so we can distinguish root-stroke vs
+          // child-stroke host Views by height (thickness).
+          penWidth: 800,
+        },
+      ]);
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas
+          initialTree={tree}
+          isEditMode
+          initialPreservedStrokes={strokes as never}
+        />,
+      );
+      const rootSegs = findHostByLabel(
+        renderer,
+        `preserved-stroke-node-${tree.rootId}`,
+      );
+      const childSegs = findHostByLabel(
+        renderer,
+        `preserved-stroke-node-${childId}`,
+      );
+      expect(rootSegs).toHaveLength(1);
+      expect(childSegs).toHaveLength(1);
+      // thickness = penWidth/40 clamped to MIN_STROKE_PX=2. Root:
+      // 400/40 = 10. Child: 800/40 = 20.
+      expect(flattenStyle(rootSegs[0].props.style).height).toBe(10);
+      expect(flattenStyle(childSegs[0].props.style).height).toBe(20);
+      unmount();
+    });
+
+    it('strokes follow the node across layout shifts (add-child re-layout)', () => {
+      // Establish the child's initial bbox, render with a stroke on
+      // the child, then add another child to the root — the first
+      // child's bbox may shift (radial layout redistributes) and the
+      // stroke should render at the new bbox position.
+      const tree = createTree();
+      addChild(tree, tree.rootId);
+      const childId = tree.nodesById.get(tree.rootId)!.childIds[0];
+      const strokes = new Map<number, Array<unknown>>();
+      strokes.set(childId, [
+        {
+          type: 'GEO_polygon',
+          points: [
+            {x: 0, y: 0},
+            {x: 10, y: 0},
+          ],
+          ...PEN,
+        },
+      ]);
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas
+          initialTree={tree}
+          isEditMode
+          initialPreservedStrokes={strokes as never}
+        />,
+      );
+      const before = findHostByLabel(
+        renderer,
+        `preserved-stroke-node-${childId}`,
+      );
+      expect(before).toHaveLength(1);
+      const beforeStyle = flattenStyle(before[0].props.style);
+      // Capture the pre-shift position before we mutate the tree.
+      const beforeLeft = beforeStyle.left as number;
+      const beforeTop = beforeStyle.top as number;
+
+      // Add a sibling to force a re-layout. Radial layout fans nodes
+      // around the root; adding a second child changes the first
+      // child's angular slot (fan → full-ring transition happens at
+      // FAN_THRESHOLD=2, but any change in child count tweaks spacing
+      // along the connector). At the very least the stage origin or
+      // the child's bbox moves; if both remained pixel-identical, the
+      // test would catch a future regression where layout stops
+      // responding to child count.
+      pressByLabel(renderer, `add-sibling-${childId}`);
+      const after = findHostByLabel(
+        renderer,
+        `preserved-stroke-node-${childId}`,
+      );
+      expect(after).toHaveLength(1);
+      const afterStyle = flattenStyle(after[0].props.style);
+      const afterLeft = afterStyle.left as number;
+      const afterTop = afterStyle.top as number;
+      // Width/height should stay equal — the stroke itself didn't
+      // resize, only its anchor moved.
+      expect(afterStyle.width).toBe(beforeStyle.width);
+      expect(afterStyle.height).toBe(beforeStyle.height);
+      // At least one axis moved. The particular delta depends on
+      // radialLayout internals, so this is a loose-but-honest
+      // "strokes track the node" assertion.
+      expect(afterLeft !== beforeLeft || afterTop !== beforeTop).toBe(true);
+      unmount();
+    });
+
+    it('drops strokes for nodes that aren\'t in the tree (e.g. stale bucket keys)', () => {
+      // Defensive: a bucket keyed on a NodeId that doesn't resolve to
+      // a rendered node is silently dropped (no throw, no stray
+      // Views). Mirrors emitGeometries' empty-bucket behavior.
+      const tree = createTree();
+      const bogus = new Map<number, Array<unknown>>();
+      bogus.set(9999, [
+        {
+          type: 'GEO_polygon',
+          points: [
+            {x: 0, y: 0},
+            {x: 10, y: 0},
+          ],
+          ...PEN,
+        },
+      ]);
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas
+          initialTree={tree}
+          isEditMode
+          initialPreservedStrokes={bogus as never}
+        />,
+      );
+      expect(findHostByLabel(renderer, 'preserved-stroke-node-9999')).toHaveLength(
+        0,
+      );
+      expect(
+        findHostByLabel(renderer, `preserved-stroke-node-${tree.rootId}`),
+      ).toHaveLength(0);
+      unmount();
+    });
+
+    it('does not render strokes for nodes hidden inside a collapsed subtree', () => {
+      // Build root → A → B. Collapse A; B is hidden. Preserved strokes
+      // stashed on B must not render. Strokes on A itself DO render
+      // because A is still visible (collapsed hides descendants only).
+      const tree = createTree();
+      addChild(tree, tree.rootId);
+      const a = tree.nodesById.get(tree.rootId)!.childIds[0];
+      addChild(tree, a);
+      const b = tree.nodesById.get(a)!.childIds[0];
+      const strokes = new Map<number, Array<unknown>>();
+      strokes.set(a, [
+        {
+          type: 'GEO_polygon',
+          points: [
+            {x: 0, y: 0},
+            {x: 10, y: 0},
+          ],
+          ...PEN,
+        },
+      ]);
+      strokes.set(b, [
+        {
+          type: 'GEO_polygon',
+          points: [
+            {x: 0, y: 0},
+            {x: 10, y: 0},
+          ],
+          ...PEN,
+        },
+      ]);
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas
+          initialTree={tree}
+          isEditMode
+          initialPreservedStrokes={strokes as never}
+        />,
+      );
+      // Pre-collapse: both A and B strokes render.
+      expect(findHostByLabel(renderer, `preserved-stroke-node-${a}`)).toHaveLength(
+        1,
+      );
+      expect(findHostByLabel(renderer, `preserved-stroke-node-${b}`)).toHaveLength(
+        1,
+      );
+      // Collapse A; B's strokes should disappear, A's stay.
+      pressByLabel(renderer, `collapse-${a}`);
+      expect(findHostByLabel(renderer, `preserved-stroke-node-${a}`)).toHaveLength(
+        1,
+      );
+      expect(findHostByLabel(renderer, `preserved-stroke-node-${b}`)).toHaveLength(
+        0,
+      );
+      unmount();
+    });
+
+    it('renders nothing when initialPreservedStrokes is undefined', () => {
+      // Sanity / regression: the prop is optional. An authoring
+      // canvas never passes it.
+      const {renderer, unmount} = renderCanvas(<MindmapCanvas isEditMode />);
+      const all = renderer.root.findAll(
+        node =>
+          typeof node.type === 'string' &&
+          typeof node.props.accessibilityLabel === 'string' &&
+          node.props.accessibilityLabel.startsWith('preserved-stroke-'),
+      );
+      expect(all).toHaveLength(0);
+      unmount();
+    });
+
+    it('drops empty-points polylines silently (defensive against corrupt input)', () => {
+      // Firmware output always has ≥ 2 points, but the decoder can't
+      // guarantee that. A malformed stroke mustn't crash the render.
+      const tree = createTree();
+      const strokes = new Map<number, Array<unknown>>();
+      strokes.set(tree.rootId, [
+        {type: 'GEO_polygon', points: [], ...PEN},
+        {type: 'GEO_polygon', points: [{x: 0, y: 0}], ...PEN},
+      ]);
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas
+          initialTree={tree}
+          isEditMode
+          initialPreservedStrokes={strokes as never}
+        />,
+      );
+      expect(
+        findHostByLabel(renderer, `preserved-stroke-node-${tree.rootId}`),
+      ).toHaveLength(0);
+      unmount();
+    });
+
+    it('drops zero-length segments between duplicate consecutive points', () => {
+      // Micro-sampling can produce consecutive points at the same
+      // position. A zero-length rotated View would render as nothing
+      // anyway but would still be a wasted <View> in the tree.
+      // PreservedStrokeView skips them.
+      const tree = createTree();
+      const strokes = new Map<number, Array<unknown>>();
+      strokes.set(tree.rootId, [
+        {
+          type: 'GEO_polygon',
+          points: [
+            {x: 0, y: 0},
+            {x: 10, y: 0},
+            {x: 10, y: 0}, // dup → zero-length segment skipped
+            {x: 20, y: 0},
+          ],
+          ...PEN,
+        },
+      ]);
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas
+          initialTree={tree}
+          isEditMode
+          initialPreservedStrokes={strokes as never}
+        />,
+      );
+      // 4 points → 3 segments total; one is zero-length → 2 rendered.
+      expect(
+        findHostByLabel(renderer, `preserved-stroke-node-${tree.rootId}`),
+      ).toHaveLength(2);
+      unmount();
+    });
+
+    it('ignores preserved strokes when isEditMode is omitted (authoring)', () => {
+      // Phase 4.4 chose not to gate the render on isEditMode inside
+      // MindmapCanvas (the prop name itself signals intent). This test
+      // documents the current behavior: strokes render regardless of
+      // mode, but only EditMindmap ever passes the prop — authoring
+      // callers leave it undefined and this code path stays cold.
+      //
+      // If Phase 4.5 decides to gate rendering explicitly on
+      // isEditMode, this test should flip to expect 0.
+      const tree = createTree();
+      const strokes = new Map<number, Array<unknown>>();
+      strokes.set(tree.rootId, [
+        {
+          type: 'GEO_polygon',
+          points: [
+            {x: 0, y: 0},
+            {x: 10, y: 0},
+          ],
+          ...PEN,
+        },
+      ]);
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas
+          initialTree={tree}
+          initialPreservedStrokes={strokes as never}
+        />,
+      );
+      expect(
+        findHostByLabel(renderer, `preserved-stroke-node-${tree.rootId}`),
+      ).toHaveLength(1);
+      unmount();
+    });
+  });
 });
