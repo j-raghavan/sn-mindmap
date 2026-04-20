@@ -30,17 +30,48 @@ import {create, act} from 'react-test-renderer';
 
 // sn-plugin-lib ships as untransformed ESM that jest can't parse out
 // of the box — sn-shapes handles this the same way per test file.
-// We only need PluginManager.closePluginView because MindmapCanvas
-// calls it from the Cancel button.
+// The mock covers PluginManager.closePluginView (Cancel button) plus
+// the PluginCommAPI / PluginFileAPI surface that Phase 2.2's insert
+// pipeline dips into. Default mock responses succeed; individual
+// tests override them when exercising error paths.
 jest.mock('sn-plugin-lib', () => ({
   PluginManager: {
-    closePluginView: jest.fn(),
+    closePluginView: jest.fn().mockResolvedValue(true),
+  },
+  PluginCommAPI: {
+    insertGeometry: jest.fn().mockResolvedValue({success: true}),
+    getCurrentFilePath: jest
+      .fn()
+      .mockResolvedValue({success: true, result: '/note/test.note'}),
+    getCurrentPageNum: jest
+      .fn()
+      .mockResolvedValue({success: true, result: 0}),
+    lassoElements: jest.fn().mockResolvedValue({success: true}),
+    deleteLassoElements: jest.fn().mockResolvedValue({success: true}),
+  },
+  PluginFileAPI: {
+    getPageSize: jest
+      .fn()
+      .mockResolvedValue({success: true, result: {width: 1404, height: 1872}}),
   },
 }));
 
 import MindmapCanvas from '../src/MindmapCanvas';
-import {PluginManager} from 'sn-plugin-lib';
+import {PluginCommAPI, PluginManager} from 'sn-plugin-lib';
 import {addChild, addSibling, createTree} from '../src/model/tree';
+
+function flushPromises(): Promise<void> {
+  return new Promise(resolve =>
+    jest.requireActual<typeof globalThis>('timers').setImmediate(resolve),
+  );
+}
+
+async function flushAsync(): Promise<void> {
+  await act(async () => {
+    await flushPromises();
+    await flushPromises();
+  });
+}
 
 type Renderer = ReturnType<typeof create>;
 type TestInstance = ReturnType<Renderer['root']['findAll']>[number];
@@ -536,6 +567,118 @@ describe('MindmapCanvas', () => {
       fireSurfaceLayout(renderer, 300, 300);
       const tight = readFitScale(renderer);
       expect(tight).toBeLessThan(loose);
+      unmount();
+    });
+  });
+
+  describe('Phase 2.2 — Insert button wires to insertMindmap (§F-IN-*)', () => {
+    beforeEach(() => {
+      (PluginCommAPI.insertGeometry as jest.Mock).mockClear();
+      (PluginCommAPI.insertGeometry as jest.Mock).mockResolvedValue({
+        success: true,
+      });
+      (PluginCommAPI.lassoElements as jest.Mock).mockClear();
+      (PluginCommAPI.lassoElements as jest.Mock).mockResolvedValue({
+        success: true,
+      });
+      (PluginCommAPI.deleteLassoElements as jest.Mock).mockClear();
+      (PluginCommAPI.deleteLassoElements as jest.Mock).mockResolvedValue({
+        success: true,
+      });
+      (PluginManager.closePluginView as jest.Mock).mockClear();
+      (PluginManager.closePluginView as jest.Mock).mockResolvedValue(true);
+    });
+
+    it('renders an enabled Insert Pressable with label "Insert"', () => {
+      const {renderer, unmount} = renderCanvas(<MindmapCanvas />);
+      const insert = findPressable(renderer, 'Insert');
+      expect(insert.props.accessibilityState?.disabled).toBe(false);
+      expect(insert.props.disabled).toBe(false);
+      unmount();
+    });
+
+    it('tapping Insert drives the full §F-IN-* pipeline', async () => {
+      const tree = createTree();
+      addChild(tree, tree.rootId);
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+
+      const insert = findPressable(renderer, 'Insert');
+      const onPress = insert.props.onPress as () => void;
+      await act(async () => {
+        onPress();
+        await flushPromises();
+        await flushPromises();
+      });
+
+      // 2 outlines + 1 connector = 3 geometries, then a single lasso
+      // and a single close.
+      expect(PluginCommAPI.insertGeometry).toHaveBeenCalledTimes(3);
+      expect(PluginCommAPI.lassoElements).toHaveBeenCalledTimes(1);
+      expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
+      unmount();
+    });
+
+    it('shows an error banner when insert fails and keeps the plugin view open', async () => {
+      (PluginCommAPI.insertGeometry as jest.Mock).mockResolvedValueOnce({
+        success: false,
+        error: {message: 'simulated insert failure'},
+      });
+
+      const {renderer, unmount} = renderCanvas(<MindmapCanvas />);
+      const insert = findPressable(renderer, 'Insert');
+      const onPress = insert.props.onPress as () => void;
+      await act(async () => {
+        onPress();
+        await flushPromises();
+        await flushPromises();
+      });
+
+      const banners = findHostByLabel(renderer, 'insert-error');
+      expect(banners).toHaveLength(1);
+      expect(PluginManager.closePluginView).not.toHaveBeenCalled();
+      unmount();
+    });
+
+    it('debounces rapid double-taps so only one insert runs at a time', async () => {
+      // Make insertGeometry slow enough that a second tap can land
+      // while the first is still in flight. Using a promise we resolve
+      // manually to avoid timing flake.
+      // TS's flow analysis can't see that the Promise executor fires
+      // synchronously, so we initialize resolveFirst with a no-op and
+      // reassign inside the executor to keep the type `() => void`.
+      let resolveFirst: () => void = () => {};
+      const firstPending = new Promise<void>(r => {
+        resolveFirst = r;
+      });
+      (PluginCommAPI.insertGeometry as jest.Mock).mockImplementationOnce(
+        async () => {
+          await firstPending;
+          return {success: true};
+        },
+      );
+
+      const {renderer, unmount} = renderCanvas(<MindmapCanvas />);
+      const insert = findPressable(renderer, 'Insert');
+      const onPress = insert.props.onPress as () => void;
+
+      await act(async () => {
+        onPress(); // kick off first insert
+        await flushPromises();
+      });
+      await act(async () => {
+        onPress(); // second tap while first is in flight — no-op
+        await flushPromises();
+      });
+
+      // At this point insertGeometry has been called exactly once —
+      // the second tap was debounced via insertingRef.
+      expect(PluginCommAPI.insertGeometry).toHaveBeenCalledTimes(1);
+
+      // Let the first insert complete cleanly.
+      resolveFirst();
+      await flushAsync();
       unmount();
     });
   });

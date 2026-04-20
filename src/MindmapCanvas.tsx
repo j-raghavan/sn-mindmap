@@ -42,7 +42,14 @@
  * StrokePreview pattern so the two plugins stay visually consistent
  * on-device.
  */
-import React, {useCallback, useMemo, useReducer, useState} from 'react';
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+} from 'react';
 import {
   type LayoutChangeEvent,
   Pressable,
@@ -70,6 +77,7 @@ import {
   STANDARD_PEN_WIDTH,
 } from './layout/constants';
 import type {Point, Rect} from './geometry';
+import {insertMindmap} from './insert';
 
 /**
  * Firmware pen-width (μm) → on-screen pixels. Matches sn-shapes'
@@ -107,6 +115,14 @@ const ICON_GAP = 8;
  * (surfaceW - 2 * VIEWPORT_PADDING) × (surfaceH - 2 * VIEWPORT_PADDING).
  */
 const VIEWPORT_PADDING = 48;
+
+/**
+ * How long to leave an insert-error banner on screen before auto-
+ * dismissing. Matches sn-shapes' ERROR_DISPLAY_MS so the two plugins
+ * feel consistent when the user hits an intermittent device-side
+ * insert failure.
+ */
+const INSERT_ERROR_DISPLAY_MS = 2000;
 
 export type MindmapCanvasProps = {
   /**
@@ -260,6 +276,66 @@ export default function MindmapCanvas({
     dispatch({type: 'TOGGLE_COLLAPSE', nodeId});
   }, []);
 
+  // Insert flow state (§F-IN-1..F-IN-5). `pending` ref + state is
+  // the same pattern sn-shapes/ShapePalette.tsx uses: the ref is
+  // read synchronously inside event handlers to debounce double-
+  // taps, while the state drives the render so the button dims and
+  // shows "Inserting…" during the 1-2 s insert budget (§F-NF-2).
+  const [isInserting, setIsInserting] = useState(false);
+  const insertingRef = useRef(false);
+  const [insertError, setInsertError] = useState<string | null>(null);
+  const errorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Cleanup the error timer on unmount so closures don't fire a
+  // setState against a torn-down component (no-op in current RN but
+  // matches ShapePalette.tsx's discipline and is the right shape for
+  // React 19's strict unmount semantics).
+  useEffect(() => {
+    return () => {
+      if (errorTimerRef.current) {
+        clearTimeout(errorTimerRef.current);
+      }
+    };
+  }, []);
+
+  const showInsertError = useCallback((msg: string) => {
+    setInsertError(msg);
+    if (errorTimerRef.current) {
+      clearTimeout(errorTimerRef.current);
+    }
+    errorTimerRef.current = setTimeout(
+      () => setInsertError(null),
+      INSERT_ERROR_DISPLAY_MS,
+    );
+  }, []);
+
+  /**
+   * Handle Insert tap. Delegates the whole §F-IN-* pipeline to
+   * ./insert.ts; the canvas only owns the pending/error UX. On
+   * success the plugin view has already been dismissed inside
+   * insertMindmap, so nothing more to do here.
+   */
+  const handleInsert = useCallback(async () => {
+    if (insertingRef.current) {
+      return;
+    }
+    insertingRef.current = true;
+    setIsInserting(true);
+    setInsertError(null);
+    if (errorTimerRef.current) {
+      clearTimeout(errorTimerRef.current);
+      errorTimerRef.current = null;
+    }
+    try {
+      await insertMindmap({tree});
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Insert failed';
+      showInsertError(message);
+    } finally {
+      insertingRef.current = false;
+      setIsInserting(false);
+    }
+  }, [tree, showInsertError]);
+
   return (
     <View style={styles.root}>
       <View style={styles.topBar}>
@@ -275,19 +351,36 @@ export default function MindmapCanvas({
         </Pressable>
         <View style={styles.topBarSpacer} />
         {/*
-         * Insert button is a disabled stub — the insert pipeline
-         * lands in Phase 2 (§F-IN-*). Kept visible so the on-device
-         * layout matches the final §F-AC-8 top bar, which makes it
-         * immediately obvious if the bar is clipped or misaligned.
+         * Insert button — §F-AC-8. Always enabled because the tree
+         * always has ≥ 1 node; the only reason it's locally disabled
+         * is while an insert is already in flight, to debounce double
+         * taps during the §F-NF-2 ≤ 2.0 s budget.
          */}
-        <View
-          accessibilityLabel="Insert (disabled)"
-          style={[styles.topBarBtn, styles.topBarBtnDisabled]}>
-          <Text style={[styles.topBarBtnText, styles.topBarBtnTextDisabled]}>
-            Insert
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Insert"
+          accessibilityState={{disabled: isInserting}}
+          disabled={isInserting}
+          onPress={handleInsert}
+          style={({pressed}) => [
+            styles.topBarBtn,
+            pressed && !isInserting && styles.topBarBtnPressed,
+            isInserting && styles.topBarBtnDisabled,
+          ]}>
+          <Text
+            style={[
+              styles.topBarBtnText,
+              isInserting && styles.topBarBtnTextDisabled,
+            ]}>
+            {isInserting ? 'Inserting…' : 'Insert'}
           </Text>
-        </View>
+        </Pressable>
       </View>
+      {insertError !== null && (
+        <View accessibilityLabel="insert-error" style={styles.errorBanner}>
+          <Text style={styles.errorText}>{insertError}</Text>
+        </View>
+      )}
       <Pressable
         accessibilityLabel="mindmap-background"
         style={styles.surface}
@@ -794,6 +887,18 @@ const styles = StyleSheet.create({
   },
   topBarBtnTextDisabled: {
     color: '#999',
+  },
+  errorBanner: {
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    backgroundColor: '#000',
+    borderBottomWidth: 1,
+    borderBottomColor: '#000',
+  },
+  errorText: {
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: '500',
   },
   surface: {
     flex: 1,
