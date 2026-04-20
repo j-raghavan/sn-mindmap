@@ -1524,4 +1524,322 @@ describe('MindmapCanvas', () => {
       unmount();
     });
   });
+
+  describe('Phase 4.6 — pre-Save out-of-map confirmation dialog (§8.1)', () => {
+    // The §F-ED-5 associator produces an `outOfMap` bucket for
+    // strokes whose centroid fell outside every node's bbox. On Save
+    // we show a confirmation dialog BEFORE running insertMindmap so
+    // the user can back out and re-lasso wider if they intended
+    // those strokes to be labels. Dropping the strokes on commit is
+    // automatic — they were never routed into the preEdit bucket —
+    // so the dialog's only job is gating the pipeline and counting.
+    //
+    // These tests focus on that gating: no out-of-map ⇒ no dialog,
+    // some out-of-map ⇒ dialog blocks the pipeline until the user
+    // presses "Save anyway" (or Cancel, which just dismisses without
+    // closing the plugin so the user can keep editing).
+
+    beforeEach(() => {
+      (PluginCommAPI.insertGeometry as jest.Mock).mockClear();
+      (PluginCommAPI.insertGeometry as jest.Mock).mockResolvedValue({
+        success: true,
+      });
+      (PluginCommAPI.lassoElements as jest.Mock).mockClear();
+      (PluginCommAPI.lassoElements as jest.Mock).mockResolvedValue({
+        success: true,
+      });
+      (PluginCommAPI.deleteLassoElements as jest.Mock).mockClear();
+      (PluginCommAPI.deleteLassoElements as jest.Mock).mockResolvedValue({
+        success: true,
+      });
+      (PluginManager.closePluginView as jest.Mock).mockClear();
+      (PluginManager.closePluginView as jest.Mock).mockResolvedValue(true);
+    });
+
+    /** Simplest out-of-map stroke fixture (a short polyline). */
+    function buildOutOfMap(count: number): unknown[] {
+      const arr: unknown[] = [];
+      for (let i = 0; i < count; i++) {
+        arr.push({
+          type: 'GEO_polygon',
+          points: [
+            {x: -100 - i, y: -100 - i},
+            {x: -80 - i, y: -80 - i},
+          ],
+          penColor: 0x00,
+          penType: 10,
+          penWidth: 400,
+        });
+      }
+      return arr;
+    }
+
+    /** Minimal preEdit context matching Phase 4.5's helper. */
+    function buildPreEdit(tree: ReturnType<typeof createTree>): {
+      preEditPageBboxes: Map<number, {x: number; y: number; w: number; h: number}>;
+      strokesByNodePage: Map<number, never[]>;
+    } {
+      const pre = new Map<number, {x: number; y: number; w: number; h: number}>();
+      for (const id of tree.nodesById.keys()) {
+        pre.set(id, {x: id * 100, y: id * 100, w: 220, h: 96});
+      }
+      return {preEditPageBboxes: pre, strokesByNodePage: new Map()};
+    }
+
+    it('runs the pipeline directly when outOfMap is empty (no dialog)', async () => {
+      // The gate must be a no-op when there's nothing to warn about,
+      // otherwise the simple common-case Save grows an extra tap.
+      const tree = createTree();
+      const preEdit = buildPreEdit(tree);
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas
+          initialTree={tree}
+          isEditMode
+          preEdit={preEdit}
+          initialOutOfMapStrokes={[]}
+        />,
+      );
+      const save = findPressable(renderer, 'Save');
+      await act(async () => {
+        (save.props.onPress as () => void)();
+        await flushPromises();
+        await flushPromises();
+      });
+      // Pipeline fired, no dialog ever rendered.
+      expect(findHostByLabel(renderer, 'save-confirm-dialog')).toHaveLength(0);
+      expect(PluginCommAPI.deleteLassoElements).toHaveBeenCalledTimes(1);
+      expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
+      unmount();
+    });
+
+    it('also skips the dialog when initialOutOfMapStrokes is omitted', async () => {
+      // Defensive case: if EditMindmap forgets to pass the prop we
+      // should still save rather than silently deadlock on a dialog
+      // the user can't dismiss because it never rendered.
+      const tree = createTree();
+      const preEdit = buildPreEdit(tree);
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} isEditMode preEdit={preEdit} />,
+      );
+      const save = findPressable(renderer, 'Save');
+      await act(async () => {
+        (save.props.onPress as () => void)();
+        await flushPromises();
+        await flushPromises();
+      });
+      expect(findHostByLabel(renderer, 'save-confirm-dialog')).toHaveLength(0);
+      expect(PluginCommAPI.deleteLassoElements).toHaveBeenCalledTimes(1);
+      unmount();
+    });
+
+    it('opens the dialog and blocks the pipeline when outOfMap is non-empty', async () => {
+      const tree = createTree();
+      const preEdit = buildPreEdit(tree);
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas
+          initialTree={tree}
+          isEditMode
+          preEdit={preEdit}
+          initialOutOfMapStrokes={buildOutOfMap(2) as never}
+        />,
+      );
+      const save = findPressable(renderer, 'Save');
+      await act(async () => {
+        (save.props.onPress as () => void)();
+        await flushPromises();
+      });
+      // Dialog rendered — use findHostByLabel because
+      // save-confirm-dialog is on a plain <View> host, not a
+      // Pressable composite.
+      expect(findHostByLabel(renderer, 'save-confirm-dialog').length).toBeGreaterThan(0);
+      // Nothing in the Save pipeline should have fired yet — we're
+      // still inside the confirmation gate.
+      expect(PluginCommAPI.deleteLassoElements).not.toHaveBeenCalled();
+      expect(PluginCommAPI.insertGeometry).not.toHaveBeenCalled();
+      expect(PluginManager.closePluginView).not.toHaveBeenCalled();
+      unmount();
+    });
+
+    it('the dialog body announces the correct out-of-map count', async () => {
+      // The count is the user's only clue for "how much am I about to
+      // drop" — it must reflect the actual outOfMap bucket length.
+      const cases: Array<{n: number; needle: string}> = [
+        {n: 1, needle: '1 stroke fell outside'},
+        {n: 2, needle: '2 strokes fell outside'},
+        {n: 7, needle: '7 strokes fell outside'},
+      ];
+      for (const c of cases) {
+        const tree = createTree();
+        const preEdit = buildPreEdit(tree);
+        const {renderer, unmount} = renderCanvas(
+          <MindmapCanvas
+            initialTree={tree}
+            isEditMode
+            preEdit={preEdit}
+            initialOutOfMapStrokes={buildOutOfMap(c.n) as never}
+          />,
+        );
+        const save = findPressable(renderer, 'Save');
+        await act(async () => {
+          (save.props.onPress as () => void)();
+          await flushPromises();
+        });
+        const body = findHostByLabel(renderer, 'save-confirm-body');
+        expect(body.length).toBeGreaterThan(0);
+        const text = (body[0].props.children as unknown[])
+          .filter((x): x is string => typeof x === 'string')
+          .join('');
+        expect(text).toContain(c.needle);
+        unmount();
+      }
+    });
+
+    it('"Save anyway" closes the dialog and runs the full §F-ED-7 pipeline', async () => {
+      const tree = createTree();
+      const preEdit = buildPreEdit(tree);
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas
+          initialTree={tree}
+          isEditMode
+          preEdit={preEdit}
+          initialOutOfMapStrokes={buildOutOfMap(3) as never}
+        />,
+      );
+      const save = findPressable(renderer, 'Save');
+      await act(async () => {
+        (save.props.onPress as () => void)();
+        await flushPromises();
+      });
+      const proceed = findPressable(renderer, 'save-confirm-proceed');
+      await act(async () => {
+        (proceed.props.onPress as () => void)();
+        await flushPromises();
+        await flushPromises();
+      });
+      // Dialog is gone…
+      expect(findHostByLabel(renderer, 'save-confirm-dialog')).toHaveLength(0);
+      // …and the full pipeline ran.
+      expect(PluginCommAPI.deleteLassoElements).toHaveBeenCalledTimes(1);
+      expect(
+        nonMarkerInsertCount(PluginCommAPI.insertGeometry as jest.Mock),
+      ).toBeGreaterThan(0);
+      expect(PluginCommAPI.lassoElements).toHaveBeenCalledTimes(1);
+      expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
+      unmount();
+    });
+
+    it('"Cancel" dismisses the dialog without running the pipeline or closing the plugin', async () => {
+      const tree = createTree();
+      const preEdit = buildPreEdit(tree);
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas
+          initialTree={tree}
+          isEditMode
+          preEdit={preEdit}
+          initialOutOfMapStrokes={buildOutOfMap(1) as never}
+        />,
+      );
+      const save = findPressable(renderer, 'Save');
+      await act(async () => {
+        (save.props.onPress as () => void)();
+        await flushPromises();
+      });
+      const cancel = findPressable(renderer, 'save-confirm-cancel');
+      await act(async () => {
+        (cancel.props.onPress as () => void)();
+        await flushPromises();
+      });
+      // Dialog dismissed but nothing else happened — user can tap
+      // Cancel in the top bar to close the plugin and re-lasso.
+      expect(findHostByLabel(renderer, 'save-confirm-dialog')).toHaveLength(0);
+      expect(PluginCommAPI.deleteLassoElements).not.toHaveBeenCalled();
+      expect(PluginCommAPI.insertGeometry).not.toHaveBeenCalled();
+      expect(PluginManager.closePluginView).not.toHaveBeenCalled();
+      unmount();
+    });
+
+    it('tapping the backdrop dismisses the dialog (tap-outside-to-cancel idiom)', async () => {
+      // Per spec §646 transient overlays should honor tap-outside to
+      // cancel. Backdrop is a Pressable with onPress=handleSaveCancel.
+      const tree = createTree();
+      const preEdit = buildPreEdit(tree);
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas
+          initialTree={tree}
+          isEditMode
+          preEdit={preEdit}
+          initialOutOfMapStrokes={buildOutOfMap(1) as never}
+        />,
+      );
+      const save = findPressable(renderer, 'Save');
+      await act(async () => {
+        (save.props.onPress as () => void)();
+        await flushPromises();
+      });
+      const backdrop = findPressable(renderer, 'save-confirm-backdrop');
+      await act(async () => {
+        (backdrop.props.onPress as () => void)();
+        await flushPromises();
+      });
+      expect(findHostByLabel(renderer, 'save-confirm-dialog')).toHaveLength(0);
+      expect(PluginCommAPI.deleteLassoElements).not.toHaveBeenCalled();
+      unmount();
+    });
+
+    it('re-opens the dialog on a subsequent Save tap after the user cancelled', async () => {
+      // Regression guard: saveConfirmOpen must go back to false on
+      // cancel so the next Save tap re-triggers the gate. If the
+      // state got stuck the user would be silently auto-saving on the
+      // second tap and losing the out-of-map strokes without a prompt.
+      const tree = createTree();
+      const preEdit = buildPreEdit(tree);
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas
+          initialTree={tree}
+          isEditMode
+          preEdit={preEdit}
+          initialOutOfMapStrokes={buildOutOfMap(1) as never}
+        />,
+      );
+      // First tap → dialog → cancel.
+      const save = findPressable(renderer, 'Save');
+      await act(async () => {
+        (save.props.onPress as () => void)();
+        await flushPromises();
+      });
+      const cancel = findPressable(renderer, 'save-confirm-cancel');
+      await act(async () => {
+        (cancel.props.onPress as () => void)();
+        await flushPromises();
+      });
+      expect(findHostByLabel(renderer, 'save-confirm-dialog')).toHaveLength(0);
+      // Second tap → dialog shows again.
+      const save2 = findPressable(renderer, 'Save');
+      await act(async () => {
+        (save2.props.onPress as () => void)();
+        await flushPromises();
+      });
+      expect(findHostByLabel(renderer, 'save-confirm-dialog').length).toBeGreaterThan(0);
+      unmount();
+    });
+
+    it('does not render the dialog in authoring mode (isEditMode omitted)', () => {
+      // The prop combination shouldn't happen in practice (authoring
+      // doesn't know about lasso association) but a stray prop must
+      // not spawn an on-authoring-canvas dialog either way.
+      const tree = createTree();
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas
+          initialTree={tree}
+          initialOutOfMapStrokes={buildOutOfMap(2) as never}
+        />,
+      );
+      // The Save button itself isn't rendered in authoring mode, and
+      // the dialog's isEditMode guard keeps it off-screen even if
+      // saveConfirmOpen somehow got flipped.
+      expect(findHostByLabel(renderer, 'save-confirm-dialog')).toHaveLength(0);
+      expect(findHostByLabel(renderer, 'Save')).toHaveLength(0);
+      unmount();
+    });
+  });
 });

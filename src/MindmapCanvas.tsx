@@ -211,9 +211,15 @@ export type MindmapCanvasProps = {
   initialPreservedStrokes?: StrokeBucket;
   /**
    * Strokes whose centroid fell outside every node's bbox during
-   * §F-ED-5 association. Carried through to Phase 4.6's pre-Save
-   * out-of-map confirmation dialog (§8.1). Phase 4.4 does not render
-   * these — the current scope is in-map strokes only.
+   * §F-ED-5 association. On Save (Phase 4.6 / §8.1) these gate the
+   * pipeline: if any are present the user sees a confirmation dialog
+   * before insertMindmap runs, so they can back out and re-lasso to
+   * include missed labels. If the user confirms, the strokes are
+   * dropped (not carried through to the re-inserted block). They are
+   * never rendered inside the canvas — only in-map strokes show up
+   * inside node outlines (Phase 4.4).
+   *
+   * Omit in authoring mode. An empty array is equivalent to omitting.
    */
   initialOutOfMapStrokes?: OutOfMapStrokes;
 };
@@ -275,14 +281,7 @@ export default function MindmapCanvas({
   initialTree,
   isEditMode = false,
   initialPreservedStrokes,
-  // initialOutOfMapStrokes is held on the props contract for Phase 4.6
-  // (pre-Save out-of-map confirmation dialog). Phase 4.5 intentionally
-  // does not consume it — the strokes aren't rendered and the Save
-  // flow doesn't gate on them yet. Listed in destructuring so the
-  // contract stays visible in the component signature even though
-  // it's currently a no-op. The underscore prefix opts out of
-  // no-unused-vars until Phase 4.6 wires it up.
-  initialOutOfMapStrokes: _initialOutOfMapStrokes,
+  initialOutOfMapStrokes,
   preEdit,
 }: MindmapCanvasProps = {}): React.JSX.Element {
   // The initial-state arg is called lazily by React, so cloning only
@@ -478,20 +477,27 @@ export default function MindmapCanvas({
     }
   }, [tree, showInsertError]);
 
+  // Phase 4.6 — pre-Save out-of-map confirmation dialog (§8.1). When
+  // the user's lassoed region contained strokes whose centroid fell
+  // outside every node's bbox, Save opens this dialog first instead
+  // of calling insertMindmap directly. The user chooses between
+  //   - "Save anyway" → drop the out-of-map strokes and proceed;
+  //   - "Cancel"      → dismiss the dialog without saving so the user
+  //                     can close the plugin and re-lasso wider.
+  // The dialog is skipped entirely when outOfMap is empty (the common
+  // case) so simple edits don't grow an extra confirmation tap.
+  const [saveConfirmOpen, setSaveConfirmOpen] = useState(false);
+  const outOfMapCount = initialOutOfMapStrokes?.length ?? 0;
+
   /**
-   * Handle Save tap (§F-ED-7, Phase 4.5). Same debounce/error-banner
-   * UX as Insert; the only difference is that we pass `preEdit` so
-   * insertMindmap takes the re-insert branch (delete old mindmap
-   * first, translate preserved label strokes by each node's move
-   * delta, then emit + insert + lasso + close around the post-edit
-   * tree).
-   *
-   * Shares the isInserting state with Insert so the same pending-
-   * spinner / disabled-button UX applies — the two buttons are
-   * mutually exclusive by isEditMode, so there's no risk of a race
-   * between them.
+   * Run the actual §F-ED-7 Save pipeline. Factored out of handleSave
+   * so the same code path covers both the no-out-of-map fast path
+   * (tap Save → run directly) and the confirmed path (tap Save →
+   * dialog → tap "Save anyway" → run). Shares debounce/error-banner
+   * UX with handleInsert — the two buttons are mutually exclusive by
+   * isEditMode so there's no race between them.
    */
-  const handleSave = useCallback(async () => {
+  const runSavePipeline = useCallback(async () => {
     if (insertingRef.current) {
       return;
     }
@@ -512,6 +518,47 @@ export default function MindmapCanvas({
       setIsInserting(false);
     }
   }, [tree, preEdit, showInsertError]);
+
+  /**
+   * Handle Save tap (§F-ED-7, Phase 4.5 + 4.6). If any out-of-map
+   * strokes were carried through from the associator (§8.1), open
+   * the confirmation dialog instead of running the pipeline; the
+   * user's subsequent "Save anyway" tap calls runSavePipeline.
+   * Otherwise run the pipeline directly for the common no-out-of-map
+   * case.
+   */
+  const handleSave = useCallback(async () => {
+    if (insertingRef.current) {
+      return;
+    }
+    if (outOfMapCount > 0) {
+      setSaveConfirmOpen(true);
+      return;
+    }
+    await runSavePipeline();
+  }, [outOfMapCount, runSavePipeline]);
+
+  /**
+   * "Save anyway" from the out-of-map dialog — closes the dialog,
+   * drops the out-of-map strokes implicitly (they were never routed
+   * into the preEdit bucket to begin with) and runs the pipeline.
+   */
+  const handleSaveConfirm = useCallback(async () => {
+    setSaveConfirmOpen(false);
+    await runSavePipeline();
+  }, [runSavePipeline]);
+
+  /**
+   * "Cancel" from the out-of-map dialog — or tap-outside on the
+   * backdrop. Just closes the dialog; the plugin view stays open so
+   * the user can tap the top-bar Cancel to close the plugin entirely
+   * and re-lasso including the missed strokes. Intentional: we do
+   * NOT closePluginView from here because the user might simply want
+   * to make more topology edits first, then Save again.
+   */
+  const handleSaveCancel = useCallback(() => {
+    setSaveConfirmOpen(false);
+  }, []);
 
   return (
     <View style={styles.root}>
@@ -654,6 +701,74 @@ export default function MindmapCanvas({
           />
         </View>
       </Pressable>
+      {/*
+       * Pre-Save out-of-map confirmation dialog (§8.1, Phase 4.6).
+       * Rendered on top of the canvas when the user taps Save and at
+       * least one stroke's centroid fell outside every node's bbox.
+       *
+       * Layout: absolute-positioned overlay fills the canvas; a
+       * Pressable backdrop dims the surface and dismisses the dialog
+       * on tap (the §646 "tap-outside to cancel" idiom). The centered
+       * card sits on top of the backdrop. We stop tap propagation on
+       * the card itself so a careless tap inside the card doesn't
+       * count as a backdrop tap.
+       *
+       * The button row exposes both actions via accessibilityLabel so
+       * the test suite can drive "Save anyway" / "Cancel" independently
+       * of the visible text (we might end up tweaking button copy
+       * without wanting to churn every test).
+       */}
+      {isEditMode && saveConfirmOpen && (
+        <View
+          accessibilityLabel="save-confirm-dialog"
+          style={styles.dialogOverlay}
+          pointerEvents="box-none">
+          <Pressable
+            accessibilityLabel="save-confirm-backdrop"
+            style={styles.dialogBackdrop}
+            onPress={handleSaveCancel}
+          />
+          <View style={styles.dialogCard}>
+            <Text style={styles.dialogTitle}>
+              Some strokes are outside every node
+            </Text>
+            <Text
+              accessibilityLabel="save-confirm-body"
+              style={styles.dialogBody}>
+              {outOfMapCount === 1
+                ? '1 stroke fell outside every node and will not be saved. '
+                : `${outOfMapCount} strokes fell outside every node and will not be saved. `}
+              Cancel to close the plugin and re-lasso with a wider selection,
+              or save anyway to drop them.
+            </Text>
+            <View style={styles.dialogButtonRow}>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="save-confirm-cancel"
+                onPress={handleSaveCancel}
+                style={({pressed}) => [
+                  styles.dialogBtn,
+                  pressed && styles.dialogBtnPressed,
+                ]}>
+                <Text style={styles.dialogBtnText}>Cancel</Text>
+              </Pressable>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="save-confirm-proceed"
+                onPress={handleSaveConfirm}
+                style={({pressed}) => [
+                  styles.dialogBtn,
+                  styles.dialogBtnPrimary,
+                  pressed && styles.dialogBtnPrimaryPressed,
+                ]}>
+                <Text style={[styles.dialogBtnText, styles.dialogBtnTextPrimary]}>
+                  Save anyway
+                </Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      )}
     </View>
   );
 }
@@ -1348,6 +1463,84 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 13,
     fontWeight: '500',
+  },
+  // Phase 4.6 — pre-Save out-of-map confirmation dialog styles (§8.1).
+  // StyleSheet.absoluteFillObject pins the overlay over the entire
+  // canvas; the dialogBackdrop is a full-bleed Pressable that dims +
+  // absorbs taps (except on the card itself, which sits on top).
+  dialogOverlay: {
+    position: 'absolute',
+    top: 0,
+    bottom: 0,
+    left: 0,
+    right: 0,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  dialogBackdrop: {
+    position: 'absolute',
+    top: 0,
+    bottom: 0,
+    left: 0,
+    right: 0,
+    // Semi-transparent black — on e-ink it renders as a subtle mid-
+    // gray that's still readable through but unmistakably "modal".
+    backgroundColor: 'rgba(0,0,0,0.35)',
+  },
+  dialogCard: {
+    backgroundColor: '#fff',
+    borderWidth: 1,
+    borderColor: '#000',
+    borderRadius: 6,
+    paddingVertical: 20,
+    paddingHorizontal: 24,
+    maxWidth: 480,
+    minWidth: 320,
+  },
+  dialogTitle: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: '#000',
+    marginBottom: 12,
+  },
+  dialogBody: {
+    fontSize: 14,
+    color: '#000',
+    lineHeight: 20,
+    marginBottom: 20,
+  },
+  dialogButtonRow: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+  },
+  dialogBtn: {
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    borderWidth: 1,
+    borderColor: '#000',
+    borderRadius: 4,
+    marginLeft: 12,
+  },
+  dialogBtnPressed: {
+    backgroundColor: '#eee',
+  },
+  // Primary (commit) button uses the same inverted black-on-white →
+  // white-on-black treatment the Clear button's armed state uses, so
+  // the destructive-intent button reads as the stronger affordance.
+  dialogBtnPrimary: {
+    backgroundColor: '#000',
+    borderColor: '#000',
+  },
+  dialogBtnPrimaryPressed: {
+    backgroundColor: '#333',
+  },
+  dialogBtnText: {
+    fontSize: 14,
+    fontWeight: '500',
+    color: '#000',
+  },
+  dialogBtnTextPrimary: {
+    color: '#fff',
   },
   surface: {
     flex: 1,

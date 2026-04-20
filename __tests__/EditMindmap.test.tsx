@@ -889,3 +889,145 @@ describe('EditMindmap (Phase 4.5) — Save end-to-end (§F-ED-7)', () => {
     });
   });
 });
+
+describe('EditMindmap (Phase 4.6) — pre-Save out-of-map confirmation (§8.1)', () => {
+  // Phase 4.6 lives in MindmapCanvas — these tests prove the
+  // out-of-map plumbing reaches it end-to-end from the decoder +
+  // associator. When a lasso stroke's centroid lands outside every
+  // node's bbox, the associator routes it to `outOfMap`; EditMindmap
+  // forwards that bucket as initialOutOfMapStrokes; MindmapCanvas
+  // gates the Save pipeline behind a confirmation dialog so the user
+  // can back out and re-lasso wider (§8.1 line 369).
+
+  const mockInsertGeometry = PluginCommAPI.insertGeometry as jest.Mock;
+  const mockLassoElements = PluginCommAPI.lassoElements as jest.Mock;
+  const mockDelete = PluginCommAPI.deleteLassoElements as jest.Mock;
+
+  beforeEach(() => {
+    mockGetLasso.mockReset();
+    mockClose.mockReset();
+    mockDecode.mockReset();
+    mockInsertGeometry.mockReset();
+    mockLassoElements.mockReset();
+    mockDelete.mockReset();
+
+    mockGetLasso.mockResolvedValue({success: true, result: []});
+    mockClose.mockResolvedValue(true);
+    mockInsertGeometry.mockResolvedValue({success: true});
+    mockLassoElements.mockResolvedValue({success: true});
+    mockDelete.mockResolvedValue({success: true});
+  });
+
+  /**
+   * Stand up a mounted EditMindmap where one lasso stroke lands
+   * outside every node's bbox (so association drops it into
+   * `outOfMap`). The decoder is mocked to return a single-node tree
+   * with a known mindmap-local bbox + markerOriginPage so the real
+   * associator inside EditMindmap does the actual routing — we're
+   * not mocking associateStrokes here because we explicitly want to
+   * prove the full pipe works.
+   */
+  async function mountWithOneOutOfMap(): Promise<ReactTestRenderer> {
+    const tree = createTree();
+    const mindmapLocalBboxes = new Map<NodeId, Rect>();
+    mindmapLocalBboxes.set(tree.rootId, {x: 0, y: 0, w: 200, h: 100});
+    // markerOriginPage = (100, 100) → root page bbox (100..300, 100..200).
+    // This stroke centroid at (-10, -10) is clearly outside. The
+    // associator will send it to outOfMap.
+    const orphanStroke = {
+      type: 'GEO_polygon',
+      points: [
+        {x: -20, y: -20},
+        {x: 0, y: 0},
+      ],
+      penColor: 0x00,
+      penType: 10,
+      penWidth: 400,
+    };
+    mockGetLasso.mockResolvedValue({success: true, result: [orphanStroke]});
+    mockDecode.mockReturnValue({
+      ok: true,
+      tree,
+      nodeBboxesById: mindmapLocalBboxes,
+      markerOriginPage: {x: 100, y: 100},
+    });
+    let renderer!: ReactTestRenderer;
+    act(() => {
+      renderer = create(<EditMindmap />);
+    });
+    await flushAsync(renderer);
+    return renderer;
+  }
+
+  it('tapping Save opens the confirmation dialog when any stroke is out of map', async () => {
+    const renderer = await mountWithOneOutOfMap();
+    // Find the Save Pressable (composite, not the host). The
+    // Pressable's onPress is our entry point; tapping it should open
+    // the dialog instead of running the pipeline.
+    const saveCandidates = renderer.root.findAllByProps({
+      accessibilityLabel: 'Save',
+    });
+    const saveBtn = saveCandidates.find(
+      n => typeof n.props.onPress === 'function',
+    );
+    expect(saveBtn).toBeDefined();
+    await act(async () => {
+      (saveBtn!.props.onPress as () => void)();
+      for (let i = 0; i < 5; i++) {
+        await Promise.resolve();
+      }
+    });
+    // Dialog should be up now.
+    const dialogs = renderer.root.findAll(
+      n =>
+        typeof n.type === 'string' &&
+        n.props.accessibilityLabel === 'save-confirm-dialog',
+    );
+    expect(dialogs.length).toBeGreaterThan(0);
+    // And critically: none of the pipeline work ran.
+    expect(mockDelete).not.toHaveBeenCalled();
+    expect(mockInsertGeometry).not.toHaveBeenCalled();
+    expect(mockLassoElements).not.toHaveBeenCalled();
+    expect(mockClose).not.toHaveBeenCalled();
+    act(() => {
+      renderer.unmount();
+    });
+  });
+
+  it('"Save anyway" from the dialog drives the full §F-ED-7 pipeline', async () => {
+    const renderer = await mountWithOneOutOfMap();
+    const saveCandidates = renderer.root.findAllByProps({
+      accessibilityLabel: 'Save',
+    });
+    const saveBtn = saveCandidates.find(
+      n => typeof n.props.onPress === 'function',
+    );
+    await act(async () => {
+      (saveBtn!.props.onPress as () => void)();
+      await Promise.resolve();
+    });
+    // Tap "Save anyway".
+    const proceedCandidates = renderer.root.findAllByProps({
+      accessibilityLabel: 'save-confirm-proceed',
+    });
+    const proceed = proceedCandidates.find(
+      n => typeof n.props.onPress === 'function',
+    );
+    expect(proceed).toBeDefined();
+    await act(async () => {
+      (proceed!.props.onPress as () => void)();
+      for (let i = 0; i < 10; i++) {
+        await Promise.resolve();
+      }
+    });
+    // Pipeline ran — delete-before-insert order is enforced by
+    // insertMindmap itself; here we just check the whole thing
+    // reached closePluginView.
+    expect(mockDelete).toHaveBeenCalledTimes(1);
+    expect(mockInsertGeometry.mock.calls.length).toBeGreaterThan(0);
+    expect(mockClose).toHaveBeenCalledTimes(1);
+    act(() => {
+      renderer.unmount();
+    });
+  });
+});
