@@ -348,12 +348,19 @@ function rsFormalDerivative(Lambda: Uint8Array): Uint8Array {
  * Compute error magnitudes via Forney's algorithm.
  *
  * Ω(x) = [S(x) · Λ(x)] mod x^nsym, where S is the syndrome polynomial
- * (low-degree-first: S[j] = S_j). For each error position i, the
- * magnitude is Ω(α^{-i}) / Λ'(α^{-i}).
+ * (low-degree-first: S[j] = S_j). For each error position i (from the
+ * end of the codeword), the magnitude is
  *
- * Forney with syndromes starting at j=0 has no α^i factor (that extra
- * factor appears when syndromes start at j=1). §6.2's convention is
- * j=0..nsym-1, so the simpler formula applies.
+ *     m_i = X_i^{1-c} · Ω(α^{-i}) / Λ'(α^{-i})
+ *
+ * where X_i = α^i and `c` is the first consecutive root of the
+ * generator. Our generator starts at α^0 (c=0), so the formula
+ * simplifies to `m_i = X_i · Ω(α^{-i}) / Λ'(α^{-i})`. This is the
+ * classic "off by one" trap in small RS implementations: c=1 makes
+ * the X_i factor vanish, c=0 doesn't. With the factor omitted,
+ * errors at position 0 (the constant term) decode correctly by luck
+ * (X_0 = 1) while every other position silently miscorrects and
+ * trips the post-correction syndrome guard downstream.
  *
  * Throws if any Λ'(α^{-i}) is zero — that indicates a malformed locator
  * or more errors than the parity can correct; callers in this module
@@ -381,7 +388,9 @@ function rsForneyMagnitudes(
     if (den === 0) {
       throw new Error('rsDecode: Forney denominator is zero (uncorrectable)');
     }
-    mags[k] = gfDiv(num, den);
+    // X_i = α^i, the c=0 correction factor.
+    const Xi = GF_EXP[i % 255];
+    mags[k] = gfMul(gfDiv(num, den), Xi);
   }
   return mags;
 }
