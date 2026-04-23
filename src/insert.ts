@@ -317,41 +317,58 @@ export async function insertMindmap(input: InsertInput): Promise<void> {
 
 /**
  * Wrap a Geometry into the Element envelope that
- * PluginFileAPI.insertElements expects (type = TYPE_GEO / 700,
- * geometry = the original record). The firmware tolerates unknown
- * fields (`allowUnknown: true` in sn-plugin-lib's ElementSchema),
- * so we don't have to mint uuids or fill the stroke/contours
- * accessors here — the native side generates those when the element
- * lands.
+ * PluginFileAPI.insertElements expects (type = TYPE_GEO / 700).
  *
- * `showLassoAfterInsert` is carried through from the geometry
- * (emitGeometries sets it to false on every entry, §F-IN-3), so the
- * batched insert does not auto-lasso individual elements — the
- * plugin's single explicit lassoElements call is what selects the
- * whole block post-insert.
+ * Key rules enforced here:
  *
- * The geometry's point coordinates are rounded to integers at this
- * boundary (see roundGeometryPoints) because the native firmware
- * surfaces a "Invalid API parameters. Cannot call the API. Please
- * check parameter validity!" toast and aborts insertPageTrails when
- * point coordinates arrive as floats. sn-plugin-lib's JS-side
- * GeometrySchema does NOT require integer x/y (PointSchema only
- * enforces `{x: number, y: number}` with no integer flag), so
- * fractional coords pass JS validation but are rejected host-side
- * in com.ratta.supernote.note. Radial layout (Math.cos/Math.sin)
- * and roundedRectPoints corner sampling both produce fractional
- * coords, so the rounding pass is required on every emission.
+ * 1. `uuid` — native insertPageTrails rejects elements without a
+ *    non-empty uuid string (the JS ElementSchema marks it optional,
+ *    but native enforces it).
+ *
+ * 2. `layerNum: 0` — native expects this field; omitting it causes
+ *    the "Invalid API parameters" rejection even though sn-plugin-lib
+ *    JS schema marks it optional.
+ *
+ * 3. `showLassoAfterInsert` stripped — this field is documented as
+ *    "Used only by insertGeometry; ignored by other APIs". Native's
+ *    insertElements parser does NOT tolerate it inside the geometry
+ *    sub-object and returns "Invalid API parameters" when it is
+ *    present. We omit it explicitly here.
+ *
+ * 4. Point coordinates are rounded to integers (roundGeometryPoints)
+ *    — fractional coords pass JS GeometrySchema but are rejected
+ *    host-side in com.ratta.supernote.note.
  */
 function wrapGeometryAsElement(geometry: Geometry): {
   type: number;
   uuid: string;
-  geometry: Geometry;
+  layerNum: number;
+  geometry: Omit<Geometry, 'showLassoAfterInsert'>;
 } {
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const {showLassoAfterInsert: _drop, ...geoForNative} =
+    roundGeometryPoints(geometry);
   return {
     type: ELEMENT_TYPE_GEO,
-    uuid: crypto.randomUUID(),
-    geometry: roundGeometryPoints(geometry),
+    uuid: uuidV4(),
+    layerNum: 0,
+    geometry: geoForNative,
   };
+}
+
+/**
+ * Generate a RFC 4122 v4 UUID using Math.random.
+ * Avoids a dependency on the `crypto` global, which is not typed in the
+ * project's TS lib and may be absent on older Hermes builds.
+ */
+function uuidV4(): string {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    // eslint-disable-next-line no-bitwise
+    const r = (Math.random() * 16) | 0;
+    // eslint-disable-next-line no-bitwise
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
 }
 
 /**

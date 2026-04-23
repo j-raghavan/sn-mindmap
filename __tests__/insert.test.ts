@@ -256,13 +256,16 @@ describe('insertMindmap — happy path (§F-IN-1..F-IN-4)', () => {
     }
   });
 
-  it('forces showLassoAfterInsert:false on every inserted geometry (§F-IN-3)', async () => {
+  it('strips showLassoAfterInsert from geometries sent to insertElements (§F-IN-3)', async () => {
+    // showLassoAfterInsert is a insertGeometry-only field; native
+    // insertElements rejects elements whose geometry sub-object contains
+    // it. wrapGeometryAsElement must omit it before the batched call.
     const tree = buildSmallTree();
     await insertMindmap({tree});
 
     const insertCalls = getInsertedGeometries();
     for (const [geometry] of insertCalls) {
-      expect(geometry.showLassoAfterInsert).toBe(false);
+      expect(geometry.showLassoAfterInsert).toBeUndefined();
     }
   });
 
