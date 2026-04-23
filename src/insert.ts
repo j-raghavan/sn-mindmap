@@ -344,9 +344,14 @@ export async function insertMindmap(input: InsertInput): Promise<void> {
  */
 function wrapGeometryAsElement(geometry: Geometry): {
   type: number;
+  uuid: string;
   geometry: Geometry;
 } {
-  return {type: ELEMENT_TYPE_GEO, geometry: roundGeometryPoints(geometry)};
+  return {
+    type: ELEMENT_TYPE_GEO,
+    uuid: crypto.randomUUID(),
+    geometry: roundGeometryPoints(geometry),
+  };
 }
 
 /**
