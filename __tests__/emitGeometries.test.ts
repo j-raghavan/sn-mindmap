@@ -26,7 +26,10 @@
  *   - MarkerCapacityError surfaces through emitGeometries when the
  *     tree exceeds MARKER_PUBLISHED_NODE_CAP (§F-PE-4).
  */
-import {emitGeometries} from '../src/rendering/emitGeometries';
+import {
+  emitGeometries,
+  unionRectOfGeometries,
+} from '../src/rendering/emitGeometries';
 import {
   addChild,
   addSibling,
@@ -36,13 +39,15 @@ import {
   type Tree,
   type NodeId,
 } from '../src/model/tree';
-import {radialLayout} from '../src/layout/radial';
+import {radialLayout, type LayoutResult} from '../src/layout/radial';
 import {
   ROOT_PEN_WIDTH,
   STANDARD_PEN_WIDTH,
 } from '../src/layout/constants';
 import {
   PEN_DEFAULTS,
+  type CircleGeometry,
+  type EllipseGeometry,
   type Geometry,
   type LineGeometry,
   type PolygonGeometry,
@@ -632,5 +637,209 @@ describe('emitGeometries — marker emission (§6 / Phase 3.4)', () => {
     if (thrown instanceof MarkerCapacityError) {
       expect(thrown.nodeCount).toBe(MARKER_PUBLISHED_NODE_CAP + 1);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// unionRectOfGeometries — direct unit tests (covers circle/ellipse arms and
+// empty-input sentinel that emitGeometries integration tests don't reach)
+// ---------------------------------------------------------------------------
+
+describe('unionRectOfGeometries — standalone (§F-IN-3)', () => {
+  function makeCircle(cx: number, cy: number, r: number): CircleGeometry {
+    return {
+      type: 'GEO_circle',
+      ellipseCenterPoint: {x: cx, y: cy},
+      ellipseMajorAxisRadius: r,
+      ellipseMinorAxisRadius: r,
+      ellipseAngle: 0,
+      ...PEN_DEFAULTS,
+    };
+  }
+
+  function makeEllipse(
+    cx: number,
+    cy: number,
+    major: number,
+    minor: number,
+  ): EllipseGeometry {
+    return {
+      type: 'GEO_ellipse',
+      ellipseCenterPoint: {x: cx, y: cy},
+      ellipseMajorAxisRadius: major,
+      ellipseMinorAxisRadius: minor,
+      ellipseAngle: 0,
+      ...PEN_DEFAULTS,
+    };
+  }
+
+  it('returns {0,0,0,0} for an empty geometry list', () => {
+    const r = unionRectOfGeometries([]);
+    expect(r).toEqual({x: 0, y: 0, w: 0, h: 0});
+  });
+
+  it('computes correct bounds for a single GEO_circle', () => {
+    const r = unionRectOfGeometries([makeCircle(100, 200, 30)]);
+    // Extends from center ± max(major, minor) = 30.
+    expect(r).toEqual({x: 70, y: 170, w: 60, h: 60});
+  });
+
+  it('computes correct bounds for a GEO_ellipse (uses major radius on both axes)', () => {
+    // major=50, minor=20 → bounding square is ±50 from center.
+    const r = unionRectOfGeometries([makeEllipse(0, 0, 50, 20)]);
+    expect(r).toEqual({x: -50, y: -50, w: 100, h: 100});
+  });
+
+  it('unions a circle and a polygon correctly', () => {
+    const poly: PolygonGeometry = {
+      type: 'GEO_polygon',
+      points: [
+        {x: 200, y: 200},
+        {x: 300, y: 200},
+        {x: 300, y: 300},
+      ],
+      ...PEN_DEFAULTS,
+    };
+    const circle = makeCircle(0, 0, 50);
+    const r = unionRectOfGeometries([poly, circle]);
+    // x: min(-50, 200)=-50 to max(50, 300)=300 → w=350
+    // y: min(-50, 200)=-50 to max(50, 300)=300 → h=350
+    expect(r).toEqual({x: -50, y: -50, w: 350, h: 350});
+  });
+
+  it('throws on unknown geometry variant (exhaustiveness guard)', () => {
+    const bad = {type: 'UNKNOWN_GEOM'} as unknown as Geometry;
+    expect(() => unionRectOfGeometries([bad])).toThrow(
+      /unknown geometry variant UNKNOWN_GEOM/,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// emitGeometries — error paths for centerOrThrow / bboxOrThrow
+// ---------------------------------------------------------------------------
+
+describe('emitGeometries — layout consistency errors', () => {
+  it('throws when layout is missing a node center', () => {
+    const tree = createTree();
+    const childId = addChild(tree, tree.rootId);
+    const layout = radialLayout(tree);
+    // Remove the child's center entry to trigger centerOrThrow.
+    layout.centers.delete(childId);
+    expect(() => emitGeometries({tree, layout})).toThrow(
+      /missing layout center/,
+    );
+  });
+
+  it('throws when layout is missing a node bbox', () => {
+    const tree = createTree();
+    const childId = addChild(tree, tree.rootId);
+    const layout = radialLayout(tree);
+    // Remove the child's bbox entry to trigger bboxOrThrow.
+    layout.bboxes.delete(childId);
+    expect(() => emitGeometries({tree, layout})).toThrow(
+      /missing layout bbox/,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// emitGeometries — connector clipping edge-case paths
+// (covers fallback branches in clipSegmentBetweenRects / slabIntersect that
+// normal radial layouts never reach because their bboxes are always centred
+// on their node centres)
+// ---------------------------------------------------------------------------
+
+describe('emitGeometries — connector clipping edge cases', () => {
+  /**
+   * Build a two-node tree (root + one child) with a hand-crafted
+   * LayoutResult so we can place bboxes wherever we like.
+   */
+  function twoNodeLayout(
+    rootCenter: {x: number; y: number},
+    rootBbox: {x: number; y: number; w: number; h: number},
+    childCenter: {x: number; y: number},
+    childBbox: {x: number; y: number; w: number; h: number},
+  ): {tree: ReturnType<typeof createTree>; layout: LayoutResult} {
+    const tree = createTree();
+    const childId = addChild(tree, tree.rootId);
+    const layout: LayoutResult = {
+      centers: new Map([
+        [tree.rootId, rootCenter],
+        [childId, childCenter],
+      ]),
+      bboxes: new Map([
+        [tree.rootId, rootBbox],
+        [childId, childBbox],
+      ]),
+      unionBbox: {x: -200, y: -200, w: 800, h: 400},
+    };
+    return {tree, layout};
+  }
+
+  it('falls back to center pair when parent center lies outside its own bbox (pSlab null)', () => {
+    // Parent center at (0,0) but parent bbox placed far away.
+    // slabIntersect for the y-axis will see p0=0 < lo=200 → return null.
+    // Connector output falls back to [parentCenter, childCenter].
+    const {tree, layout} = twoNodeLayout(
+      {x: 0, y: 0},
+      {x: -110, y: 200, w: 220, h: 96},   // parent bbox above the x-axis
+      {x: 400, y: 0},
+      {x: 290, y: -48, w: 220, h: 96},
+    );
+    const {geometries} = emitGeometries({tree, layout});
+    // There should be exactly one connector (root → child). Verify it
+    // falls back to the raw center pair — p0 = parentCenter = (0, 0).
+    const connectors = geometries.filter(
+      g => g.type === 'straightLine' && g.penColor !== MARKER_PEN_COLOR,
+    );
+    expect(connectors.length).toBe(1);
+    if (connectors[0].type !== 'straightLine') throw new Error('type guard');
+    expect(connectors[0].points[0]).toEqual({x: 0, y: 0});
+    expect(connectors[0].points[1]).toEqual({x: 400, y: 0});
+  });
+
+  it('falls back to center pair when parent and child share the same center (dx=dy=0)', () => {
+    // When the connector direction vector is zero, slabIntersect returns
+    // {tEnter=-Inf, tExit=Inf} for any axis with d=0, so tExit is Infinity
+    // and !Number.isFinite(tExit) fires the non-finite guard.
+    const sharedCenter = {x: 100, y: 100};
+    const {tree, layout} = twoNodeLayout(
+      sharedCenter,
+      {x: 0, y: 0, w: 220, h: 220},   // bbox contains the shared center
+      sharedCenter,                     // same center as parent
+      {x: 0, y: 0, w: 220, h: 220},
+    );
+    const {geometries} = emitGeometries({tree, layout});
+    const connectors = geometries.filter(
+      g => g.type === 'straightLine' && g.penColor !== MARKER_PEN_COLOR,
+    );
+    expect(connectors.length).toBe(1);
+    if (connectors[0].type !== 'straightLine') throw new Error('type guard');
+    // Fallback: both endpoints equal the shared center.
+    expect(connectors[0].points[0]).toEqual(sharedCenter);
+    expect(connectors[0].points[1]).toEqual(sharedCenter);
+  });
+
+  it('falls back when cSlab is null because the connector does not intersect the child bbox (tEnter > tExit)', () => {
+    // Line from (0,0) toward (500,300) — direction (500,300).
+    // Child bbox at x=[-10,10], y=[200,250]: x-slab t in [-0.02, 0.02]
+    // but y-slab t in [0.67, 0.83]. Since max(-0.02,0.67) > min(0.02,0.83),
+    // slabIntersect returns null (tEnter > tExit) for the child bbox.
+    const {tree, layout} = twoNodeLayout(
+      {x: 0, y: 0},
+      {x: -110, y: -48, w: 220, h: 96},   // normal parent bbox (contains center)
+      {x: 500, y: 300},
+      {x: -10, y: 200, w: 20, h: 50},     // narrow bbox far off the connector line
+    );
+    const {geometries} = emitGeometries({tree, layout});
+    const connectors = geometries.filter(
+      g => g.type === 'straightLine' && g.penColor !== MARKER_PEN_COLOR,
+    );
+    expect(connectors.length).toBe(1);
+    if (connectors[0].type !== 'straightLine') throw new Error('type guard');
+    // Falls back to raw centers.
+    expect(connectors[0].points[0]).toEqual({x: 0, y: 0});
+    expect(connectors[0].points[1]).toEqual({x: 500, y: 300});
   });
 });

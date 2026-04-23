@@ -139,7 +139,16 @@ function findByAccessibilityLabel(
 // --- tests ---------------------------------------------------------------
 
 describe('EditMindmap (Phase 4.3)', () => {
+  // Silence the console.error / console.warn calls that the component
+  // intentionally emits on API-failure and decode-failure paths.
+  // The log output is exercised by the tests themselves; suppressing it
+  // here keeps the test run noise-free without hiding real issues.
+  let errorSpy: jest.SpyInstance;
+  let warnSpy: jest.SpyInstance;
+
   beforeEach(() => {
+    errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
     mockGetLasso.mockReset();
     mockClose.mockReset();
     mockDecode.mockReset();
@@ -147,6 +156,11 @@ describe('EditMindmap (Phase 4.3)', () => {
     // next test that doesn't override the mock sees undefined.
     mockGetLasso.mockResolvedValue({success: true, result: []});
     mockClose.mockResolvedValue(true);
+  });
+
+  afterEach(() => {
+    errorSpy.mockRestore();
+    warnSpy.mockRestore();
   });
 
   it('renders the loading phase before the lasso read resolves', () => {

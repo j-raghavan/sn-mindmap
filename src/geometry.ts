@@ -1,102 +1,107 @@
 /**
- * Local geometry type definitions — minimal mirror of
- * sn-shapes/src/shapes.ts (Point, PenStyle, GeometryFlags, Geometry
- * union). Maintained locally because sn-shapes is not a published
- * package; Phase 2 (§F-IN-* emit work) will decide whether to keep
- * this mirror, vendor the full shapes.ts, or introduce a package.
+ * Shared geometry primitives used throughout the mindmap plugin.
  *
- * The shape of these types must stay compatible with sn-plugin-lib's
- * PluginCommAPI.insertGeometry signature and with the sn-shapes
- * helpers that requirements §F-IN-2 instructs us to reuse
- * (roundedRectPoints etc.).
+ * Coordinate conventions (§3 / §F-LY-*):
+ *   - Layout operates in "mindmap-local" space (logical pixels, origin at
+ *     root centre).  The insert pipeline translates to page pixel coords
+ *     before calling SDK APIs.
+ *   - All sizes are in the same unit as the layout constants in
+ *     src/layout/constants.ts.
  */
 
-export type Point = {x: number; y: number};
+/** 2-D point with floating-point coordinates. */
+export interface Point {
+  x: number;
+  y: number;
+}
 
-export type PenStyle = {
+/**
+ * Axis-aligned bounding box.
+ * Uses (x, y, w, h) rather than (left, top, right, bottom) so that
+ * width/height arithmetic never accidentally reintroduces right/bottom
+ * confusion when coordinates are negative (common in mindmap-local space
+ * where the root sits at origin).
+ */
+export interface Rect {
+  x: number; // left edge
+  y: number; // top edge
+  w: number; // width  (always ≥ 0)
+  h: number; // height (always ≥ 0)
+}
+
+/**
+ * Pen style fields shared by every Geometry variant.
+ */
+export interface PenStyle {
   penColor: number;
   penType: number;
   penWidth: number;
+}
+
+/**
+ * Default pen style for node outlines and connectors.
+ * Black fineliner, standard pen weight.
+ *
+ * NOTE: penType=10 (Fineliner) must be in the firmware allow-list
+ * {1=Pressure, 10=Fineliner, 11=Marker, 14=Calligraphy}. Any other
+ * value causes insertGeometry to fail with "invalid pen type" on-device.
+ */
+export const PEN_DEFAULTS: PenStyle & {showLassoAfterInsert: false} = {
+  penColor: 0x00, // black
+  penType: 10,     // Fineliner
+  penWidth: 400,   // STANDARD_PEN_WIDTH
+  showLassoAfterInsert: false,
 };
 
-export type GeometryFlags = {
-  /**
-   * When true, sn-plugin-lib's insertGeometry auto-lassos the
-   * inserted shape. For multi-geometry blocks (the sn-mindmap insert
-   * path, §F-IN-3) EVERY emitted geometry sets this to false and the
-   * plugin calls PluginCommAPI.lassoElements(unionRect) explicitly.
-   */
+/**
+ * Straight two-point line geometry. Used for connectors and marker bit
+ * strokes.
+ */
+export interface LineGeometry extends PenStyle {
+  type: 'straightLine';
+  points: Point[];
   showLassoAfterInsert?: boolean;
-};
+}
 
-export type PolygonGeometry = PenStyle &
-  GeometryFlags & {
-    type: 'GEO_polygon';
-    points: Point[];
-  };
+/**
+ * Closed polygon geometry. Used for node outlines.
+ */
+export interface PolygonGeometry extends PenStyle {
+  type: 'GEO_polygon';
+  points: Point[];
+  showLassoAfterInsert?: boolean;
+}
 
-export type CircleGeometry = PenStyle &
-  GeometryFlags & {
-    type: 'GEO_circle';
-    ellipseCenterPoint: Point;
-    ellipseMajorAxisRadius: number;
-    ellipseMinorAxisRadius: number;
-    ellipseAngle: number;
-  };
+/**
+ * Circle geometry (equal-axis ellipse). Used for preserved label
+ * strokes that the user drew as a circle.
+ */
+export interface CircleGeometry extends PenStyle {
+  type: 'GEO_circle';
+  ellipseCenterPoint: Point;
+  ellipseMajorAxisRadius: number;
+  ellipseMinorAxisRadius: number;
+  ellipseAngle: number;
+  showLassoAfterInsert?: boolean;
+}
 
-export type EllipseGeometry = PenStyle &
-  GeometryFlags & {
-    type: 'GEO_ellipse';
-    ellipseCenterPoint: Point;
-    ellipseMajorAxisRadius: number;
-    ellipseMinorAxisRadius: number;
-    ellipseAngle: number;
-  };
+/**
+ * Ellipse geometry. Used for preserved label strokes.
+ */
+export interface EllipseGeometry extends PenStyle {
+  type: 'GEO_ellipse';
+  ellipseCenterPoint: Point;
+  ellipseMajorAxisRadius: number;
+  ellipseMinorAxisRadius: number;
+  ellipseAngle: number;
+  showLassoAfterInsert?: boolean;
+}
 
-export type LineGeometry = PenStyle &
-  GeometryFlags & {
-    type: 'straightLine';
-    points: Point[];
-  };
-
+/**
+ * Discriminated union of all geometry types emitted by the plugin.
+ */
 export type Geometry =
+  | LineGeometry
   | PolygonGeometry
   | CircleGeometry
-  | EllipseGeometry
-  | LineGeometry;
-
-/**
- * Axis-aligned bounding rectangle. Used for marker placement
- * (§6.1), per-node bbox in the marker payload (§6.3), lasso
- * union-rect (§F-IN-3), and label-to-node association on edit
- * (§F-ED-5 / §8.1).
- */
-export type Rect = {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-};
-
-/**
- * Default pen style for sn-mindmap emissions. Per the conventions
- * inherited from sn-shapes (§11): black, Fineliner pen type, pen
- * width 400. Overridden per-emission for the root Oval darker border
- * (pen width ≥ 500, §F-AC-2) and the marker cells (0x9D, pen width
- * 100, §6.4).
- *
- * `penType: 10` is **required** — the firmware rejects insertGeometry
- * calls with an "invalid pen type" error for any value outside its
- * allow-list {1=Pressure, 10=Fineliner, 11=Marker, 14=Calligraphy}
- * (PEN_TYPE_PRESETS in sn-shapes/src/ShapeOptionsPanel.tsx:141-145).
- * Earlier drafts of this file used `penType: 0`, which passes our
- * jest suite (we don't validate the allow-list in unit tests) but
- * fails on Nomad/Manta as soon as the first outline reaches
- * PluginCommAPI. sn-shapes anchors this same default in
- * PEN_DEFAULTS at sn-shapes/src/shapes.ts:82-90.
- */
-export const PEN_DEFAULTS: PenStyle = {
-  penColor: 0x00,
-  penType: 10,
-  penWidth: 400,
-};
+  | EllipseGeometry;

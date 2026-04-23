@@ -1,252 +1,186 @@
 /**
- * Radial mindmap layout (§F-LY-1..F-LY-6).
+ * Radial layout algorithm for the mindmap canvas (§F-LY-1 – §F-LY-5).
  *
- * Inputs a Tree; outputs a Map<NodeId, {x, y}> plus per-node
- * bounding-rect anchored at those positions using NODE_WIDTH /
- * NODE_HEIGHT. Positions are in mindmap-local coordinates: the root
- * sits at the origin (0, 0). The caller is responsible for
- * translating into page-space when inserting (§F-IN-1's
- * resolvePageSize / fit-to-page scaling per §F-LY-6).
+ * Algorithm summary
+ * -----------------
+ * 1. Root sits at the origin (0, 0).
+ * 2. Each node at depth d is placed at polar radius
+ *      r(d) = d === 0 ? 0 : R1 + (d − 1) × LEVEL_RADIUS_INCREMENT
+ *    from the origin, in the direction of its allocated angle θ.
+ * 3. The children of any node are assigned proportional angular slices
+ *    based on their *leaf counts* (a leaf counts as 1; an interior node
+ *    counts as the sum of its children's leaf counts).
+ * 4. Fan mode (< 3 children of root or of any parent):
+ *      angular range = [parentAngle − π/3, parentAngle + π/3]  (120°)
+ *    Full-ring mode (≥ 3 children):
+ *      angular range = [parentAngle − π, parentAngle + π]       (360°)
+ *    The range starts from parentAngle − π/3 (fan) or parentAngle − π
+ *    (ring) so that equal-weight children are symmetrically placed around
+ *    the parent's direction and atan2 values stay monotonically increasing
+ *    across siblings (important for the §6.3 determinism guarantee and for
+ *    the radial.test.ts assertions that check adjacent-angle differences
+ *    without wrapping through ±π).
+ * 5. Collapsed subtrees are laid out in full — the canvas hides the
+ *    hidden nodes visually, but the insert pipeline emits them all (§F-IN-2).
  *
- * Rules:
- *   F-LY-1  root at origin
- *   F-LY-2  first-level children distributed on circle radius R1,
- *           skipping a wedge behind the root when a parent is set
- *   F-LY-3  deeper levels radiate outward; each node's angular slice
- *           is proportional to leaf count in its subtree
- *   F-LY-4  connectors are straight lines (phase-2: curved)
- *   F-LY-5  constants live in ./constants.ts
- *   F-LY-6  fit-to-page scaling happens at insert, not here
- *
- * F-LY-2 "skipping a wedge" interpretation for v0.1: if the root has
- * ≤ 2 first-level children, fan them right-facing across
- * [-60°, +60°] so the short map reads as a horizontal tree; with ≥ 3
- * first-level children use the full 360° ring so large maps radiate
- * symmetrically. Tunable under §10.
- *
- * This module is pure — no React, no side effects — so it can be
- * unit-tested in isolation (Phase 1, §9). Must be deterministic:
- * given the same Tree it must return the same positions byte-for-byte,
- * because the marker's per-node bbox depends on these values (§6.3).
- *
- * Collapse state is ignored on purpose. §F-IN-2 auto-expands before
- * emit, so the emit path wants every node laid out anyway; the
- * authoring canvas filters collapsed subtrees out of its own render
- * pass per §4.2.
+ * References: §F-LY-1, §F-LY-2, §F-LY-3, §F-LY-5, §6.3.
  */
-import type {MindmapNode, NodeId, Tree} from '../model/tree';
-import type {Rect} from '../geometry';
+
+import type {Point, Rect} from '../geometry';
 import {
   LEVEL_RADIUS_INCREMENT,
   NODE_HEIGHT,
   NODE_WIDTH,
   R1,
 } from './constants';
+import type {NodeId, Tree} from '../model/tree';
 
-export type LayoutResult = {
-  /** Center point of each node, mindmap-local coords (root = origin). */
-  centers: Map<NodeId, {x: number; y: number}>;
-  /** Axis-aligned bbox of each node, mindmap-local coords. */
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+export interface LayoutResult {
+  /** Centre point of every node, keyed by NodeId, in mindmap-local coords. */
+  centers: Map<NodeId, Point>;
+  /**
+   * Axis-aligned bounding box of every node (centred on the node's centre),
+   * keyed by NodeId.
+   */
   bboxes: Map<NodeId, Rect>;
-  /** Axis-aligned bbox covering every node (for marker placement, §6.1). */
+  /** Smallest Rect that contains every node bbox. */
   unionBbox: Rect;
-};
-
-/** Half-angle (radians) of the right-facing fan — 60° on each side of +x. */
-const FAN_HALF_ANGLE = Math.PI / 3;
-
-/**
- * First-level fan kicks in when the root has this many children or
- * fewer; beyond this, use the full 360° ring.
- */
-const FAN_THRESHOLD = 2;
-
-/**
- * Compute the radial layout for a tree. Collapsed subtrees are
- * included in the layout result because §F-IN-2 auto-expands before
- * emit; the authoring canvas is free to filter them out of its own
- * render pass without changing this function's output.
- */
-export function radialLayout(tree: Tree): LayoutResult {
-  const centers = new Map<NodeId, {x: number; y: number}>();
-  const bboxes = new Map<NodeId, Rect>();
-
-  // Root at origin (§F-LY-1).
-  const rootId = tree.rootId;
-  centers.set(rootId, {x: 0, y: 0});
-  bboxes.set(rootId, centeredRect(0, 0));
-
-  const root = nodeOrThrow(tree, rootId);
-  if (root.childIds.length > 0) {
-    const leafCounts = computeLeafCounts(tree);
-    const isFan = root.childIds.length <= FAN_THRESHOLD;
-    const rangeStart = isFan ? -FAN_HALF_ANGLE : -Math.PI;
-    const rangeEnd = isFan ? FAN_HALF_ANGLE : Math.PI;
-    placeSubtree(tree, root, rangeStart, rangeEnd, R1, leafCounts, centers, bboxes);
-  }
-
-  return {
-    centers,
-    bboxes,
-    unionBbox: computeUnionBbox(bboxes),
-  };
 }
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 /**
- * Allocate angular slices to each child proportional to its subtree
- * leaf count (§F-LY-3), place each child at the mid-angle of its
- * slice at the given radius, and recurse into each child's own
- * subtree with that slice as the new angular range.
- *
- * Iterative so deep trees can't blow the stack; tree.ts uses the
- * same pattern in deleteSubtree / flattenForEmit.
+ * Count the number of leaf nodes in the subtree rooted at `nodeId`.
+ * A node with no children is itself a leaf (count = 1).
+ * Memoised per call into `cache` to avoid O(n²) traversal.
  */
-function placeSubtree(
+function leafCount(
   tree: Tree,
-  root: MindmapNode,
-  rangeStart: number,
-  rangeEnd: number,
-  radius: number,
-  leafCounts: Map<NodeId, number>,
-  centers: Map<NodeId, {x: number; y: number}>,
-  bboxes: Map<NodeId, Rect>,
-): void {
-  type Frame = {
-    parent: MindmapNode;
-    rangeStart: number;
-    rangeEnd: number;
-    radius: number;
-  };
-  const stack: Frame[] = [{parent: root, rangeStart, rangeEnd, radius}];
-
-  while (stack.length > 0) {
-    const frame = stack.pop() as Frame;
-    const parent = frame.parent;
-    const rangeWidth = frame.rangeEnd - frame.rangeStart;
-    // Sum children's leaf counts so each child gets a proportional
-    // arc. Every node has leafCount ≥ 1 so totalLeaves > 0 when
-    // parent.childIds.length > 0.
-    let totalLeaves = 0;
-    for (const id of parent.childIds) {
-      totalLeaves += leafCounts.get(id) ?? 0;
-    }
-    if (totalLeaves === 0) {
-      continue;
-    }
-
-    let cursor = frame.rangeStart;
-    for (const childId of parent.childIds) {
-      const leafCount = leafCounts.get(childId) ?? 0;
-      const sliceWidth = (leafCount / totalLeaves) * rangeWidth;
-      const sliceMid = cursor + sliceWidth / 2;
-
-      const x = frame.radius * Math.cos(sliceMid);
-      const y = frame.radius * Math.sin(sliceMid);
-      centers.set(childId, {x, y});
-      bboxes.set(childId, centeredRect(x, y));
-
-      const child = nodeOrThrow(tree, childId);
-      if (child.childIds.length > 0) {
-        stack.push({
-          parent: child,
-          rangeStart: cursor,
-          rangeEnd: cursor + sliceWidth,
-          radius: frame.radius + LEVEL_RADIUS_INCREMENT,
-        });
-      }
-
-      cursor += sliceWidth;
-    }
+  nodeId: NodeId,
+  cache: Map<NodeId, number>,
+): number {
+  const cached = cache.get(nodeId);
+  if (cached !== undefined) {
+    return cached;
   }
+  const node = tree.nodesById.get(nodeId)!;
+  const count =
+    node.childIds.length === 0
+      ? 1
+      : node.childIds.reduce((sum, c) => sum + leafCount(tree, c, cache), 0);
+  cache.set(nodeId, count);
+  return count;
 }
 
 /**
- * Count leaves in each node's subtree (leaves count as 1, internal
- * nodes sum their children). Used by placeSubtree for §F-LY-3
- * angular-slice proportions.
+ * Recursively place `nodeId` and all its descendants.
  *
- * Iterative post-order so child counts are available when the parent
- * is processed.
+ * @param tree       - The full tree.
+ * @param nodeId     - Node being placed.
+ * @param depth      - Depth of this node (root = 0).
+ * @param angle      - Angular direction (radians) for this node's centre.
+ * @param centers    - Accumulator: node centres.
+ * @param bboxes     - Accumulator: node bboxes.
+ * @param leafCache  - Memoisation table for leafCount.
  */
-function computeLeafCounts(tree: Tree): Map<NodeId, number> {
-  const counts = new Map<NodeId, number>();
-  const stack: Array<{id: NodeId; visited: boolean}> = [
-    {id: tree.rootId, visited: false},
-  ];
-  while (stack.length > 0) {
-    const top = stack[stack.length - 1];
-    if (top.visited) {
-      stack.pop();
-      const node = nodeOrThrow(tree, top.id);
-      if (node.childIds.length === 0) {
-        counts.set(top.id, 1);
-      } else {
-        let sum = 0;
-        for (const childId of node.childIds) {
-          sum += counts.get(childId) ?? 0;
-        }
-        counts.set(top.id, sum);
-      }
-    } else {
-      top.visited = true;
-      const node = nodeOrThrow(tree, top.id);
-      for (const childId of node.childIds) {
-        stack.push({id: childId, visited: false});
-      }
-    }
-  }
-  return counts;
-}
+function placeNode(
+  tree: Tree,
+  nodeId: NodeId,
+  depth: number,
+  angle: number,
+  centers: Map<NodeId, Point>,
+  bboxes: Map<NodeId, Rect>,
+  leafCache: Map<NodeId, number>,
+): void {
+  // Radial distance from origin.
+  const r = depth === 0 ? 0 : R1 + (depth - 1) * LEVEL_RADIUS_INCREMENT;
+  const cx = r * Math.cos(angle);
+  const cy = r * Math.sin(angle);
 
-/**
- * Union of every bbox in the map. There is always at least one entry
- * (the root) so the empty-map branch is unreachable in practice; the
- * guard is here for safety, not as a real code path.
- */
-function computeUnionBbox(bboxes: Map<NodeId, Rect>): Rect {
-  let minX = Infinity;
-  let minY = Infinity;
-  let maxX = -Infinity;
-  let maxY = -Infinity;
-  for (const r of bboxes.values()) {
-    if (r.x < minX) {
-      minX = r.x;
-    }
-    if (r.y < minY) {
-      minY = r.y;
-    }
-    if (r.x + r.w > maxX) {
-      maxX = r.x + r.w;
-    }
-    if (r.y + r.h > maxY) {
-      maxY = r.y + r.h;
-    }
-  }
-  if (minX === Infinity) {
-    return {x: 0, y: 0, w: 0, h: 0};
-  }
-  return {x: minX, y: minY, w: maxX - minX, h: maxY - minY};
-}
-
-/**
- * Node's standard bbox: NODE_WIDTH × NODE_HEIGHT centered on (cx, cy).
- * Shape-specific rendering (oval vs rectangle vs rounded rectangle)
- * is nodeFrame's job at emit time (§F-IN-2); layout only cares about
- * the outline's bounding box.
- */
-function centeredRect(cx: number, cy: number): Rect {
-  return {
+  centers.set(nodeId, {x: cx, y: cy});
+  bboxes.set(nodeId, {
     x: cx - NODE_WIDTH / 2,
     y: cy - NODE_HEIGHT / 2,
     w: NODE_WIDTH,
     h: NODE_HEIGHT,
-  };
+  });
+
+  const node = tree.nodesById.get(nodeId)!;
+  const children = node.childIds;
+  if (children.length === 0) {
+    return;
+  }
+
+  // Fan (<3 children) vs full-ring (≥3 children) mode.
+  const fanMode = children.length < 3;
+  const span = fanMode ? (2 * Math.PI) / 3 : 2 * Math.PI;
+  const startAngle = angle + (fanMode ? -Math.PI / 3 : -Math.PI);
+
+  // Proportional slice allocation based on leaf counts.
+  const totalLeaves = children.reduce(
+    (sum, c) => sum + leafCount(tree, c, leafCache),
+    0,
+  );
+  let curAngle = startAngle;
+  for (const childId of children) {
+    const sliceWidth = (leafCount(tree, childId, leafCache) / totalLeaves) * span;
+    const childAngle = curAngle + sliceWidth / 2;
+    placeNode(
+      tree,
+      childId,
+      depth + 1,
+      childAngle,
+      centers,
+      bboxes,
+      leafCache,
+    );
+    curAngle += sliceWidth;
+  }
 }
 
-function nodeOrThrow(tree: Tree, id: NodeId): MindmapNode {
-  const node = tree.nodesById.get(id);
-  if (!node) {
-    throw new Error(`radialLayout: unknown node id ${id}`);
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/**
+ * Compute a radial layout for the given tree and return centres, bboxes,
+ * and the union bounding box.
+ *
+ * The function is pure and deterministic: calling it twice with the same
+ * tree (including the same nextId) always yields byte-identical results
+ * (§6.3 marker-bbox stability).
+ */
+export function radialLayout(tree: Tree): LayoutResult {
+  const centers = new Map<NodeId, Point>();
+  const bboxes = new Map<NodeId, Rect>();
+  const leafCache = new Map<NodeId, number>();
+
+  placeNode(tree, tree.rootId, 0, 0, centers, bboxes, leafCache);
+
+  // Compute union bbox over all node bboxes.
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const b of bboxes.values()) {
+    if (b.x < minX) {minX = b.x;}
+    if (b.y < minY) {minY = b.y;}
+    if (b.x + b.w > maxX) {maxX = b.x + b.w;}
+    if (b.y + b.h > maxY) {maxY = b.y + b.h;}
   }
-  return node;
+
+  const unionBbox: Rect = {
+    x: minX,
+    y: minY,
+    w: maxX - minX,
+    h: maxY - minY,
+  };
+
+  return {centers, bboxes, unionBbox};
 }

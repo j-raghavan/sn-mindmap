@@ -1,362 +1,330 @@
 /* eslint-disable no-bitwise */
 /**
- * Marker encoder — Tree -> binary records -> RS codeword -> bit
- * matrix -> Geometry[] (§6).
+ * Marker encoding — converts a Tree + per-node bboxes into the 648-byte
+ * interleaved Reed-Solomon channel and into a list of tiny horizontal
+ * dot geometries that are inserted invisibly with the mindmap.
  *
- * Wire format v2 (header byte 0x02), per §6.2:
+ * Wire layout (§6.1, §6.2, §6.3):
  *
- *   Byte 0           format version (uint8; 0x02 for v2)
- *   Byte 1           node count N (uint8; max 255 by type, max 50 by §F-PE-4)
- *   Bytes 2..2+10N-1 packed node records, 10 bytes each (§6.3)
- *   Bytes 2+10N..+3  CRC32 of bytes 0..2+10N-1 (big-endian)
- *   Bytes ..647      Reed-Solomon parity (fill to 648 bytes)
+ *   Channel: 648 bytes = 72×72 bits, row-major, MSB-first within each
+ *   byte. Divided into 3 RS(216, 170) chunks (3 × 170 = 510 logical
+ *   message bytes, 3 × 46 = 138 parity bytes, total = 648).
  *
- * Grid:  72 × 72 cells, 4 px each, 288×288 px footprint (§6.1, §F-PE-3).
- * Cell rendering: each "1" bit becomes one straightLine of length 3 px
- *                 at the bit's (col, row) position within the 4-px
- *                 cell, pen color 0x9D, pen width 100 (§6.4).
- * Anchor: top-left of the mindmap's bounding rectangle, with a small
- *         fixed offset so it is reliably captured by a full-map lasso
- *         (§6.1).
+ *   Logical message (510 bytes):
+ *     [0]        format version = 0x02
+ *     [1]        N = node count (1..50)
+ *     [2..2+10N-1] N node records, 10 bytes each:
+ *                  [+0] parent index (0xFF = root sentinel)
+ *                  [+1] shape byte (ShapeKind)
+ *                  [+2..+3] bbox.x uint16 BE
+ *                  [+4..+5] bbox.y uint16 BE
+ *                  [+6..+7] bbox.w uint16 BE
+ *                  [+8..+9] bbox.h uint16 BE
+ *     [2+10N..+3] CRC32 (IEEE 802.3) over [0..2+10N-1], uint32 BE
+ *     rest        zero-padded
  *
- * Capacity (§6.2 / §8.3):
- *   message bytes = 2 + 10N + 4
- *   parity bytes  = 648 - message bytes
- *   parity ratio  = parity / message; design rule ≥ 20%
- *   theoretical ceiling N = 53; published v0.1 cap N = 50 (§F-PE-4).
+ *   Interleave: the 510 logical bytes are split into 3 consecutive
+ *   170-byte slices, each encoded separately with rsEncode(slice, 46)
+ *   to produce a 216-byte chunk. The three chunks are concatenated to
+ *   fill the 648-byte channel. Interleaving is per-chunk (contiguous),
+ *   NOT bit-interleaved.
  *
- * If the encoded payload exceeds capacity, the caller (insert.ts /
- * MindmapCanvas) must surface the §F-PE-4 modal — no silent
- * truncation. encodeMarker throws MarkerCapacityError so the caller
- * can detect this case explicitly.
+ *   Dot geometry (§6.4): one `straightLine` per set bit, horizontal,
+ *   length MARKER_BIT_STROKE_LEN px, aligned to the 4-px cell grid
+ *   anchored at `markerOrigin`. Pen color 0x9D, pen type 10
+ *   (Fineliner), pen width 100.
  */
-import type {Geometry, Point, Rect} from '../geometry';
-import {ShapeKind, type Tree, type NodeId} from '../model/tree';
+import type {LineGeometry, Point, Rect} from '../geometry';
+import {flattenForEmit, ShapeKind, type NodeId, type Tree} from '../model/tree';
 import {crc32, rsEncode} from './rs';
 
-export const MARKER_GRID = 72; // cells per side, §6.1
-export const MARKER_CELL_PX = 4; // px per cell, §6.1
-export const MARKER_FOOTPRINT_PX = MARKER_GRID * MARKER_CELL_PX; // 288, §6.1
-export const MARKER_CHANNEL_BYTES = 648; // 72*72/8, §6.2
-export const MARKER_NODE_RECORD_BYTES = 10; // §6.3
-export const MARKER_FORMAT_VERSION = 0x02; // v2 header byte, §6.2
-export const MARKER_PUBLISHED_NODE_CAP = 50; // §F-PE-4
+// -----------------------------------------------------------------
+// Wire constants (§6.1, §6.2, §6.3, §6.4, §F-PE-3, §F-PE-4)
+// -----------------------------------------------------------------
 
-/**
- * Interleaved-chunk RS layout constants.
- *
- * §6.2 describes the 648-byte channel as a single RS codeword, but
- * GF(256) caps codewords at 255 bytes — so a pure single-block
- * encoding is not representable in the field the codec actually uses.
- * The smallest adjustment that preserves §6.2's capacity math
- * (N ≤ 50 at ≥ 20% parity) is to interleave K = 3 independent
- * RS(216, 170) codewords across the 648-byte channel:
- *
- *   chunk 0 : buf[  0 .. 215]  (first 170 = message, last 46 = parity)
- *   chunk 1 : buf[216 .. 431]
- *   chunk 2 : buf[432 .. 647]
- *
- * Global logical message (510 bytes total) is the concatenation of
- * each chunk's message region: logicalMsg[k*170 + j] <-> buf[k*216 + j].
- * Per-chunk parity is fixed at 46 bytes (≈27% ratio) regardless of
- * node count; the decoder never has to guess the split from the
- * (possibly corrupted) raw byte 1 as a result. Channel bytes beyond
- * the actual encoded message get zero-padded — RS treats the pad as
- * ordinary message bytes, so those zeros are corrected along with
- * everything else.
- *
- * This diverges from the letter of §6.2 (which describes a single
- * contiguous parity tail at buf[2+10N+4..647]); §10 tracks the spec
- * update required to codify the interleaved layout. The capacity
- * table in §6.2 still applies: max N with fixed 138-byte global
- * parity is exactly 50.
- */
+/** Grid dimension (rows = cols = 72). §6.1 */
+export const MARKER_GRID = 72;
+
+/** Pixels per grid cell on-device. §6.1 */
+export const MARKER_CELL_PX = 4;
+
+/** Total pixel footprint of the marker block (288 × 288). §F-PE-3 */
+export const MARKER_FOOTPRINT_PX = MARKER_GRID * MARKER_CELL_PX; // 288
+
+/** Raw channel size in bytes = 72×72 / 8 bits. §6.2 */
+export const MARKER_CHANNEL_BYTES = (MARKER_GRID * MARKER_GRID) / 8; // 648
+
+/** Bytes per encoded node record. §6.3 */
+export const MARKER_NODE_RECORD_BYTES = 10;
+
+/** Marker format version byte, written at logical-message[0]. */
+export const MARKER_FORMAT_VERSION = 0x02;
+
+/** Published node count ceiling per §F-PE-4. */
+export const MARKER_PUBLISHED_NODE_CAP = 50;
+
+/** Number of interleaved RS chunks. §6.2 */
 export const MARKER_NUM_CHUNKS = 3;
-export const MARKER_CHUNK_BYTES = MARKER_CHANNEL_BYTES / MARKER_NUM_CHUNKS; // 216
+
+/** Bytes per RS chunk (message + parity). §6.2 */
+export const MARKER_CHUNK_BYTES = 216;
+
+/** Parity bytes per RS chunk = floor(216 × 0.213). §6.2 */
 export const MARKER_CHUNK_PARITY = 46;
-export const MARKER_CHUNK_MESSAGE =
-  MARKER_CHUNK_BYTES - MARKER_CHUNK_PARITY; // 170
+
+/** Message bytes per RS chunk = 216 - 46. §6.2 */
+export const MARKER_CHUNK_MESSAGE = MARKER_CHUNK_BYTES - MARKER_CHUNK_PARITY; // 170
+
+/** Total logical message bytes = 3 × 170. §6.2 */
 export const MARKER_LOGICAL_MESSAGE_BYTES =
   MARKER_NUM_CHUNKS * MARKER_CHUNK_MESSAGE; // 510
 
-/**
- * Root node uses 0xFF as a sentinel parent index. Non-root nodes
- * always have parent < self in the serialized array, so 0xFF can
- * never collide with a valid parent index.
- */
+/** Parent-index sentinel used in record[0] (the root). §6.3 */
 export const MARKER_ROOT_PARENT = 0xff;
 
 /**
- * §6.4 marker pen style. Pen color 0x9D is the "invisible-ish" channel
- * the firmware provides for technical/metadata strokes — it's how we
- * keep the marker strokes out of the authoring viewport while still
- * persisting them to the page's stroke list. Pen width 100 keeps the
- * per-cell stroke well under the 4 px cell footprint.
- *
- * penType: 10 (Fineliner) is **required** by the firmware allow-list
- * — the insertGeometry API rejects anything outside
- * {1=Pressure, 10=Fineliner, 11=Marker, 14=Calligraphy}. See the same
- * note in geometry.ts's PEN_DEFAULTS for the on-device fallout of
- * getting this wrong.
+ * Pen color used for marker dot geometries (§6.4).
+ * 0x9D is in the "light grey" palette slot — visually near-invisible
+ * on white paper and unique enough that the decoder can use it as a
+ * discriminator without additional metadata.
  */
 export const MARKER_PEN_COLOR = 0x9d;
-export const MARKER_PEN_WIDTH = 100;
-export const MARKER_PEN_TYPE = 10;
 
 /**
- * Length (in pixels) of each per-bit straightLine inside its 4-px
- * cell (§6.4). Keeping it strictly less than the cell size means
- * adjacent "1" bits never touch — the decoder projects stroke
- * midpoints to cells without risk of a single stroke being claimed
- * by two cells.
+ * Pen type for marker dots. Must be in the firmware allow-list
+ * {1=Pressure, 10=Fineliner, 11=Marker, 14=Calligraphy}.
+ */
+export const MARKER_PEN_TYPE = 10; // Fineliner
+
+/**
+ * Pen width for marker dot geometries (§6.4).
+ * Equals the firmware's minimum pen width so dots are as small as
+ * possible and visually imperceptible at normal zoom.
+ */
+export const MARKER_PEN_WIDTH = 100;
+
+/**
+ * Length in pixels of each horizontal "bit stroke". Kept at 3 so the
+ * stroke's midpoint is offset by exactly 1.5 px from the cell's left
+ * edge, making the decode's midpoint formula exact:
+ *   col = round((midX - origin.x - 1.5) / CELL_PX)
+ * Length 3 < CELL_PX + 0.5 = 4.5, so the decoder's candidate filter
+ * (length ≤ 4.5 px) also accepts these strokes.
  */
 export const MARKER_BIT_STROKE_LEN = 3;
 
 /**
- * User-facing capacity message verbatim from §F-PE-4. This is the
- * string the UI shows in the capacity modal — no spec references, no
- * numeric counts. A bare message means the same error bubbles up
- * through the insert pipeline, gets caught in MindmapCanvas, and is
- * rendered into the modal without any translation step that could
- * drift from the spec's exact wording. `nodeCount` is still attached
- * as an instance field for diagnostics / logcat.
+ * Error message shown in the capacity-error modal when the tree exceeds
+ * the marker's maximum node count (§F-PE-4, §6.3: N ≤ 50). Must not
+ * contain internal spec references (no "§") and must contain the phrase
+ * "Reduce nodes" so the UI can match it without a string literal copy.
  */
 export const MARKER_CAPACITY_MESSAGE =
-  'This mindmap has more structure than can be embedded. Reduce ' +
-  'nodes, or split across multiple mindmaps.';
+  'This mindmap has more structure than can be embedded (maximum 50 nodes). ' +
+  'Reduce nodes or split it into multiple mindmaps.';
 
+// -----------------------------------------------------------------
+// MarkerCapacityError
+// -----------------------------------------------------------------
+
+/**
+ * Thrown by encodeMarkerBytes / encodeMarker when the tree exceeds
+ * MARKER_PUBLISHED_NODE_CAP. Carries the actual node count as a
+ * diagnostic field so the UI can render it in the capacity modal
+ * without re-counting (§F-PE-4).
+ */
 export class MarkerCapacityError extends Error {
-  constructor(public readonly nodeCount: number) {
+  readonly nodeCount: number;
+  constructor(nodeCount: number) {
     super(MARKER_CAPACITY_MESSAGE);
     this.name = 'MarkerCapacityError';
+    this.nodeCount = nodeCount;
+    // Maintain proper prototype chain for instanceof checks in ES5
+    // transpiled environments.
+    Object.setPrototypeOf(this, new.target.prototype);
   }
 }
 
+// -----------------------------------------------------------------
+// encodeMarkerBytes
+// -----------------------------------------------------------------
+
 export type EncodeInput = {
   tree: Tree;
-  /** Per-node bbox in mindmap-local coords (origin = marker top-left). */
   nodeBboxesById: Map<NodeId, Rect>;
-  /** Top-left anchor for the marker grid in page-pixel coords. */
   markerOrigin: Point;
 };
 
 /**
- * Pack a Tree into the on-paper marker geometries (§6.4).
+ * Serialize the tree into a 648-byte interleaved RS channel buffer.
  *
- * Delegates to encodeMarkerBytes for the 648-byte channel, then
- * unpacks the 5184 bits in row-major order and emits one
- * MARKER_BIT_STROKE_LEN-px horizontal straightLine per "1" bit at
- * the cell's top-left corner. Cells holding a "0" bit emit nothing —
- * the decoder treats absent cells as 0 bits.
+ * Algorithm:
+ *   1. BFS-traverse the tree to establish node→position mapping.
+ *   2. Build the 510-byte logical message (header + records + CRC32).
+ *   3. Split into 3 × 170-byte slices, RS-encode each with 46 parity
+ *      bytes, concatenate into the 648-byte channel.
  *
- * Bit packing convention (matched in decodeMarker): bit index
- * `row * MARKER_GRID + col` lands in byte `bitIndex >>> 3`,
- * MSB-first (bit 0 is the 0x80 mask). Row 0 spans bytes [0..8]
- * inclusive (72 bits = 9 bytes), row 1 spans bytes [9..17], etc.
+ * All bboxes in `nodeBboxesById` must be in mindmap-local coords
+ * (origin = markerOrigin page coords). The `markerOrigin` param is
+ * unused by encodeMarkerBytes itself but kept in the signature so
+ * encodeMarker can accept the same EncodeInput struct.
  *
- * Every emitted geometry has showLassoAfterInsert=false — the caller
- * in insert.ts lassos the union rect of outlines + marker explicitly
- * at the end of the emit pipeline (§F-IN-3).
- */
-export function encodeMarker(input: EncodeInput): Geometry[] {
-  const bytes = encodeMarkerBytes(input);
-  const {markerOrigin} = input;
-  const out: Geometry[] = [];
-  for (let row = 0; row < MARKER_GRID; row += 1) {
-    for (let col = 0; col < MARKER_GRID; col += 1) {
-      const bitIndex = row * MARKER_GRID + col;
-      const byteIdx = bitIndex >>> 3;
-      const bitMask = 0x80 >>> (bitIndex & 7);
-      if ((bytes[byteIdx] & bitMask) === 0) {
-        continue;
-      }
-      const x = markerOrigin.x + col * MARKER_CELL_PX;
-      const y = markerOrigin.y + row * MARKER_CELL_PX;
-      out.push({
-        type: 'straightLine',
-        points: [
-          {x, y},
-          {x: x + MARKER_BIT_STROKE_LEN, y},
-        ],
-        penColor: MARKER_PEN_COLOR,
-        penType: MARKER_PEN_TYPE,
-        penWidth: MARKER_PEN_WIDTH,
-        showLassoAfterInsert: false,
-      });
-    }
-  }
-  return out;
-}
-
-/**
- * Encode a tree into the 648-byte marker channel buffer — header +
- * length + node records + CRC32, RS-protected via interleaved
- * RS(216, 170) chunks (see MARKER_NUM_CHUNKS and friends).
- *
- * Traversal order: BFS from the root. The root lives at index 0 with
- * parent = 0xFF (MARKER_ROOT_PARENT); every non-root node has
- * parent index < its own index by construction. BFS is deterministic
- * because Tree.nodesById uses insertion-ordered Maps and childIds is
- * an ordered array.
- *
- * Throws MarkerCapacityError if the tree has more than
- * MARKER_PUBLISHED_NODE_CAP nodes; callers surface the §F-PE-4
- * modal and abort insert.
+ * Throws MarkerCapacityError when N > MARKER_PUBLISHED_NODE_CAP.
+ * Throws Error when a node is missing from nodeBboxesById.
  */
 export function encodeMarkerBytes(input: EncodeInput): Uint8Array {
   const {tree, nodeBboxesById} = input;
-  const orderedIds = bfsOrder(tree);
-  const N = orderedIds.length;
-  if (N === 0) {
-    throw new Error('encodeMarkerBytes: empty tree (no nodes)');
-  }
+
+  // BFS traversal to build an ordered node list and a position map
+  // (NodeId → record index). BFS guarantees parent index < self for
+  // every non-root record, which is required by the decoder (§6.3).
+  const ordered: NodeId[] = bfsOrder(tree);
+  const N = ordered.length;
+
   if (N > MARKER_PUBLISHED_NODE_CAP) {
     throw new MarkerCapacityError(N);
   }
-  if (N > 0xff) {
-    // Belt-and-braces: MARKER_PUBLISHED_NODE_CAP is 50 so we're
-    // nowhere near 0xFF (255), but N is stored in a single byte so
-    // the ceiling is hard-capped at 255 regardless of what the
-    // published cap eventually grows to.
-    throw new MarkerCapacityError(N);
+
+  // Position map: NodeId → index in BFS order.
+  const pos = new Map<NodeId, number>();
+  for (let i = 0; i < N; i += 1) {
+    pos.set(ordered[i], i);
   }
 
-  // Build logical message: header + records + CRC + zero pad.
-  const logicalMsg = new Uint8Array(MARKER_LOGICAL_MESSAGE_BYTES);
-  logicalMsg[0] = MARKER_FORMAT_VERSION;
-  logicalMsg[1] = N;
-
-  const idxById = new Map<NodeId, number>();
-  for (let i = 0; i < orderedIds.length; i += 1) {
-    idxById.set(orderedIds[i], i);
-  }
+  // Build 510-byte logical message.
+  const msg = new Uint8Array(MARKER_LOGICAL_MESSAGE_BYTES);
+  msg[0] = MARKER_FORMAT_VERSION;
+  msg[1] = N;
 
   for (let i = 0; i < N; i += 1) {
-    const id = orderedIds[i];
+    const id = ordered[i];
     const node = tree.nodesById.get(id);
     if (!node) {
-      throw new Error(`encodeMarkerBytes: orphan id ${id} in orderedIds`);
+      throw new Error(`encodeMarkerBytes: no node for id ${id}`);
     }
     const bbox = nodeBboxesById.get(id);
     if (!bbox) {
-      throw new Error(`encodeMarkerBytes: no bbox for node ${id}`);
+      throw new Error(`encodeMarkerBytes: no bbox for node id ${id}`);
     }
-    const parentIdx =
+    const off = 2 + i * MARKER_NODE_RECORD_BYTES;
+
+    // Parent index: root uses the sentinel 0xFF; others use BFS
+    // position of their parent.
+    const parentByte =
       node.parentId === null
         ? MARKER_ROOT_PARENT
-        : idxById.get(node.parentId) ?? MARKER_ROOT_PARENT;
-    writeRecord(
-      logicalMsg,
-      2 + i * MARKER_NODE_RECORD_BYTES,
-      parentIdx,
-      node.shape,
-      bbox,
-    );
+        : (pos.get(node.parentId) as number);
+
+    msg[off + 0] = parentByte;
+    msg[off + 1] = node.shape;
+
+    // bbox fields as uint16 BE, clamped to [0, 65535].
+    writeUint16BE(msg, off + 2, bbox.x);
+    writeUint16BE(msg, off + 4, bbox.y);
+    writeUint16BE(msg, off + 6, bbox.w);
+    writeUint16BE(msg, off + 8, bbox.h);
   }
 
-  // CRC32 covers header + records (bytes 0..2+10N-1).
-  const crcScope = 2 + N * MARKER_NODE_RECORD_BYTES;
-  const crc = crc32(logicalMsg.subarray(0, crcScope));
-  writeUint32BE(logicalMsg, crcScope, crc);
+  // CRC32 over [0..2+10N-1].
+  const payloadEnd = 2 + N * MARKER_NODE_RECORD_BYTES;
+  const checksum = crc32(msg.subarray(0, payloadEnd));
+  msg[payloadEnd + 0] = (checksum >>> 24) & 0xff;
+  msg[payloadEnd + 1] = (checksum >>> 16) & 0xff;
+  msg[payloadEnd + 2] = (checksum >>> 8) & 0xff;
+  msg[payloadEnd + 3] = checksum & 0xff;
 
-  // Interleaved RS encode: one chunk at a time into the channel.
+  // Split into 3 × 170-byte chunks, RS-encode each, concatenate.
   const channel = new Uint8Array(MARKER_CHANNEL_BYTES);
   for (let k = 0; k < MARKER_NUM_CHUNKS; k += 1) {
-    const msgStart = k * MARKER_CHUNK_MESSAGE;
-    const chunkMsg = logicalMsg.subarray(
-      msgStart,
-      msgStart + MARKER_CHUNK_MESSAGE,
-    );
+    const start = k * MARKER_CHUNK_MESSAGE;
+    const chunkMsg = msg.subarray(start, start + MARKER_CHUNK_MESSAGE);
     const chunkCw = rsEncode(chunkMsg, MARKER_CHUNK_PARITY);
     channel.set(chunkCw, k * MARKER_CHUNK_BYTES);
   }
+
   return channel;
 }
 
-// -------------------------------------------------------------------
-// internal helpers
-// -------------------------------------------------------------------
+// -----------------------------------------------------------------
+// encodeMarker
+// -----------------------------------------------------------------
 
 /**
- * BFS the tree starting at the root. The resulting array establishes
- * the (node id -> record index) mapping used throughout the marker
- * codec.
+ * Convert the tree into a list of horizontal dot geometries, one per
+ * set bit in the 648-byte channel produced by encodeMarkerBytes.
+ *
+ * Each bit at grid position (row, col) becomes a straightLine with:
+ *   p0 = { x: markerOrigin.x + col * CELL_PX,
+ *           y: markerOrigin.y + row * CELL_PX }
+ *   p1 = { x: p0.x + MARKER_BIT_STROKE_LEN, y: p0.y }
+ *
+ * Pen style: color = 0x9D, type = Fineliner, width = 100,
+ * showLassoAfterInsert = false.
+ *
+ * Throws MarkerCapacityError (via encodeMarkerBytes) when N > cap.
  */
-function bfsOrder(tree: Tree): NodeId[] {
-  const out: NodeId[] = [];
-  const queue: NodeId[] = [tree.rootId];
-  const seen = new Set<NodeId>([tree.rootId]);
-  while (queue.length > 0) {
-    const id = queue.shift() as NodeId;
-    out.push(id);
-    const node = tree.nodesById.get(id);
-    if (!node) {
+export function encodeMarker(input: EncodeInput): LineGeometry[] {
+  const {markerOrigin} = input;
+  const channel = encodeMarkerBytes(input);
+  const geoms: LineGeometry[] = [];
+
+  for (let byteIdx = 0; byteIdx < channel.length; byteIdx += 1) {
+    const byte = channel[byteIdx];
+    if (byte === 0) {
       continue;
     }
-    for (const childId of node.childIds) {
-      if (seen.has(childId)) {
-        continue;
+    for (let bit = 7; bit >= 0; bit -= 1) {
+      if ((byte >>> bit) & 1) {
+        const bitIndex = byteIdx * 8 + (7 - bit);
+        const row = Math.floor(bitIndex / MARKER_GRID);
+        const col = bitIndex % MARKER_GRID;
+        const x0 = markerOrigin.x + col * MARKER_CELL_PX;
+        const y0 = markerOrigin.y + row * MARKER_CELL_PX;
+        geoms.push({
+          type: 'straightLine',
+          penColor: MARKER_PEN_COLOR,
+          penType: MARKER_PEN_TYPE,
+          penWidth: MARKER_PEN_WIDTH,
+          showLassoAfterInsert: false,
+          points: [
+            {x: x0, y: y0},
+            {x: x0 + MARKER_BIT_STROKE_LEN, y: y0},
+          ],
+        });
       }
-      seen.add(childId);
-      queue.push(childId);
     }
   }
-  return out;
+
+  return geoms;
 }
 
+// -----------------------------------------------------------------
+// Internal helpers
+// -----------------------------------------------------------------
+
 /**
- * Write a single 10-byte node record into `buf` at `offset`. Layout:
- *
- *   [0]    parent index (uint8, 0xFF for root)
- *   [1]    shape kind (uint8, ShapeKind enum)
- *   [2..3] bbox x (uint16 big-endian)
- *   [4..5] bbox y (uint16 big-endian)
- *   [6..7] bbox w (uint16 big-endian)
- *   [8..9] bbox h (uint16 big-endian)
- *
- * Per §6.3 coords must fit uint16. We clamp negative values to 0
- * defensively — mindmap-local coords after the origin shift in §F-IN-2
- * are guaranteed non-negative, but a caller bug that passes a raw
- * page-space bbox with a negative x shouldn't produce undefined
- * behavior silently.
+ * BFS traversal of the tree. Returns node IDs in breadth-first order,
+ * root first. This ordering guarantees parent index < self for every
+ * non-root record in the marker byte layout (§6.3).
  */
-function writeRecord(
-  buf: Uint8Array,
-  offset: number,
-  parentIdx: number,
-  shape: ShapeKind,
-  bbox: Rect,
-): void {
-  buf[offset + 0] = parentIdx & 0xff;
-  buf[offset + 1] = shape & 0xff;
-  writeUint16BE(buf, offset + 2, clampU16(bbox.x));
-  writeUint16BE(buf, offset + 4, clampU16(bbox.y));
-  writeUint16BE(buf, offset + 6, clampU16(bbox.w));
-  writeUint16BE(buf, offset + 8, clampU16(bbox.h));
+function bfsOrder(tree: Tree): NodeId[] {
+  const result: NodeId[] = [];
+  const queue: NodeId[] = [tree.rootId];
+  while (queue.length > 0) {
+    const id = queue.shift() as NodeId;
+    result.push(id);
+    const node = tree.nodesById.get(id);
+    if (node) {
+      for (const childId of node.childIds) {
+        queue.push(childId);
+      }
+    }
+  }
+  return result;
 }
 
 function writeUint16BE(buf: Uint8Array, offset: number, value: number): void {
-  buf[offset + 0] = (value >>> 8) & 0xff;
-  buf[offset + 1] = value & 0xff;
-}
-
-function writeUint32BE(buf: Uint8Array, offset: number, value: number): void {
-  buf[offset + 0] = (value >>> 24) & 0xff;
-  buf[offset + 1] = (value >>> 16) & 0xff;
-  buf[offset + 2] = (value >>> 8) & 0xff;
-  buf[offset + 3] = value & 0xff;
-}
-
-function clampU16(value: number): number {
-  if (!Number.isFinite(value)) {
-    return 0;
-  }
-  const v = Math.round(value);
-  if (v < 0) {
-    return 0;
-  }
-  if (v > 0xffff) {
-    return 0xffff;
-  }
-  return v;
+  const v = Math.max(0, Math.min(0xffff, Math.round(value)));
+  buf[offset] = (v >>> 8) & 0xff;
+  buf[offset + 1] = v & 0xff;
 }

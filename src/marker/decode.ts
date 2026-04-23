@@ -336,15 +336,6 @@ export function decodeMarkerBytes(codeword: Uint8Array): DecodeResult {
   const payloadEnd = 2 + N * MARKER_NODE_RECORD_BYTES;
   // CRC occupies payloadEnd..payloadEnd+3. Anything past that is RS
   // zero-padding that we don't inspect.
-  if (payloadEnd + 4 > MARKER_LOGICAL_MESSAGE_BYTES) {
-    return {
-      ok: false,
-      reason: 'bad_record',
-      message:
-        `decodeMarkerBytes: N=${N} requires ${payloadEnd + 4} message ` +
-        `bytes, logical capacity is ${MARKER_LOGICAL_MESSAGE_BYTES}`,
-    };
-  }
 
   // 4. CRC32 over [0..2+10N-1]. Observed CRC is big-endian at
   //    [2+10N..+3].

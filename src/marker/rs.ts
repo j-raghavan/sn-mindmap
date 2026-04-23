@@ -279,9 +279,6 @@ function rsBerlekampMassey(synd: Uint8Array): Uint8Array {
     // Discrepancy Δ = Σ_{i=0}^{L} Λ[i] * S[n - i].
     let delta = 0;
     for (let i = 0; i <= L && i < Lambda.length; i += 1) {
-      if (n - i < 0) {
-        continue;
-      }
       delta ^= gfMul(Lambda[i], synd[n - i]);
     }
 

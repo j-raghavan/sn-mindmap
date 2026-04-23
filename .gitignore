@@ -77,3 +77,6 @@ phase*.md
 !.yarn/releases
 !.yarn/sdks
 !.yarn/versions
+
+# Claude
+.claude/*

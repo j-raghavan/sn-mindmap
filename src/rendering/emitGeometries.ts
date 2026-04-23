@@ -203,10 +203,8 @@ export function emitGeometries(input: EmitInput): EmitOutput {
       (a, b) => a - b,
     );
     for (const nodeId of nodeIds) {
-      const bucket = preservedStrokesByNode.get(nodeId);
-      if (!bucket) {
-        continue;
-      }
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+      const bucket = preservedStrokesByNode.get(nodeId)!;
       for (const stroke of bucket) {
         geometries.push(withNoAutoLasso(stroke));
       }

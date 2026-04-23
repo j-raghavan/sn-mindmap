@@ -625,3 +625,96 @@ describe('decodeMarkerBytes: header / record validation', () => {
     expectErr(decodeMarkerBytes(corrupted), 'crc_failed');
   });
 });
+
+// ---------------------------------------------------------------------------
+// decodeMarker — candidate-filter edge cases (§6.5 step 1 / filterCandidates)
+// ---------------------------------------------------------------------------
+
+describe('decodeMarker — candidate filter edge cases', () => {
+  it('ignores a marker-colored straightLine with more than 2 points (≠2 length guard)', () => {
+    // filterCandidates only accepts length-2 strokes. A 3-point
+    // "stroke" with the right pen style is silently discarded, leaving
+    // no candidates and returning no_candidates.
+    const threePoint: Geometry = {
+      type: 'straightLine',
+      points: [
+        {x: 0, y: 0},
+        {x: 3, y: 0},
+        {x: 6, y: 0},
+      ],
+      penColor: MARKER_PEN_COLOR,
+      penType: 10,
+      penWidth: MARKER_PEN_COLOR, // irrelevant value
+    };
+    expectErr(decodeMarker([threePoint]), 'no_candidates');
+  });
+
+  it('returns the failure reason when candidates exist but decode fails', () => {
+    // A handful of marker-format strokes placed at valid on-grid
+    // positions but NOT forming a valid RS codeword. packCandidatesToBytes
+    // succeeds (all cols/rows in range), decodeMarkerBytes fails
+    // (wrong version byte or RS error), and decodeMarker returns that
+    // failure reason instead of no_candidates.
+    const origin = {x: 0, y: 0};
+    const fakeStrokes: Geometry[] = [];
+    // Scatter 8 strokes across the first two rows to set a handful
+    // of bits. The resulting channel is nowhere near a valid marker.
+    for (let col = 0; col < 8; col += 1) {
+      const row = col % 2; // rows 0 and 1
+      fakeStrokes.push({
+        type: 'straightLine',
+        points: [
+          {x: origin.x + col * MARKER_CELL_PX, y: origin.y + row * MARKER_CELL_PX},
+          {x: origin.x + col * MARKER_CELL_PX + 3, y: origin.y + row * MARKER_CELL_PX},
+        ],
+        penColor: MARKER_PEN_COLOR,
+        penType: 10,
+        penWidth: 100,
+      });
+    }
+    const result = decodeMarker(fakeStrokes);
+    // Must NOT be no_candidates (we have valid-format candidates).
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).not.toBe('no_candidates');
+  });
+
+  it('handles a candidate whose column projects outside the grid (null from packCandidatesToBytes)', () => {
+    // A single marker-format stroke placed far to the right of
+    // the inferred origin will project to col >= MARKER_GRID (72).
+    // packCandidatesToBytes returns null for that origin guess, and
+    // the search loop continues (covering the `continue` at line 224
+    // of decode.ts).  With nothing else to decode the result
+    // degrades to no_candidates.
+    const outOfBounds: Geometry = {
+      type: 'straightLine',
+      // Place the stroke so its midX is at 72*CELL + origin.x + 1.5
+      // When origin is inferred from minX = outOfBounds.p0.x,
+      // col = round((midX - origin.x - 1.5) / CELL) = round(72.something) >= 72 → null.
+      points: [
+        {x: 0, y: 0},
+        {x: 3, y: 0},
+      ],
+      penColor: MARKER_PEN_COLOR,
+      penType: 10,
+      penWidth: 100,
+    };
+    // Add a second stroke far to the right so when the origin is
+    // based on minX=0, this far stroke maps to col >= MARKER_GRID.
+    const farRight: Geometry = {
+      type: 'straightLine',
+      points: [
+        {x: 72 * MARKER_CELL_PX + 10, y: 0}, // col = round((72*4+11.5-0-1.5)/4) = round(72.5) = 73 >= 72
+        {x: 72 * MARKER_CELL_PX + 13, y: 0},
+      ],
+      penColor: MARKER_PEN_COLOR,
+      penType: 10,
+      penWidth: 100,
+    };
+    const result = decodeMarker([outOfBounds, farRight]);
+    // packCandidatesToBytes returns null for origin.x=0,0 (far stroke
+    // is out of bounds). The loop continues through the remaining
+    // origin offsets; ultimately no valid decode is found.
+    expect(result.ok).toBe(false);
+  });
+});

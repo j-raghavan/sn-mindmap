@@ -1,80 +1,115 @@
 /**
- * pluginRouter — single source of truth for plugin button press events.
+ * Plugin button router — central dispatch for PluginManager button events.
  *
- * Ported from sn-shapes/src/pluginRouter.ts with the constant names
- * updated per requirements §7.2. Two buttons are registered in
- * index.js and their events land here:
+ * Design (Pattern 5 from sn-plugin-lib skill §patterns.md):
+ *   installPluginRouter() registers a single PluginManager.registerButtonListener
+ *   at module-load time (idempotent: safe to call from both index.js and App.tsx).
+ *   Every press updates `lastButtonEvent` and fans out to all active React
+ *   subscribers via subscribeToButtonEvents().
  *
- *   id=100  BUTTON_ID_TOOLBAR       — toolbar "Mindmap" (opens authoring)
- *   id=200  BUTTON_ID_EDIT_MINDMAP  — lasso "Edit Mindmap" (opens edit)
+ * Usage in index.js:
+ *   import {installPluginRouter} from './src/pluginRouter';
+ *   PluginManager.init();
+ *   installPluginRouter();           // registers the listener
  *
- * A single PluginManager.registerButtonListener is installed here and
- * fans out to subscribers. Components read getLastButtonEvent() on
- * first render to pick the initial view (authoring vs edit), and use
- * subscribeToButtonEvents for anything that arrives during the
- * session.
+ * Usage in App.tsx (React side):
+ *   const initial = getLastButtonEvent();   // synchronous; avoids first-render flicker
+ *   useEffect(() => subscribeToButtonEvents(handler), []);
  *
- * Why "last event" instead of an event stream? The plugin UI is
- * started by the button press itself; by the time App.tsx mounts the
- * corresponding event has typically already fired. sn-plugin-lib
- * replays the cached lastButtonEventMsg when a listener registers
- * inside its 1-second window, which is enough for us to capture the
- * initial trigger into module state before components mount.
- *
- * Log prefix is [PLUGIN_ROUTER] per §11 so logcat stays searchable
- * and consistent with sn-shapes.
+ * References: §7.2, §7.3, Pattern 5.
  */
+
 import {PluginManager} from 'sn-plugin-lib';
 
+// ---------------------------------------------------------------------------
+// Button ID constants (§7.3)
+// ---------------------------------------------------------------------------
+
+/** Toolbar "Mindmap" button — opens the authoring canvas. */
 export const BUTTON_ID_TOOLBAR = 100;
+
+/** Lasso-toolbar "Edit Mindmap" button — opens the edit round-trip. */
 export const BUTTON_ID_EDIT_MINDMAP = 200;
 
-// Mirror sn-plugin-lib's ButtonEvent shape locally so we don't depend
-// on the library's internal sub-path (which isn't exported in its
-// package exports map). Kept in sync with
-// node_modules/sn-plugin-lib/src/listener/ButtonListener.ts.
-export type ButtonEvent = {
-  pressEvent: number;
+// ---------------------------------------------------------------------------
+// Internal state
+// ---------------------------------------------------------------------------
+
+export interface ButtonEvent {
   id: number;
   name: string;
-  color: number;
   icon: string;
-  bgColor: number;
-};
+  pressEvent?: number;
+}
 
-export type ButtonSubscriber = (event: ButtonEvent) => void;
+/** The most recent button event, or undefined if none has fired yet. */
+let lastButtonEvent: ButtonEvent | undefined;
 
-let lastEvent: ButtonEvent | null = null;
-const subscribers = new Set<ButtonSubscriber>();
+/** Active React subscribers. */
+const subscribers = new Set<(event: ButtonEvent) => void>();
+
+/** Guard preventing double-registration across index.js / App.tsx calls. */
 let installed = false;
 
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/**
+ * Register the single PluginManager button listener.  Idempotent — a second
+ * call after the first is a no-op (important because both index.js and
+ * App.tsx call this for test-harness compatibility).
+ */
 export function installPluginRouter(): void {
   if (installed) {
     return;
   }
   installed = true;
+
   PluginManager.registerButtonListener({
-    onButtonPress(event: ButtonEvent) {
-      console.log('[PLUGIN_ROUTER] onButtonPress', JSON.stringify(event));
-      lastEvent = event;
-      for (const fn of subscribers) {
-        try {
-          fn(event);
-        } catch (e) {
-          console.error('[PLUGIN_ROUTER] subscriber threw', e);
-        }
+    onButtonPress(event: ButtonEvent): void {
+      lastButtonEvent = event;
+      for (const cb of subscribers) {
+        cb(event);
       }
     },
   });
 }
 
-export function getLastButtonEvent(): ButtonEvent | null {
-  return lastEvent;
+/**
+ * Subscribe to future button-press events.  Returns an unsubscribe function
+ * suitable for React's useEffect cleanup.
+ *
+ * @example
+ *   useEffect(() => subscribeToButtonEvents(e => setView(viewFor(e.id))), []);
+ */
+export function subscribeToButtonEvents(
+  callback: (event: ButtonEvent) => void,
+): () => void {
+  subscribers.add(callback);
+  return () => {
+    subscribers.delete(callback);
+  };
 }
 
-export function subscribeToButtonEvents(fn: ButtonSubscriber): () => void {
-  subscribers.add(fn);
-  return () => {
-    subscribers.delete(fn);
-  };
+/**
+ * Synchronously return the last button event received (or undefined if the
+ * listener has not fired yet).  Used as the lazy initial-state seed in
+ * App.tsx to avoid a first-render flicker to the wrong view.
+ */
+export function getLastButtonEvent(): ButtonEvent | undefined {
+  return lastButtonEvent;
+}
+
+/**
+ * Reset all module-level state.  Only for use in tests — not exported in
+ * production builds (tree-shaken away because it is only referenced from
+ * test files that are excluded from the bundle).
+ *
+ * @internal
+ */
+export function _resetForTests(): void {
+  lastButtonEvent = undefined;
+  subscribers.clear();
+  installed = false;
 }

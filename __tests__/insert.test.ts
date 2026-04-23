@@ -296,6 +296,68 @@ describe('insertMindmap — happy path (§F-IN-1..F-IN-4)', () => {
       }
     }
   });
+
+  it('rounds the lasso rect to integers so RectSchema.allowUnknown:false + integer validation passes', async () => {
+    // Regression guard for APIError(107) "must be an integer" from
+    // sn-plugin-lib's verifyParams on lassoElements. Upstream
+    // geometry (radial layout centers via Math.cos/Math.sin,
+    // roundedRectPoints corner arcs) is inherently fractional, so
+    // toLassoBounds must floor left/top and ceil right/bottom —
+    // otherwise the firmware surfaces "invalid parameters sent to
+    // the API" immediately after a successful insertElements.
+    const tree = buildSmallTree();
+    await insertMindmap({tree});
+
+    const [rect] = asMock(PluginCommAPI.lassoElements).mock.calls[0];
+    expect(Number.isInteger(rect.left)).toBe(true);
+    expect(Number.isInteger(rect.top)).toBe(true);
+    expect(Number.isInteger(rect.right)).toBe(true);
+    expect(Number.isInteger(rect.bottom)).toBe(true);
+  });
+
+  it('rounds every emitted geometry point to integers before insertElements (native firmware banner guard)', async () => {
+    // Regression guard for the native firmware toast
+    //   "Invalid API parameters. Cannot call the API. Please check
+    //    parameter validity!"
+    // which surfaces from com.ratta.supernote.note's insertPageTrails
+    // when polygon/line points arrive as floats. sn-plugin-lib's
+    // JS-side GeometrySchema does NOT enforce integer x/y (PointSchema
+    // only checks `{x: number, y: number}`), so radial-layout fractional
+    // coords pass JS validation but are rejected host-side. Rounding at
+    // the insertElements boundary (wrapGeometryAsElement) is required.
+    const tree = buildSmallTree();
+    await insertMindmap({tree});
+
+    const insertCalls = getInsertedGeometries();
+    for (const [geometry] of insertCalls) {
+      for (const p of geometry.points ?? []) {
+        expect(Number.isInteger(p.x)).toBe(true);
+        expect(Number.isInteger(p.y)).toBe(true);
+      }
+    }
+  });
+
+  it('rounds every sequential-fallback geometry point to integers before insertGeometry', async () => {
+    // Same integer-coord guard on the fallback path. When the note
+    // context is unresolvable, insertMindmap calls
+    // PluginCommAPI.insertGeometry per geometry instead of the batched
+    // insertElements — the native firmware rejects fractional coords
+    // equally on both paths.
+    forceSequentialInsertPath();
+    const tree = buildSmallTree();
+    await insertMindmap({tree});
+
+    expect(PluginCommAPI.insertGeometry).toHaveBeenCalled();
+    const insertCalls = asMock(PluginCommAPI.insertGeometry).mock.calls as Array<
+      [InsertedGeometry]
+    >;
+    for (const [geometry] of insertCalls) {
+      for (const p of geometry.points ?? []) {
+        expect(Number.isInteger(p.x)).toBe(true);
+        expect(Number.isInteger(p.y)).toBe(true);
+      }
+    }
+  });
 });
 
 describe('insertMindmap — auto-expansion (§F-IN-2 / §8.6)', () => {
@@ -469,8 +531,13 @@ describe('insertMindmap — fit-to-page scaling (§F-LY-6)', () => {
     const ys = (firstGeom.points ?? []).map((p: {y: number}) => p.y);
     const width = Math.max(...xs) - Math.min(...xs);
     const height = Math.max(...ys) - Math.min(...ys);
-    expect(width).toBeCloseTo(220 * expectedScale, 0);
-    expect(height).toBeCloseTo(96 * expectedScale, 0);
+    // Tolerance widened to ±1 to accommodate integer rounding at the
+    // insertElements boundary (wrapGeometryAsElement rounds every
+    // point.x/y to integers — the native firmware rejects fractional
+    // coords, see roundGeometryPoints). The max-min of rounded coords
+    // can drift by up to ±1 from the pre-rounding float value.
+    expect(Math.abs(width - 220 * expectedScale)).toBeLessThanOrEqual(1);
+    expect(Math.abs(height - 96 * expectedScale)).toBeLessThanOrEqual(1);
   });
 
   it('centers the union rect on the page', async () => {
@@ -948,5 +1015,86 @@ describe('insertMindmap — Save round-trip (§F-ED-7)', () => {
     // §F-IN-3 auto-lasso is skipped on failure).
     expect(PluginCommAPI.lassoElements).toHaveBeenCalledTimes(1);
     expect(PluginManager.closePluginView).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Coverage gap: roundGeometryPoints for GEO_circle / GEO_ellipse
+// The production emitGeometries doesn't emit circles/ellipses today,
+// but preserved strokes can carry any geometry type. Passing one via
+// strokesByNodePage exercises the circle/ellipse arm of
+// roundGeometryPoints (§F-IN-3 firmware integer requirement).
+// ---------------------------------------------------------------------------
+
+describe('insertMindmap — circle/ellipse rounding (roundGeometryPoints §F-IN-3)', () => {
+  it('rounds GEO_circle ellipseCenterPoint to integers when inserted', async () => {
+    const tree = buildSmallTree();
+    const base = radialLayout(tree);
+    const available = DEFAULT_PAGE_WIDTH - 2 * INSERT_MARGIN_PX;
+    const availableH = DEFAULT_PAGE_HEIGHT - 2 * INSERT_MARGIN_PX;
+    const scale = Math.min(
+      1,
+      available / Math.max(1, base.unionBbox.w),
+      availableH / Math.max(1, base.unionBbox.h),
+    );
+    const tx =
+      DEFAULT_PAGE_WIDTH / 2 -
+      (base.unionBbox.x * scale + (base.unionBbox.w * scale) / 2);
+    const ty =
+      DEFAULT_PAGE_HEIGHT / 2 -
+      (base.unionBbox.y * scale + (base.unionBbox.h * scale) / 2);
+    // Compute the root's post-edit page bbox so we can build a
+    // matching pre-edit bbox for the delta = 0 case.
+    const rootLayoutBbox = base.bboxes.get(tree.rootId)!;
+    const rootPostBbox: Rect = {
+      x: rootLayoutBbox.x * scale + tx,
+      y: rootLayoutBbox.y * scale + ty,
+      w: rootLayoutBbox.w * scale,
+      h: rootLayoutBbox.h * scale,
+    };
+
+    // Place a GEO_circle preserved stroke on the root with a
+    // fractional center so the rounding is observable.
+    const circleStroke: Geometry = {
+      type: 'GEO_circle',
+      // Fractional coords — must be rounded to nearest integer on insert.
+      ellipseCenterPoint: {x: rootPostBbox.x + 10.7, y: rootPostBbox.y + 20.3},
+      ellipseMajorAxisRadius: 15,
+      ellipseMinorAxisRadius: 15,
+      ellipseAngle: 0,
+      penColor: 0x00,
+      penType: 10,
+      penWidth: 400,
+    };
+
+    const strokesByNodePage = new Map([[tree.rootId, [circleStroke]]]);
+    const preEditPageBboxes = new Map<NodeId, Rect>();
+    for (const [id, bb] of base.bboxes) {
+      preEditPageBboxes.set(id, {
+        x: bb.x * scale + tx,
+        y: bb.y * scale + ty,
+        w: bb.w * scale,
+        h: bb.h * scale,
+      });
+    }
+
+    await insertMindmap({
+      tree,
+      preEdit: {preEditPageBboxes, strokesByNodePage},
+    });
+
+    // Find the inserted GEO_circle among the inserted geometries.
+    const allInserts = getInsertedGeometries();
+    const circleInserts = allInserts
+      .map(([g]) => g)
+      .filter(g => g.type === 'GEO_circle');
+    expect(circleInserts.length).toBeGreaterThan(0);
+    const inserted = circleInserts[0] as {
+      ellipseCenterPoint?: {x: number; y: number};
+    };
+    expect(inserted.ellipseCenterPoint).toBeDefined();
+    // Both coords must be exact integers after rounding.
+    expect(Number.isInteger(inserted.ellipseCenterPoint!.x)).toBe(true);
+    expect(Number.isInteger(inserted.ellipseCenterPoint!.y)).toBe(true);
   });
 });

@@ -455,4 +455,65 @@ describe('translateStrokes', () => {
     expect(out.points).not.toBe(s.points);
     expect(out.points[0]).not.toBe(s.points[0]);
   });
+
+  it('throws on unknown geometry variant (exhaustiveness guard)', () => {
+    // Force a runtime type that TypeScript doesn't know about to verify
+    // the never-branch guard fires before producing garbage output.
+    const bad = {
+      type: 'UNKNOWN_VARIANT',
+      points: [{x: 0, y: 0}],
+    } as unknown as PreservedStroke;
+    expect(() => translateStrokes([bad], {x: 1, y: 1})).toThrow(
+      /unknown geometry variant UNKNOWN_VARIANT/,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Coverage gap tests — strokePointMassInRect with circle/ellipse (§8.1 tie-break)
+// ---------------------------------------------------------------------------
+
+describe('associateStrokes — circle/ellipse tie-break via strokePointMassInRect', () => {
+  it('resolves circle/ellipse tie by center-in-rect mass (circle)', () => {
+    // Two bboxes that both contain the circle center at (50, 50).
+    // The tie-break calls strokePointMassInRect for GEO_circle, which
+    // returns 1 if center is inside the rect and 0 otherwise.
+    // Both bboxes contain the center → both mass=1 → Map-insertion-order wins.
+    const s = circle({x: 50, y: 50});
+    const bboxes = new Map<NodeId, Rect>([
+      [id(1), rect(0, 0, 100, 100)],  // contains (50,50) → mass 1
+      [id(2), rect(20, 20, 60, 60)],  // also contains (50,50) → mass 1
+    ]);
+    const result = associateStrokes([s], bboxes);
+    // Both tie at mass=1 → first candidate (id 1) wins.
+    expect(result.byNode.get(id(1))).toBeDefined();
+    expect(result.byNode.get(id(2))).toBeUndefined();
+  });
+
+  it('resolves ellipse to the higher-mass bbox when centers differ', () => {
+    // Ellipse center at (80, 80). Bbox A covers 0–100 (contains center);
+    // bbox B covers 0–60 (does NOT contain the ellipse center → mass 0).
+    // Tie-break: A mass=1, B mass=0 → A wins.
+    const s = ellipse({x: 80, y: 80});
+    const bboxes = new Map<NodeId, Rect>([
+      [id(1), rect(0, 0, 100, 100)],  // contains (80,80) → mass 1
+      [id(2), rect(0, 0, 60, 60)],    // does NOT contain (80,80) → mass 0
+    ]);
+    const result = associateStrokes([s], bboxes);
+    expect(result.byNode.get(id(1))).toBeDefined();
+    expect(result.byNode.get(id(2))).toBeUndefined();
+  });
+});
+
+describe('associateStrokes — unknown variant exhaustiveness guards', () => {
+  it('strokeCentroid throws on unknown geometry variant', () => {
+    const bad = {
+      type: 'BOGUS_TYPE',
+      points: [],
+      ellipseCenterPoint: {x: 0, y: 0},
+    } as unknown as PreservedStroke;
+    expect(() =>
+      associateStrokes([bad], new Map([[id(1), rect(0, 0, 100, 100)]])),
+    ).toThrow(/unknown geometry variant BOGUS_TYPE/);
+  });
 });

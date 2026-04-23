@@ -118,16 +118,16 @@ export function associateStrokes(
       // intuition when two node bboxes each contain exactly half of a
       // symmetric stroke.
       let bestId = candidates[0];
-      const firstBbox = nodeBboxesById.get(bestId);
-      let bestMass =
-        firstBbox === undefined ? 0 : strokePointMassInRect(stroke, firstBbox);
+      let bestMass = strokePointMassInRect(
+        stroke,
+        nodeBboxesById.get(bestId) as Rect,
+      );
       for (let i = 1; i < candidates.length; i += 1) {
         const id = candidates[i];
-        const bbox = nodeBboxesById.get(id);
-        if (bbox === undefined) {
-          continue;
-        }
-        const mass = strokePointMassInRect(stroke, bbox);
+        const mass = strokePointMassInRect(
+          stroke,
+          nodeBboxesById.get(id) as Rect,
+        );
         if (mass > bestMass) {
           bestMass = mass;
           bestId = id;

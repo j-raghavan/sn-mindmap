@@ -278,7 +278,7 @@ export async function insertMindmap(input: InsertInput): Promise<void> {
     } else {
       for (const geometry of geometries) {
         const res = (await PluginCommAPI.insertGeometry(
-          geometry,
+          roundGeometryPoints(geometry),
         )) as ApiRes<boolean>;
         if (!res?.success) {
           throw new Error(res?.error?.message ?? 'insertGeometry failed');
@@ -329,12 +329,66 @@ export async function insertMindmap(input: InsertInput): Promise<void> {
  * batched insert does not auto-lasso individual elements — the
  * plugin's single explicit lassoElements call is what selects the
  * whole block post-insert.
+ *
+ * The geometry's point coordinates are rounded to integers at this
+ * boundary (see roundGeometryPoints) because the native firmware
+ * surfaces a "Invalid API parameters. Cannot call the API. Please
+ * check parameter validity!" toast and aborts insertPageTrails when
+ * point coordinates arrive as floats. sn-plugin-lib's JS-side
+ * GeometrySchema does NOT require integer x/y (PointSchema only
+ * enforces `{x: number, y: number}` with no integer flag), so
+ * fractional coords pass JS validation but are rejected host-side
+ * in com.ratta.supernote.note. Radial layout (Math.cos/Math.sin)
+ * and roundedRectPoints corner sampling both produce fractional
+ * coords, so the rounding pass is required on every emission.
  */
 function wrapGeometryAsElement(geometry: Geometry): {
   type: number;
   geometry: Geometry;
 } {
-  return {type: ELEMENT_TYPE_GEO, geometry};
+  return {type: ELEMENT_TYPE_GEO, geometry: roundGeometryPoints(geometry)};
+}
+
+/**
+ * Round every coordinate in a Geometry's point set (and, for
+ * circle/ellipse, the ellipseCenterPoint) to the nearest integer.
+ *
+ * Used exclusively at the firmware boundary — the emit pipeline and
+ * its tests stay in floating-point. This keeps emitGeometries pure
+ * and leaves the tolerance-based geometry tests unaffected.
+ *
+ * Rounded fields:
+ *   - polygon.points[*].x/y
+ *   - straightLine.points[*].x/y
+ *   - circle/ellipse.ellipseCenterPoint.x/y
+ *
+ * Ellipse radii and angle are left as-is for now: the logcat
+ * evidence points at fractional polygon/line point coords as the
+ * rejection trigger, and emitGeometries does not emit circles or
+ * ellipses today. If the banner reappears after this fix, widening
+ * the rounding to radii/angles is the next step.
+ */
+function roundGeometryPoints(geometry: Geometry): Geometry {
+  switch (geometry.type) {
+    case 'GEO_polygon':
+    case 'straightLine':
+      return {
+        ...geometry,
+        points: geometry.points.map(p => ({
+          x: Math.round(p.x),
+          y: Math.round(p.y),
+        })),
+      };
+    case 'GEO_circle':
+    case 'GEO_ellipse':
+      return {
+        ...geometry,
+        ellipseCenterPoint: {
+          x: Math.round(geometry.ellipseCenterPoint.x),
+          y: Math.round(geometry.ellipseCenterPoint.y),
+        },
+      };
+  }
 }
 
 /**
@@ -541,6 +595,16 @@ function transformLayout(
  * lasso-bounds format (left/top/right/bottom). Exposed as a free
  * function so the cleanup path can reuse it without re-deriving the
  * conversion.
+ *
+ * The firmware's RectSchema (sn-plugin-lib VerifyUtils) requires all
+ * four fields to be integers and rejects floats with APIError(107)
+ * ("must be an integer"), which surfaces in the UI as "invalid
+ * parameters sent to the API". Upstream geometry — radial layout
+ * centers (Math.cos/Math.sin) and rounded-corner polygon vertices
+ * (roundedRectPoints) — is inherently fractional, so we floor/ceil
+ * here to produce the smallest integer rect that still encloses the
+ * union. Widening by <1 unit has no user-visible effect because the
+ * firmware canvas resolution is in the thousands per side.
  */
 function toLassoBounds(rect: Rect): {
   left: number;
@@ -549,10 +613,10 @@ function toLassoBounds(rect: Rect): {
   bottom: number;
 } {
   return {
-    left: rect.x,
-    top: rect.y,
-    right: rect.x + rect.w,
-    bottom: rect.y + rect.h,
+    left: Math.floor(rect.x),
+    top: Math.floor(rect.y),
+    right: Math.ceil(rect.x + rect.w),
+    bottom: Math.ceil(rect.y + rect.h),
   };
 }
 
@@ -565,9 +629,6 @@ function toLassoBounds(rect: Rect): {
  * toolbar) to back out anything this cleanup couldn't reclaim.
  */
 async function attemptCleanup(inserted: Geometry[]): Promise<void> {
-  if (inserted.length === 0) {
-    return;
-  }
   const partial = unionRectOfGeometries(inserted);
   try {
     const lassoRes = (await PluginCommAPI.lassoElements(

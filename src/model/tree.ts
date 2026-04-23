@@ -1,69 +1,91 @@
 /**
- * Mindmap tree model and mutators.
+ * Mindmap tree model — immutable-style mutations operating on a mutable
+ * Tree object passed by reference.
  *
- * Tree identity: each node has an integer id that is its index in the
- * flat records array at encode time (§6.3). The root is always id=0
- * with parentId=null. Ids are stable for the lifetime of an authoring
- * session; the marker records (§6.3) do NOT carry node ids — identity
- * on decode is "position in the records array".
+ * Design notes:
+ *   - NodeId is a plain integer so it serialises cheaply into the 2-byte
+ *     marker record format (§6.3).  The root always has id 0; subsequent
+ *     nodes get monotonically increasing ids from `tree.nextId`.
+ *   - Mutations are applied in-place (the caller owns the Tree and clones
+ *     it via cloneTree() before passing it to the React reducer if needed).
+ *   - Collapse state is a UI concern; flattenForEmit always traverses the
+ *     full tree regardless (§F-IN-2: "auto-expand on insert").
  *
- * Shape-by-creation-action (§F-AC-3):
- *   root               -> OVAL              (shape kind 0x00)
- *   added via addChild -> RECTANGLE         (shape kind 0x01)
- *   added via addSibling-> ROUNDED_RECTANGLE (shape kind 0x02)
- *
- * Collapse state is authoring-time only (§4.2 / §8.6). It lives on
- * nodes here but is intentionally NOT carried into the marker
- * records — at Insert time the tree is fully expanded (§F-IN-2).
- *
- * Mutators in this module mutate the passed `Tree` in place and
- * return whatever information the caller needs (new id, removed ids,
- * etc.). The authoring canvas uses `cloneTree` before dispatching
- * into a reducer so the reducer stays pure from the outside even
- * though the helpers here are imperative.
+ * References: §F-AC-2, §F-AC-3, §F-AC-5, §4.2, §4.3, §6.3, §F-IN-2.
  */
 
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/**
+ * Numeric node identifier.  Root is always 0; subsequent nodes receive
+ * strictly increasing integers from Tree.nextId.  Values ≤ 0xFFFF (65535)
+ * to fit in the 2-byte marker field (§6.3).
+ */
 export type NodeId = number;
 
 /**
- * Shape kind byte enum per §6.3 "Shape-kind enum" and §F-AC-3.
- * Numeric values are the wire bytes used by the marker encoder;
- * do not renumber.
+ * Shape of a node's outline — also the wire byte stored in the marker
+ * record (§6.3).  Do NOT renumber: the decoder depends on these exact values.
  */
 export enum ShapeKind {
+  /** Root node.  Oval / ellipse outline. (§F-AC-2) */
   OVAL = 0x00,
+  /** Child node added via "Add Child".  Rectangle outline. (§F-AC-3) */
   RECTANGLE = 0x01,
+  /** Sibling node added via "Add Sibling".  Rounded-rectangle. (§F-AC-3) */
   ROUNDED_RECTANGLE = 0x02,
 }
 
-export type MindmapNode = {
+/** A single node in the mindmap. */
+export interface MindmapNode {
   id: NodeId;
-  parentId: NodeId | null;
-  shape: ShapeKind;
-  /** Ordered child ids. Order determines radial-slice assignment (§F-LY-3). */
+  parentId: NodeId | null; // null only for the root
   childIds: NodeId[];
-  /**
-   * Authoring-time only. Expand/collapse UI affordance per §F-AC-5
-   * and §4.2. Never persisted — §F-IN-2 auto-expands before emit.
-   */
+  shape: ShapeKind;
+  /** True when the subtree below this node is hidden in the authoring canvas. */
   collapsed: boolean;
-};
+}
 
-export type Tree = {
-  /** Always 0 — the root node id. Kept explicit for readability. */
-  rootId: NodeId;
+/**
+ * The full mindmap tree.  Mutated in-place by the functions below; use
+ * cloneTree() to create an independent copy before mutation when the
+ * original must remain unchanged (e.g. inside a React reducer).
+ */
+export interface Tree {
+  rootId: NodeId; // always 0
+  /** All nodes keyed by their id. */
   nodesById: Map<NodeId, MindmapNode>;
-  /** Monotonic id allocator. Next id handed out by allocateId. */
-  nextId: NodeId;
-};
+  /** Next id to assign.  Starts at 1 (root consumed 0). */
+  nextId: number;
+}
 
-/** Create a fresh tree with only the root Oval (id=0). */
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function getNode(tree: Tree, id: NodeId, context: string): MindmapNode {
+  const node = tree.nodesById.get(id);
+  if (!node) {
+    throw new Error(`[tree] unknown node ${id} in ${context}`);
+  }
+  return node;
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/**
+ * Create a fresh tree containing only the root Oval node (§F-AC-2).
+ */
 export function createTree(): Tree {
   const root: MindmapNode = {
     id: 0,
     parentId: null,
-    shape: ShapeKind.OVAL,
     childIds: [],
+    shape: ShapeKind.OVAL,
     collapsed: false,
   };
   return {
@@ -74,182 +96,146 @@ export function createTree(): Tree {
 }
 
 /**
- * Deep-clone a tree so the caller can mutate the clone without
- * affecting the original. Used by the authoring canvas reducer to
- * keep dispatch pure even though the mutators below work in place.
- */
-export function cloneTree(tree: Tree): Tree {
-  const cloned = new Map<NodeId, MindmapNode>();
-  for (const [id, node] of tree.nodesById) {
-    cloned.set(id, {
-      id: node.id,
-      parentId: node.parentId,
-      shape: node.shape,
-      childIds: node.childIds.slice(),
-      collapsed: node.collapsed,
-    });
-  }
-  return {
-    rootId: tree.rootId,
-    nodesById: cloned,
-    nextId: tree.nextId,
-  };
-}
-
-/**
- * Look up a node; throw if missing. Internal helper to keep the
- * mutator bodies small.
- */
-function mustGet(tree: Tree, id: NodeId): MindmapNode {
-  const node = tree.nodesById.get(id);
-  if (!node) {
-    throw new Error(`tree: unknown node id ${id}`);
-  }
-  return node;
-}
-
-/**
- * Allocate a fresh node, register it in `nodesById`, and return its
- * id. Shared by addChild / addSibling — they differ only in the
- * shape byte and in how the new id is linked into the parent's
- * childIds, so the allocation bookkeeping lives here.
- */
-function allocateNode(
-  tree: Tree,
-  parentId: NodeId,
-  shape: ShapeKind,
-): NodeId {
-  const id = tree.nextId;
-  tree.nextId += 1;
-  tree.nodesById.set(id, {
-    id,
-    parentId,
-    shape,
-    childIds: [],
-    collapsed: false,
-  });
-  return id;
-}
-
-/**
- * Add a RECTANGLE child to `parentId`. Returns the new node id.
- * Per §F-AC-3, shape is determined by the creating action, not by
- * depth.
+ * Add a Rectangle child under `parentId` and return the new node's id.
+ * Appends to the end of the parent's childIds list (§F-AC-3).
+ *
+ * @throws if `parentId` does not exist in the tree.
  */
 export function addChild(tree: Tree, parentId: NodeId): NodeId {
-  const parent = mustGet(tree, parentId);
-  const id = allocateNode(tree, parentId, ShapeKind.RECTANGLE);
+  const parent = getNode(tree, parentId, 'addChild');
+  const id = tree.nextId++;
+  const child: MindmapNode = {
+    id,
+    parentId,
+    childIds: [],
+    shape: ShapeKind.RECTANGLE,
+    collapsed: false,
+  };
+  tree.nodesById.set(id, child);
   parent.childIds.push(id);
   return id;
 }
 
 /**
- * Add a ROUNDED_RECTANGLE sibling next to `nodeId` (a child of
- * nodeId's parent, inserted immediately after nodeId in the
- * parent's childIds). Root has no siblings; calling this on the
- * root throws per §F-AC-5 (Add Sibling is hidden, not disabled, so
- * reaching this code path is a programming error).
+ * Add a Rounded-Rectangle sibling immediately after `nodeId` in the
+ * parent's childIds list and return the new node's id (§F-AC-3).
+ *
+ * @throws if `nodeId` is the root (no parent) or does not exist.
  */
 export function addSibling(tree: Tree, nodeId: NodeId): NodeId {
-  const pivot = mustGet(tree, nodeId);
-  if (pivot.parentId === null) {
-    throw new Error('tree: addSibling on root is forbidden (§F-AC-5)');
+  const node = getNode(tree, nodeId, 'addSibling');
+  if (node.parentId === null) {
+    throw new Error('[tree] cannot add a sibling to the root');
   }
-  const parent = mustGet(tree, pivot.parentId);
-  const id = allocateNode(tree, pivot.parentId, ShapeKind.ROUNDED_RECTANGLE);
-  const pivotIdx = parent.childIds.indexOf(nodeId);
-  // pivotIdx cannot be -1 — parent.childIds is the source of truth
-  // for parent/child linkage. If we ever find it missing, the tree
-  // is corrupt; surface loudly rather than appending silently.
-  if (pivotIdx < 0) {
-    throw new Error(
-      `tree: inconsistent state — node ${nodeId} not found in parent ${pivot.parentId}.childIds`,
-    );
-  }
-  parent.childIds.splice(pivotIdx + 1, 0, id);
+  const parent = getNode(tree, node.parentId, 'addSibling/parent');
+  const id = tree.nextId++;
+  const sibling: MindmapNode = {
+    id,
+    parentId: node.parentId,
+    childIds: [],
+    shape: ShapeKind.ROUNDED_RECTANGLE,
+    collapsed: false,
+  };
+  tree.nodesById.set(id, sibling);
+  const idx = parent.childIds.indexOf(nodeId);
+  parent.childIds.splice(idx + 1, 0, id);
   return id;
 }
 
 /**
- * Delete the subtree rooted at `nodeId`. Deleting the root is
- * forbidden (§4.3, §F-AC-5). Returns the set of removed node ids so
- * callers (e.g. emit time) can drop associated label strokes.
+ * Delete the subtree rooted at `nodeId` (inclusive) and return the Set of
+ * all removed ids (§4.3, §F-AC-5).
+ *
+ * @throws if `nodeId` is the root or does not exist.
  */
 export function deleteSubtree(tree: Tree, nodeId: NodeId): Set<NodeId> {
-  const target = mustGet(tree, nodeId);
-  if (target.parentId === null) {
-    throw new Error('tree: cannot delete root (§4.3, §F-AC-5)');
+  const node = getNode(tree, nodeId, 'deleteSubtree');
+  if (node.parentId === null) {
+    throw new Error('[tree] cannot delete the root');
   }
+
+  // Collect all ids in the subtree via BFS.
   const removed = new Set<NodeId>();
-  // Iterative DFS to avoid recursion depth surprises on pathological
-  // trees. Order does not matter — callers only care about set
-  // membership.
-  const stack: NodeId[] = [nodeId];
-  while (stack.length > 0) {
-    const id = stack.pop() as NodeId;
-    const node = tree.nodesById.get(id);
-    if (!node) {
-      continue;
+  const queue: NodeId[] = [nodeId];
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    removed.add(current);
+    const n = tree.nodesById.get(current)!;
+    for (const c of n.childIds) {
+      queue.push(c);
     }
-    removed.add(id);
-    for (const childId of node.childIds) {
-      stack.push(childId);
-    }
+  }
+
+  // Remove from parent's childIds.
+  const parent = getNode(tree, node.parentId, 'deleteSubtree/parent');
+  parent.childIds = parent.childIds.filter(c => c !== nodeId);
+
+  // Remove all collected nodes from the map.
+  for (const id of removed) {
     tree.nodesById.delete(id);
   }
-  // Unlink from parent.
-  const parent = mustGet(tree, target.parentId);
-  const idx = parent.childIds.indexOf(nodeId);
-  if (idx >= 0) {
-    parent.childIds.splice(idx, 1);
-  }
+
   return removed;
 }
 
 /**
- * Set collapsed state. Any node with ≥ 1 child may be collapsed
- * (§F-AC-5, §4.2) regardless of whether those children came from
- * addChild or addSibling. Calling this on a leaf is a no-op so UI
- * handlers can dispatch speculatively without guard races.
+ * Set the collapsed state of `nodeId` (§F-AC-5, §4.2).
+ * Silently ignores the call when `nodeId` has no children (leaves cannot
+ * be collapsed — the toggle icon is hidden for them in the canvas).
+ *
+ * @throws if `nodeId` does not exist.
  */
 export function setCollapsed(
   tree: Tree,
   nodeId: NodeId,
   collapsed: boolean,
 ): void {
-  const node = mustGet(tree, nodeId);
+  const node = getNode(tree, nodeId, 'setCollapsed');
   if (node.childIds.length === 0) {
-    // Leaf: no-op. §F-AC-5 says the toggle is hidden on leaves; if
-    // we somehow get here, silently ignoring is safer than throwing
-    // from a UI callback.
-    return;
+    return; // no-op for leaves
   }
   node.collapsed = collapsed;
 }
 
 /**
- * Produce a fully-expanded flat pre-order traversal of the tree.
- * Used by the marker encoder (§6.2 / §6.3) which expects node index
- * in the traversal to equal the node's record offset. Collapsed
- * subtrees are still emitted — §F-IN-2 auto-expansion at Insert
- * time.
- *
- * Order is depth-first, visiting children in their `childIds`
- * order, starting from the root. The root is always index 0, which
- * matches the §6.3 wire-format requirement.
+ * Return all nodes in pre-order depth-first traversal, regardless of
+ * collapse state (§F-IN-2: the insert pipeline auto-expands everything).
+ * The root is always index 0, matching the §6.3 marker-record offset
+ * convention.
  */
 export function flattenForEmit(tree: Tree): MindmapNode[] {
-  const out: MindmapNode[] = [];
+  const result: MindmapNode[] = [];
+  // Pre-order DFS: push children in REVERSE so the leftmost child is
+  // popped first, matching the "root → child₀ → grandchildren → child₁ …"
+  // order required by §6.3 (record offset == pre-order index).
   const stack: NodeId[] = [tree.rootId];
   while (stack.length > 0) {
-    const id = stack.pop() as NodeId;
-    const node = mustGet(tree, id);
-    out.push(node);
-    // Push children in reverse so the top-of-stack is the first
-    // child — this gives us left-to-right pre-order.
-    for (let i = node.childIds.length - 1; i >= 0; i -= 1) {
+    const id = stack.pop()!;
+    const node = tree.nodesById.get(id)!;
+    result.push(node);
+    for (let i = node.childIds.length - 1; i >= 0; i--) {
       stack.push(node.childIds[i]);
     }
   }
-  return out;
+  return result;
+}
+
+/**
+ * Produce a deep clone of `tree` that shares no object references with
+ * the original.  The clone's `nextId` is preserved so it can continue
+ * allocating fresh ids independently.
+ */
+export function cloneTree(tree: Tree): Tree {
+  const nodesById = new Map<NodeId, MindmapNode>();
+  for (const [id, node] of tree.nodesById) {
+    nodesById.set(id, {
+      ...node,
+      childIds: [...node.childIds],
+    });
+  }
+  return {
+    rootId: tree.rootId,
+    nodesById,
+    nextId: tree.nextId,
+  };
 }

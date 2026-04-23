@@ -1,52 +1,54 @@
 /**
- * Radial-layout constants per §F-LY-5.
+ * Layout and rendering constants for the mindmap plugin.
  *
- * These values are STARTING POINTS, not frozen. §F-LY-5 calls for
- * empirical tuning against both Nomad (1404×1872) and Manta
- * (1920×TBD per §10). §10 also tracks Manta pixel-height
- * verification — values that assume a 2560 height must not be frozen
- * until that is confirmed.
+ * All dimension values are in logical pixels (mindmap-local coordinate
+ * space).  The insert pipeline scales to note-page pixel coords via the
+ * page-size returned by PluginFileAPI.getPageSize (§F-IN-1).
  *
- * Note: a few constants that used to live here were consolidated
- * elsewhere during the Phase 5 cleanup because they duplicated the
- * source-of-truth definition in their primary module:
- *   - MARKER_PEN_WIDTH      → src/marker/encode.ts (§6.4 codec owner)
- *   - PAGE_MARGIN           → INSERT_MARGIN_PX in src/insert.ts
- *                             (fit-to-page scaler owner, §F-LY-6)
- *   - NODE_INTERNAL_PADDING → decoder uses bbox-contains, not padded
- *                             offsets; unused by the emit path
- *   - RECENTER_ANIMATION_MS → the §F-AC-6 animation budget lives in
- *                             MindmapCanvas's withLayoutTiming helper
- *                             (not a shared constant)
+ * References:
+ *   §F-AC-2  Root node is an Oval, pen weight ROOT_PEN_WIDTH.
+ *   §F-AC-3  Child = Rectangle (STANDARD_PEN_WIDTH); sibling = Rounded-
+ *            Rectangle (STANDARD_PEN_WIDTH, corner radius CORNER_RADIUS).
+ *   §F-LY-2  First-level children sit at radius R1 from the root.
+ *   §F-LY-3  Each deeper level adds LEVEL_RADIUS_INCREMENT to the radius.
+ *   §F-LY-5  Node bounding boxes are NODE_WIDTH × NODE_HEIGHT.
+ *   §11      STANDARD_PEN_WIDTH = 400 (matches sn-shapes convention).
  */
 
-/** First-level children orbit radius (distance from root to first ring). */
-export const R1 = 340;
+/** Radius (logical px) from root centre to first-level child centres. */
+export const R1 = 200;
 
 /**
- * Each deeper level grows by this much. Slices further out also get
- * wider angular arcs per §F-LY-3, so linear growth is usually enough
- * to keep crowding manageable.
+ * Extra radius added per depth level beyond the first (§F-LY-3).
+ * Depth-d node distance from origin = R1 + (d − 1) × LEVEL_RADIUS_INCREMENT.
  */
-export const LEVEL_RADIUS_INCREMENT = 260;
+export const LEVEL_RADIUS_INCREMENT = 400;
 
-/** Default node outline width (Oval / Rectangle / Rounded Rectangle). */
+/** Width of every node bounding box (logical px) (§F-LY-5). */
 export const NODE_WIDTH = 220;
 
-/** Default node outline height. */
+/** Height of every node bounding box (logical px) (§F-LY-5). */
 export const NODE_HEIGHT = 96;
 
 /**
- * Rounded-rectangle corner radius for Add-Sibling nodes (§F-AC-3).
- * The root's Oval uses a corner radius ≥ half the shorter side
- * (§F-AC-2) — computed from NODE_HEIGHT at emit time, not stored here
- * as a fixed value.
+ * Pen weight for the root Oval outline (§F-AC-2).
+ * Must be ≥ 500 to match the firmware's "thick" style.
  */
-export const SIBLING_CORNER_RADIUS = 15;
+export const ROOT_PEN_WIDTH = 500;
 
 /**
- * Connector pen width follows the child node's border weight per
- * §F-IN-2 step 2. The two standard weights are:
+ * Pen weight for child Rectangle and sibling Rounded-Rectangle outlines
+ * (§F-AC-3, §11).  Exactly 400 — do not change without updating §11.
  */
-export const STANDARD_PEN_WIDTH = 400; // non-root node outlines + connectors
-export const ROOT_PEN_WIDTH = 500; // root Oval darker border (§F-AC-2, min ≥ 500)
+export const STANDARD_PEN_WIDTH = 400;
+
+/**
+ * Corner radius (logical px) for Rounded-Rectangle (sibling) nodes (§F-AC-3).
+ */
+export const CORNER_RADIUS = 15;
+
+/**
+ * Alias for CORNER_RADIUS — used by consumers that prefer the more
+ * descriptive name (nodeFrame, roundedRectPoints).
+ */
+export const SIBLING_CORNER_RADIUS = CORNER_RADIUS;
