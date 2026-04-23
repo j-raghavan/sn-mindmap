@@ -35,7 +35,7 @@
  *   (Fineliner), pen width 100.
  */
 import type {LineGeometry, Point, Rect} from '../geometry';
-import {flattenForEmit, ShapeKind, type NodeId, type Tree} from '../model/tree';
+import {type NodeId, type Tree} from '../model/tree';
 import {crc32, rsEncode} from './rs';
 
 // -----------------------------------------------------------------

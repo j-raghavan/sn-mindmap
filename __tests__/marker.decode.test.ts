@@ -675,7 +675,7 @@ describe('decodeMarker — candidate filter edge cases', () => {
     const result = decodeMarker(fakeStrokes);
     // Must NOT be no_candidates (we have valid-format candidates).
     expect(result.ok).toBe(false);
-    if (result.ok) return;
+    if (result.ok) { return; }
     expect(result.reason).not.toBe('no_candidates');
   });
 

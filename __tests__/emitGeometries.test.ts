@@ -794,7 +794,7 @@ describe('emitGeometries — connector clipping edge cases', () => {
       g => g.type === 'straightLine' && g.penColor !== MARKER_PEN_COLOR,
     );
     expect(connectors.length).toBe(1);
-    if (connectors[0].type !== 'straightLine') throw new Error('type guard');
+    if (connectors[0].type !== 'straightLine') { throw new Error('type guard'); }
     expect(connectors[0].points[0]).toEqual({x: 0, y: 0});
     expect(connectors[0].points[1]).toEqual({x: 400, y: 0});
   });
@@ -815,7 +815,7 @@ describe('emitGeometries — connector clipping edge cases', () => {
       g => g.type === 'straightLine' && g.penColor !== MARKER_PEN_COLOR,
     );
     expect(connectors.length).toBe(1);
-    if (connectors[0].type !== 'straightLine') throw new Error('type guard');
+    if (connectors[0].type !== 'straightLine') { throw new Error('type guard'); }
     // Fallback: both endpoints equal the shared center.
     expect(connectors[0].points[0]).toEqual(sharedCenter);
     expect(connectors[0].points[1]).toEqual(sharedCenter);
@@ -837,7 +837,7 @@ describe('emitGeometries — connector clipping edge cases', () => {
       g => g.type === 'straightLine' && g.penColor !== MARKER_PEN_COLOR,
     );
     expect(connectors.length).toBe(1);
-    if (connectors[0].type !== 'straightLine') throw new Error('type guard');
+    if (connectors[0].type !== 'straightLine') { throw new Error('type guard'); }
     // Falls back to raw centers.
     expect(connectors[0].points[0]).toEqual({x: 0, y: 0});
     expect(connectors[0].points[1]).toEqual({x: 500, y: 300});
