@@ -23,7 +23,6 @@ import {
   ROOT_PEN_WIDTH,
   STANDARD_PEN_WIDTH,
 } from '../src/layout/constants';
-import {MARKER_PEN_WIDTH} from '../src/marker/encode';
 import {
   addChild,
   addSibling,
@@ -46,11 +45,6 @@ describe('radial layout', () => {
       expect(ROOT_PEN_WIDTH).toBeGreaterThanOrEqual(500);
       // §11 standard outline weight.
       expect(STANDARD_PEN_WIDTH).toBe(400);
-      // §6.4 marker pen width = firmware MIN_PEN_WIDTH = 100.
-      // Lives in marker/encode.ts since Phase 5 — the codec owns it.
-      // (§F-LY-6 fit-to-page margin is asserted in insert.test.ts,
-      // where INSERT_MARGIN_PX is actually consumed.)
-      expect(MARKER_PEN_WIDTH).toBe(100);
     });
   });
 

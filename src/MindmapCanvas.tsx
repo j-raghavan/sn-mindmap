@@ -84,15 +84,7 @@ import {
   STANDARD_PEN_WIDTH,
 } from './layout/constants';
 import type {Point, Rect} from './geometry';
-import {type PreEditContext} from './insert';
-import {MARKER_CAPACITY_MESSAGE} from './marker/encode';
-import ConfirmDialog from './ConfirmDialog';
 import {useInsertFlow} from './useInsertFlow';
-import type {
-  OutOfMapStrokes,
-  PreservedStroke,
-  StrokeBucket,
-} from './model/strokes';
 
 /**
  * Firmware pen-width (μm) → on-screen pixels. Matches sn-shapes'
@@ -145,78 +137,10 @@ const CLEAR_CONFIRM_MS = 3000;
 
 export type MindmapCanvasProps = {
   /**
-   * Optional preloaded tree for the edit round-trip (§F-ED-6) or for
-   * on-device authoring tests. Undefined → the canvas creates a
-   * fresh tree with just the root Oval.
+   * Optional preloaded tree for on-device authoring tests. Undefined
+   * → the canvas creates a fresh tree with just the root Oval.
    */
   initialTree?: Tree;
-  /**
-   * When true, the canvas is running inside the edit round-trip
-   * (§5.4). Current behavior:
-   *   - The Insert button is replaced by a "Save" button. Tapping
-   *     Save runs the §F-ED-7 round-trip: deleteLassoElements on the
-   *     pre-edit mindmap, then emit + insert + lasso + close around
-   *     the post-edit mindmap, with preserved label strokes
-   *     translated by each node's move delta.
-   *   - If `preEdit` is omitted, Save is still rendered but will
-   *     call insertMindmap without a pre-edit context — the new
-   *     mindmap lands on the page without deleting the old one
-   *     first. This is a defensive degraded mode; EditMindmap
-   *     always supplies preEdit in the normal flow.
-   *
-   * Authoring (isEditMode false / omitted) is the §F-AC-* flow: the
-   * Insert button runs the full §F-IN-* pipeline.
-   */
-  isEditMode?: boolean;
-  /**
-   * Pre-edit context bundle for the §F-ED-7 Save flow. When present
-   * and `isEditMode` is true, Save will hand this to insertMindmap,
-   * which (a) calls deleteLassoElements to clear the pre-edit
-   * mindmap, (b) computes per-node move delta postEdit − preEdit,
-   * and (c) translates preserved label strokes by that delta before
-   * re-emitting. Supplied by EditMindmap; omitted on the authoring
-   * canvas.
-   *
-   * Held but not inspected by MindmapCanvas — it's pure plumbing
-   * from EditMindmap to insertMindmap. The fields inside are the
-   * pre-edit page bboxes (used by insertMindmap to reconstruct the
-   * delta) and the raw page-coord stroke buckets (translateStrokes
-   * is applied internally).
-   */
-  preEdit?: PreEditContext;
-  /**
-   * Preserved label strokes bucketed by NodeId (Phase 4.4 / §F-ED-6).
-   *
-   * Coordinate convention: each stroke's points are stored in
-   * NODE-LOCAL coords — an offset from its owning node's pre-edit
-   * bbox top-left (in page coords, after EditMindmap projected the
-   * decoder's mindmap-local bboxes into page space by adding
-   * markerOriginPage). This lets the canvas render strokes anchored
-   * to each node's CURRENT radial-layout bbox, so strokes follow the
-   * node visually as the user adds, removes, or reshapes children.
-   *
-   * Render is read-only: preserved strokes paint on top of each
-   * node's outline but below the per-node action icons, and they
-   * never absorb taps. Nodes that appear as keys here but aren't in
-   * the rendered tree (e.g. after Clear) silently drop out —
-   * emitGeometries applies the same graceful behavior for re-emit.
-   *
-   * Only meaningful in edit mode (Phase 4.4). Omit for authoring.
-   */
-  initialPreservedStrokes?: StrokeBucket;
-  /**
-   * Strokes whose centroid fell outside every node's bbox during
-   * §F-ED-5 association. On Save (Phase 4.6 / §8.1) these gate the
-   * pipeline: if any are present the user sees a confirmation dialog
-   * before insertMindmap runs, so they can back out and re-lasso to
-   * include missed labels. If the user confirms, the strokes are
-   * dropped (not carried through to the re-inserted block). They are
-   * never rendered inside the canvas — only in-map strokes show up
-   * inside node outlines (Phase 4.4).
-   *
-   * Omit in authoring mode. An empty array is equivalent to omitting.
-   */
-  initialOutOfMapStrokes?: OutOfMapStrokes;
 };
 
 /**
@@ -274,10 +198,6 @@ function treeReducer(state: Tree, action: Action): Tree {
 
 export default function MindmapCanvas({
   initialTree,
-  isEditMode = false,
-  initialPreservedStrokes,
-  initialOutOfMapStrokes,
-  preEdit,
 }: MindmapCanvasProps = {}): React.JSX.Element {
   // The initial-state arg is called lazily by React, so cloning only
   // happens on mount. The clone is important: callers may reuse the
@@ -372,18 +292,10 @@ export default function MindmapCanvas({
     dispatch({type: 'TOGGLE_COLLAPSE', nodeId});
   }, []);
 
-  // Insert / Save pipeline state (§F-IN-*, §F-ED-7, §F-PE-4, §8.1).
-  // Extracted into useInsertFlow so the canvas renders topology +
-  // affordances + top bar, while the hook owns debounce, pending
-  // state, transient error banner, capacity modal, and out-of-map
-  // confirmation dialog. See src/useInsertFlow.ts for the SRP
-  // rationale; behavior is byte-identical to the pre-refactor inline
-  // code so the MindmapCanvas test suite keeps passing unchanged.
-  const flow = useInsertFlow({
-    tree,
-    preEdit,
-    outOfMapStrokes: initialOutOfMapStrokes,
-  });
+  // Insert pipeline state (§F-IN-*). Extracted into useInsertFlow so
+  // the canvas renders topology + affordances + top bar, while the
+  // hook owns debounce, pending state, and the transient error banner.
+  const flow = useInsertFlow({tree});
 
   // Clear-button two-tap confirm state. `clearArmed` flips to true on
   // the first tap, re-rendering the button label as "Confirm Clear".
@@ -475,28 +387,12 @@ export default function MindmapCanvas({
          * for re-insert. Always enabled because the tree always has
          * ≥ 1 node; the only reason it's locally disabled is while
          * an insert is already in flight, to debounce double taps
-         * during the §F-NF-2 ≤ 2.0 s budget.
-         *
-         * Authoring (isEditMode=false) → "Insert" fires the
-         * §F-IN-* pipeline. Edit (isEditMode=true) → "Save" fires
-         * the §F-ED-7 round-trip (delete pre-edit mindmap, then
-         * emit + insert + lasso + close with preserved label
-         * strokes translated by each node's move delta). The two
-         * buttons are mutually exclusive — only one shape of this
-         * button ever renders, with a distinct accessibilityLabel
-         * ("Insert" vs "Save") so tests and on-device tooling can
-         * target whichever flow they're exercising.
-         *
-         * Both branches share identical top-bar styling + pending-
-         * state chrome, so InsertSaveButton deduplicates the two
-         * ~20-line Pressable definitions behind a single component
-         * whose only mode-dependent outputs are the label text and
-         * the pending label ("Inserting…" vs "Saving…").
+         * during the §F-NF-2 ≤ 2.0 s budget. Fires the §F-IN-*
+         * pipeline (Edit/Save paths were removed with the marker).
          */}
-        <InsertSaveButton
-          mode={isEditMode ? 'save' : 'insert'}
+        <InsertButton
           isPending={flow.isInserting}
-          onPress={isEditMode ? flow.triggerSave : flow.triggerInsert}
+          onPress={flow.triggerInsert}
         />
       </View>
       {flow.insertError !== null && (
@@ -528,7 +424,6 @@ export default function MindmapCanvas({
             layout={layout}
             visibleIds={visibleIds}
             selectedId={selectedId}
-            preservedStrokes={initialPreservedStrokes}
             onSelect={handleSelect}
             onAddChild={handleAddChild}
             onAddSibling={handleAddSibling}
@@ -537,49 +432,6 @@ export default function MindmapCanvas({
           />
         </View>
       </Pressable>
-      {/*
-       * Pre-Save out-of-map confirmation dialog (§8.1, Phase 4.6).
-       * Rendered on top of the canvas when the user taps Save and at
-       * least one stroke's centroid fell outside every node's bbox.
-       *
-       * The body is passed as a two-segment array so the dynamic "{N}
-       * strokes fell outside…" count stays as its own child of the
-       * body Text (the Phase 4.6 count test inspects that split via
-       * children.filter).
-       */}
-      <ConfirmDialog
-        labelPrefix="save-confirm"
-        visible={isEditMode && flow.saveConfirmOpen}
-        title="Some strokes are outside every node"
-        body={[
-          flow.outOfMapCount === 1
-            ? '1 stroke fell outside every node and will not be saved. '
-            : `${flow.outOfMapCount} strokes fell outside every node and will not be saved. `,
-          'Cancel to close the plugin and re-lasso with a wider selection, or save anyway to drop them.',
-        ]}
-        primaryLabel="Save anyway"
-        onPrimary={flow.confirmSave}
-        secondaryLabel="Cancel"
-        onSecondary={flow.cancelSave}
-        primaryVariant="destructive"
-      />
-      {/*
-       * §F-PE-4 marker-capacity modal. Surfaced when insertMindmap
-       * throws MarkerCapacityError (i.e. the tree exceeded
-       * MARKER_PUBLISHED_NODE_CAP = 50). No secondary button — the
-       * only path forward is acknowledging the error and reducing
-       * nodes on the canvas, so a "cancel" affordance would be
-       * meaningless. Body is the verbatim §F-PE-4 spec text from
-       * marker/encode.ts (single source of truth; no duplication here).
-       */}
-      <ConfirmDialog
-        labelPrefix="capacity-error"
-        visible={flow.capacityModalOpen}
-        title="Mindmap too large"
-        body={MARKER_CAPACITY_MESSAGE}
-        primaryLabel="OK"
-        onPrimary={flow.acknowledgeCapacity}
-      />
     </View>
   );
 }
@@ -602,21 +454,17 @@ export default function MindmapCanvas({
  * either re-declare the styles (duplication) or export them
  * (accidental public surface).
  */
-function InsertSaveButton({
-  mode,
+function InsertButton({
   isPending,
   onPress,
 }: {
-  mode: 'insert' | 'save';
   isPending: boolean;
   onPress: () => void;
 }): React.JSX.Element {
-  const label = mode === 'insert' ? 'Insert' : 'Save';
-  const pendingLabel = mode === 'insert' ? 'Inserting…' : 'Saving…';
   return (
     <Pressable
       accessibilityRole="button"
-      accessibilityLabel={label}
+      accessibilityLabel="Insert"
       accessibilityState={{disabled: isPending}}
       disabled={isPending}
       onPress={onPress}
@@ -630,7 +478,7 @@ function InsertSaveButton({
           styles.topBarBtnText,
           isPending && styles.topBarBtnTextDisabled,
         ]}>
-        {isPending ? pendingLabel : label}
+        {isPending ? 'Inserting…' : 'Insert'}
       </Text>
     </Pressable>
   );
@@ -688,13 +536,6 @@ type StageProps = {
   layout: LayoutResult;
   visibleIds: Set<NodeId>;
   selectedId: NodeId | null;
-  /**
-   * Node-local preserved strokes (Phase 4.4). See
-   * MindmapCanvasProps.initialPreservedStrokes for coord convention.
-   * Undefined on the authoring canvas; non-empty only under
-   * EditMindmap's §F-ED-6 mount.
-   */
-  preservedStrokes?: StrokeBucket;
   onSelect: (nodeId: NodeId) => void;
   onAddChild: (parentId: NodeId) => void;
   onAddSibling: (nodeId: NodeId) => void;
@@ -720,7 +561,6 @@ function Stage({
   layout,
   visibleIds,
   selectedId,
-  preservedStrokes,
   onSelect,
   onAddChild,
   onAddSibling,
@@ -792,41 +632,6 @@ function Stage({
           />
         );
       })}
-      {/*
-       * Phase 4.4 — preserved label strokes. Rendered AFTER
-       * NodeFrames so they sit on top of the node's white fill
-       * (matching how handwriting appears over the shape on-device),
-       * but BEFORE NodeActions so per-node icons stay tappable on the
-       * top layer. Only visible nodes get their bucket rendered;
-       * collapsed subtrees' strokes stay in memory for a possible
-       * Save path (Phase 4.5) but don't paint.
-       *
-       * Flat-mapped into the Stage so each segment is absolutely
-       * positioned directly in stage coords — wrapping each node's
-       * strokes in a container View would require the container to be
-       * zero-sized to keep the coord frame consistent, adding
-       * complexity without a rendering benefit.
-       */}
-      {preservedStrokes !== undefined &&
-        visibleNodes.flatMap(node => {
-          const bbox = layout.bboxes.get(node.id);
-          if (!bbox) {
-            return [];
-          }
-          const strokes = preservedStrokes.get(node.id);
-          if (!strokes || strokes.length === 0) {
-            return [];
-          }
-          return strokes.map((stroke, i) => (
-            <PreservedStrokeView
-              key={`stroke-${node.id}-${i}`}
-              nodeId={node.id}
-              stroke={stroke}
-              nodeBbox={bbox}
-              origin={origin}
-            />
-          ));
-        })}
       {visibleNodes.map(node => {
         const bbox = layout.bboxes.get(node.id);
         if (!bbox) {
@@ -1062,145 +867,6 @@ function NodeActions({
 }
 
 /**
- * Read-only rendering of a single preserved label stroke (Phase 4.4 /
- * §F-ED-6). Input is expected in NODE-LOCAL coords (see
- * MindmapCanvasProps.initialPreservedStrokes); we add the current
- * node bbox top-left (minus stage origin) to every coordinate so the
- * stroke anchors to the node's current radial-layout position.
- *
- * Rendering approach — no react-native-svg:
- *   - Polyline / straightLine: each (p_i, p_{i+1}) segment renders as
- *     a thin rotated <View>, same technique as the Connector
- *     component. A polyline with N points produces N-1 segments.
- *     Single-point or empty strokes are silently dropped
- *     (firmware-captured strokes always have ≥ 2 points; this is a
- *     defensive floor, not a user-visible case).
- *   - Circle / ellipse: an absolute-positioned <View> with borderRadius
- *     matching the minor axis. Rotated by ellipseAngle when the
- *     firmware stored a non-axis-aligned orientation.
- *
- * Pen color: currently all strokes render in black. The firmware
- * palette is {black, red, grey, darkgrey, white} encoded in a single
- * byte (penColor), but on-device color values are device-specific and
- * we lack a verified mapping. Black is the common case on Supernote —
- * the vast majority of handwriting on e-ink notes is monochrome — so
- * a black fallback gives good-enough visual fidelity for Phase 4.4.
- * Expanding to a palette map is a §10 tuning item once we have
- * on-device samples of each color.
- */
-function PreservedStrokeView({
-  nodeId,
-  stroke,
-  nodeBbox,
-  origin,
-}: {
-  nodeId: NodeId;
-  stroke: PreservedStroke;
-  nodeBbox: Rect;
-  origin: Point;
-}): React.JSX.Element | null {
-  const offsetX = nodeBbox.x - origin.x;
-  const offsetY = nodeBbox.y - origin.y;
-  const thickness = penWidthToPx(stroke.penWidth);
-  const color = penColorToCss(stroke.penColor);
-  const strokeLabel = `preserved-stroke-node-${nodeId}`;
-  switch (stroke.type) {
-    case 'straightLine':
-    case 'GEO_polygon': {
-      const pts = stroke.points;
-      if (pts.length < 2) {
-        // Degenerate single-point or empty polyline — shouldn't happen
-        // in firmware output; silently drop so a corrupt stroke can't
-        // blow up the render.
-        return null;
-      }
-      const segments: React.JSX.Element[] = [];
-      for (let i = 0; i < pts.length - 1; i += 1) {
-        const from = pts[i];
-        const to = pts[i + 1];
-        const dx = to.x - from.x;
-        const dy = to.y - from.y;
-        const length = Math.hypot(dx, dy);
-        // Zero-length segment (two consecutive points at the same
-        // position) would render as a zero-width sliver — skip it so
-        // we don't emit empty Views for firmware's micro-sampling
-        // duplicates.
-        if (length === 0) {
-          continue;
-        }
-        const angle = Math.atan2(dy, dx);
-        const midX = (from.x + to.x) / 2;
-        const midY = (from.y + to.y) / 2;
-        segments.push(
-          <View
-            key={i}
-            accessibilityLabel={strokeLabel}
-            style={[
-              styles.preservedStrokeSegment,
-              {
-                left: offsetX + midX - length / 2,
-                top: offsetY + midY - thickness / 2,
-                width: length,
-                height: thickness,
-                backgroundColor: color,
-                transform: [{rotate: `${angle}rad`}],
-              },
-            ]}
-          />,
-        );
-      }
-      if (segments.length === 0) {
-        return null;
-      }
-      return <React.Fragment>{segments}</React.Fragment>;
-    }
-    case 'GEO_circle':
-    case 'GEO_ellipse': {
-      const c = stroke.ellipseCenterPoint;
-      const rx = stroke.ellipseMajorAxisRadius;
-      const ry = stroke.ellipseMinorAxisRadius;
-      // Guard against zero-radius ellipses: RN <View> with width=0 or
-      // borderRadius=0 still renders (as a rectangle of zero size,
-      // invisible), but we'd rather short-circuit explicitly.
-      if (rx <= 0 || ry <= 0) {
-        return null;
-      }
-      return (
-        <View
-          accessibilityLabel={strokeLabel}
-          style={[
-            styles.preservedStrokeEllipse,
-            {
-              left: offsetX + c.x - rx,
-              top: offsetY + c.y - ry,
-              width: rx * 2,
-              height: ry * 2,
-              // Taking the minor axis ensures the border curves fully
-              // at the tighter dimension; equals both for a circle.
-              borderRadius: Math.min(rx, ry),
-              borderWidth: thickness,
-              borderColor: color,
-              transform: [{rotate: `${stroke.ellipseAngle}rad`}],
-            },
-          ]}
-        />
-      );
-    }
-    default: {
-      // Exhaustiveness guard — PreservedStroke is the Geometry union,
-      // so any new variant (e.g. a future curve type) surfaces here
-      // at compile time before it can reach the render path.
-      const _exhaustive: never = stroke;
-      throw new Error(
-        `PreservedStrokeView: unknown geometry variant ${
-          (_exhaustive as {type: string}).type
-        }`,
-      );
-    }
-  }
-}
-
-/**
  * Convert a firmware pen width (μm) to on-screen pixels, clamped at
  * MIN_STROKE_PX so hairline strokes stay visible. Small helper kept
  * private because the ratio is a rendering concern, not a geometry
@@ -1208,19 +874,6 @@ function PreservedStrokeView({
  */
 function penWidthToPx(penWidth: number): number {
   return Math.max(MIN_STROKE_PX, penWidth * STROKE_PX_PER_PENWIDTH);
-}
-
-/**
- * Map a firmware penColor byte to a CSS color for rendering.
- *
- * Supernote's pen palette is byte-coded and device-dependent. For
- * Phase 4.4 we default every stroke to black — the dominant case in
- * practice, and a safer fallback than guessing at non-black codes.
- * Phase 10 tuning can expand this once we have on-device captures of
- * each color code.
- */
-function penColorToCss(_penColor: number): string {
-  return '#000';
 }
 
 /**
@@ -1346,21 +999,6 @@ const styles = StyleSheet.create({
   connector: {
     position: 'absolute',
     backgroundColor: '#000',
-  },
-  // Preserved-stroke segment (§F-ED-6). Positioned absolutely like
-  // Connector; dynamic left/top/width/height/rotation composed into a
-  // style array at the call site. backgroundColor is also dynamic
-  // (per-stroke pen color) but today always resolves to black —
-  // penColorToCss is a single-case lookup until Phase 10 tuning.
-  preservedStrokeSegment: {
-    position: 'absolute',
-  },
-  // Preserved-stroke ellipse/circle. Rendered as a bordered View with
-  // borderRadius = min(rx, ry) so a circle gets fully-rounded edges
-  // and a non-square ellipse still reads as an oval.
-  preservedStrokeEllipse: {
-    position: 'absolute',
-    backgroundColor: 'transparent',
   },
   iconButton: {
     position: 'absolute',

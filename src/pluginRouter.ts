@@ -28,9 +28,6 @@ import {PluginManager} from 'sn-plugin-lib';
 /** Toolbar "Mindmap" button — opens the authoring canvas. */
 export const BUTTON_ID_TOOLBAR = 100;
 
-/** Lasso-toolbar "Edit Mindmap" button — opens the edit round-trip. */
-export const BUTTON_ID_EDIT_MINDMAP = 200;
-
 // ---------------------------------------------------------------------------
 // Internal state
 // ---------------------------------------------------------------------------

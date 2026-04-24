@@ -1,85 +1,102 @@
 /**
  * Tests for src/insert.ts — the §F-IN-1..F-IN-5 orchestrator.
  *
- * Mocks sn-plugin-lib's PluginCommAPI / PluginFileAPI / PluginManager
- * so the whole insert path is exercised without a device. Covers:
+ * Mocks sn-plugin-lib's PluginCommAPI / PluginFileAPI / PluginManager /
+ * Element so the whole insert path is exercised without a device.
+ * Covers:
  *   - §F-IN-1 page-size fall-through at every step
  *   - §F-IN-2 / §8.6 auto-expansion of collapsed subtrees
- *   - §F-IN-3 order-of-calls (insertElements × 1 → lassoElements →
- *     closePluginView) plus showLassoAfterInsert:false on every
- *     inserted geometry; plus the sequential insertGeometry fallback
- *     when the note context is unresolvable
+ *   - §F-IN-3 order-of-calls: createElement × N → getElements →
+ *     replaceElements → lassoElements → closePluginView. Batched
+ *     replaceElements is the viable batched path on this firmware
+ *     (confirmed on-device 04-24 08:45 probe run); the older
+ *     per-geometry insertGeometry loop was ~80 seconds and is gone.
  *   - §F-IN-4 plugin-view dismissal
- *   - §F-IN-5 best-effort cleanup on mid-insert failure
+ *   - §F-IN-5 atomic failure semantics (replaceElements is
+ *     all-or-nothing, so there is no partial-insert cleanup to do —
+ *     a failed replaceElements throws and the page stays untouched)
  *   - §F-LY-6 fit-to-page scaling + page-centering of the union rect
  *
  * We intentionally don't re-test emitGeometries' internals here —
  * those live in __tests__/emitGeometries.test.ts. The contract
  * exercised here is the orchestration around emit, not emit itself.
  */
-jest.mock('sn-plugin-lib', () => ({
-  PluginCommAPI: {
-    insertGeometry: jest.fn().mockResolvedValue({success: true}),
-    getCurrentFilePath: jest
-      .fn()
-      .mockResolvedValue({success: true, result: '/note/test.note'}),
-    getCurrentPageNum: jest
-      .fn()
-      .mockResolvedValue({success: true, result: 0}),
-    lassoElements: jest.fn().mockResolvedValue({success: true}),
-    deleteLassoElements: jest.fn().mockResolvedValue({success: true}),
-  },
-  PluginFileAPI: {
-    getPageSize: jest
-      .fn()
-      .mockResolvedValue({success: true, result: {width: 1404, height: 1872}}),
-    insertElements: jest.fn().mockResolvedValue({success: true}),
-  },
-  PluginManager: {
-    closePluginView: jest.fn().mockResolvedValue(true),
-  },
-}));
+jest.mock('sn-plugin-lib', () => {
+  // Helper: produce a fresh native-like Element object for each
+  // createElement call. Mirrors the shape of the real Element
+  // returned by PluginCommAPI.createElement on device — pageNum,
+  // layerNum, thickness, geometry are populated by insertMindmap
+  // after createElement returns. `uuid` is unique per call so tests
+  // can verify N distinct Elements landed in replaceElements.
+  let uuidCounter = 0;
+  const mintElement = () => ({
+    uuid: `test-uuid-${uuidCounter++}`,
+    type: 700,
+    pageNum: 0,
+    layerNum: 0,
+    thickness: 0,
+    geometry: null as unknown,
+  });
+  return {
+    Element: {TYPE_GEO: 700},
+    PluginCommAPI: {
+      createElement: jest
+        .fn()
+        .mockImplementation(async () => ({success: true, result: mintElement()})),
+      insertGeometry: jest.fn().mockResolvedValue({success: true}),
+      getCurrentFilePath: jest
+        .fn()
+        .mockResolvedValue({success: true, result: '/note/test.note'}),
+      getCurrentPageNum: jest
+        .fn()
+        .mockResolvedValue({success: true, result: 0}),
+      lassoElements: jest.fn().mockResolvedValue({success: true}),
+      deleteLassoElements: jest.fn().mockResolvedValue({success: true}),
+      setLassoBoxState: jest.fn().mockResolvedValue({success: true}),
+      reloadFile: jest.fn().mockResolvedValue({success: true}),
+    },
+    PluginFileAPI: {
+      getPageSize: jest.fn().mockResolvedValue({
+        success: true,
+        result: {width: 1404, height: 1872},
+      }),
+      getElements: jest.fn().mockResolvedValue({success: true, result: []}),
+      replaceElements: jest.fn().mockResolvedValue({success: true}),
+    },
+    PluginManager: {
+      closePluginView: jest.fn().mockResolvedValue(true),
+    },
+  };
+});
 
 import {PluginCommAPI, PluginFileAPI, PluginManager} from 'sn-plugin-lib';
 
-import type {Geometry, Point, Rect} from '../src/geometry';
+import type {Point} from '../src/geometry';
 import {
   DEFAULT_PAGE_HEIGHT,
   DEFAULT_PAGE_WIDTH,
   INSERT_MARGIN_PX,
   insertMindmap,
-  type PreEditContext,
 } from '../src/insert';
 import {radialLayout} from '../src/layout/radial';
 import {
-  MARKER_PEN_COLOR,
-  MARKER_PUBLISHED_NODE_CAP,
-  MarkerCapacityError,
-} from '../src/marker/encode';
-import type {StrokeBucket} from '../src/model/strokes';
-import {
   addChild,
   createTree,
-  deleteSubtree,
   setCollapsed,
-  type NodeId,
   type Tree,
 } from '../src/model/tree';
 
 /**
- * Marker strokes are recognizable by pen color 0x9D (§6.4). The
- * phase-3 wire-up means every insert emits outlines + connectors +
- * several hundred marker bits; tests that care about the "primary"
- * emit list (outlines + connectors + preserved strokes) filter these
- * out with `nonMarkerInserts` before counting.
+ * Count-helper identity. The emit today is just outlines + connectors
+ * (marker strokes were removed with the edit/decode pipeline), so
+ * there is nothing to filter out — but tests downstream still talk in
+ * terms of "non-marker inserts", which is now synonymous with every
+ * inserted geometry.
  */
 function nonMarkerInserts(
   insertCalls: Array<[{penColor?: number; type?: string}]>,
 ): Array<[{penColor?: number; type?: string}]> {
-  return insertCalls.filter(
-    ([geometry]) =>
-      !(geometry.type === 'straightLine' && geometry.penColor === MARKER_PEN_COLOR),
-  );
+  return insertCalls;
 }
 
 type AnyMock = jest.Mock;
@@ -103,39 +120,50 @@ type InsertedGeometry = {
 };
 
 /**
- * Unified view over the emitted geometries, independent of which
- * firmware path insertMindmap actually used. The batched path
- * (PluginFileAPI.insertElements) wraps each geometry as
- * `{type: 700, geometry}` and passes the array in a single call;
- * the fallback path (PluginCommAPI.insertGeometry) calls once per
- * geometry. Returning an `Array<[InsertedGeometry]>` matches the
- * existing per-call shape that the rest of this suite was written
- * against.
- *
- * Tests that explicitly want to exercise one path or the other
- * should still assert on the underlying mock directly (e.g.
- * `expect(PluginFileAPI.insertElements).toHaveBeenCalledTimes(1)`).
- * `getInsertedGeometries` is for the many assertions that only
- * care about the geometry list's contents and order.
+ * View over the emitted geometries. insertMindmap now calls
+ * PluginFileAPI.replaceElements once with an array of Elements
+ * (each Element carries its geometry in `.geometry`). This helper
+ * walks the most recent replaceElements call, skips any pre-existing
+ * elements the mock returned from getElements, and yields a
+ * `[InsertedGeometry][]` shape that matches the legacy insertGeometry
+ * mock.calls shape so assertions elsewhere don't need to change.
  */
 function getInsertedGeometries(): Array<[InsertedGeometry]> {
-  const batchCalls = asMock(PluginFileAPI.insertElements).mock.calls;
-  if (batchCalls.length > 0) {
-    const out: Array<[InsertedGeometry]> = [];
-    for (const call of batchCalls) {
-      const elements = call[2] as Array<{geometry: InsertedGeometry}>;
-      for (const element of elements) {
-        out.push([element.geometry]);
-      }
-    }
-    return out;
+  const calls = asMock(PluginFileAPI.replaceElements).mock.calls;
+  if (calls.length === 0) {
+    return [];
   }
-  return asMock(PluginCommAPI.insertGeometry).mock.calls as Array<
-    [InsertedGeometry]
-  >;
+  const latest = calls[calls.length - 1];
+  const combined = latest[2] as Array<{geometry?: InsertedGeometry}>;
+  // Existing page elements fed in by the getElements mock land at the
+  // front of `combined`; our newly-minted elements sit at the tail.
+  // We drop any leading element whose `.geometry` is falsy — the
+  // mintElement factory initialises `.geometry` to null and
+  // insertMindmap overwrites it with the emitted Geometry, so every
+  // real insert has a truthy `.geometry`.
+  return combined
+    .filter(el => el?.geometry !== null && el?.geometry !== undefined)
+    .map(el => [el.geometry as InsertedGeometry]);
 }
 
 function resetMocks() {
+  // createElement mints a fresh native-like Element per call. Tests
+  // that want to observe all N elements should read
+  // replaceElements.mock.calls; this factory guarantees each Element
+  // carries a unique uuid so duplicate-detection assertions work.
+  let uuidCounter = 0;
+  asMock(PluginCommAPI.createElement).mockReset();
+  asMock(PluginCommAPI.createElement).mockImplementation(async () => ({
+    success: true,
+    result: {
+      uuid: `test-uuid-${uuidCounter++}`,
+      type: 700,
+      pageNum: 0,
+      layerNum: 0,
+      thickness: 0,
+      geometry: null,
+    },
+  }));
   asMock(PluginCommAPI.insertGeometry).mockClear();
   asMock(PluginCommAPI.insertGeometry).mockResolvedValue({success: true});
   asMock(PluginCommAPI.getCurrentFilePath).mockClear();
@@ -159,23 +187,16 @@ function resetMocks() {
     success: true,
     result: {width: 1404, height: 1872},
   });
-  asMock(PluginFileAPI.insertElements).mockClear();
-  asMock(PluginFileAPI.insertElements).mockResolvedValue({success: true});
+  asMock(PluginFileAPI.getElements).mockClear();
+  asMock(PluginFileAPI.getElements).mockResolvedValue({success: true, result: []});
+  asMock(PluginFileAPI.replaceElements).mockClear();
+  asMock(PluginFileAPI.replaceElements).mockResolvedValue({success: true});
+  asMock(PluginCommAPI.setLassoBoxState).mockClear();
+  asMock(PluginCommAPI.setLassoBoxState).mockResolvedValue({success: true});
+  asMock(PluginCommAPI.reloadFile).mockClear();
+  asMock(PluginCommAPI.reloadFile).mockResolvedValue({success: true});
   asMock(PluginManager.closePluginView).mockClear();
   asMock(PluginManager.closePluginView).mockResolvedValue(true);
-}
-
-/**
- * Force the fallback per-geometry insertGeometry path by making the
- * note-context resolution fall through to defaults. The fallback
- * path lets tests simulate mid-stream failures (resolves 2 inserts,
- * rejects the 3rd) that don't have a corresponding semantic in the
- * batched insertElements path.
- */
-function forceSequentialInsertPath(): void {
-  asMock(PluginCommAPI.getCurrentFilePath).mockResolvedValueOnce({
-    success: false,
-  });
 }
 
 beforeEach(() => {
@@ -206,119 +227,49 @@ describe('insertMindmap — happy path (§F-IN-1..F-IN-4)', () => {
     );
   });
 
-  it('batches every emitted geometry into a single insertElements call, then lassos, then closes', async () => {
+  it('replaceElements fires once with every emitted geometry, then reloads, then closes', async () => {
     const tree = buildSmallTree();
     await insertMindmap({tree});
 
-    // Fast path — a single PluginFileAPI.insertElements call carries
-    // every emitted geometry, wrapped as Element-typed records.
-    expect(PluginFileAPI.insertElements).toHaveBeenCalledTimes(1);
-    expect(PluginCommAPI.insertGeometry).not.toHaveBeenCalled();
-
-    const [notePath, page, elements] = asMock(PluginFileAPI.insertElements)
-      .mock.calls[0];
-    expect(notePath).toBe('/note/test.note');
-    expect(page).toBe(0);
-
-    // 4 outlines (root + 3 children) + 3 connectors = 7 non-marker;
-    // the balance is marker strokes (penColor 0x9D). Plus at least one
-    // marker stroke — the root-containing tree always produces some.
+    // 4 outlines (root + 3 children) + 3 connectors = 7 geometries
+    // total. No marker strokes — the marker / decode pipeline was
+    // removed along with edit-mode.
     const insertCalls = getInsertedGeometries();
-    expect(insertCalls.length).toBe(elements.length);
-    expect(nonMarkerInserts(insertCalls).length).toBe(7);
-    expect(insertCalls.length).toBeGreaterThan(7);
-    expect(PluginCommAPI.lassoElements).toHaveBeenCalledTimes(1);
+    expect(insertCalls.length).toBe(7);
+    expect(PluginFileAPI.replaceElements).toHaveBeenCalledTimes(1);
+    // setLassoBoxState(2) is only meaningful after an explicit lasso,
+    // which our flow never does — confirmed on device by APIError 904
+    // "No lasso action has been performed". The call is skipped.
+    expect(PluginCommAPI.setLassoBoxState).not.toHaveBeenCalled();
+    expect(PluginCommAPI.reloadFile).toHaveBeenCalledTimes(1);
     expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
 
-    // Order: lasso fires after insertElements, close fires after the
-    // lasso. Jest's mock.invocationCallOrder gives a global monotonic
-    // counter across all mocks so we can assert the relative sequence
-    // directly.
-    const insertOrder = asMock(PluginFileAPI.insertElements).mock
+    // Order: replaceElements → reloadFile → close.
+    const replaceOrder = asMock(PluginFileAPI.replaceElements).mock
       .invocationCallOrder[0];
-    const lassoOrder = asMock(PluginCommAPI.lassoElements).mock
+    const reloadOrder = asMock(PluginCommAPI.reloadFile).mock
       .invocationCallOrder[0];
     const closeOrder = asMock(PluginManager.closePluginView).mock
       .invocationCallOrder[0];
-
-    expect(lassoOrder).toBeGreaterThan(insertOrder);
-    expect(closeOrder).toBeGreaterThan(lassoOrder);
+    expect(reloadOrder).toBeGreaterThan(replaceOrder);
+    expect(closeOrder).toBeGreaterThan(reloadOrder);
   });
 
-  it('wraps every inserted geometry as an Element of TYPE_GEO (700)', async () => {
-    const tree = buildSmallTree();
-    await insertMindmap({tree});
-
-    const [, , elements] = asMock(PluginFileAPI.insertElements).mock.calls[0];
-    for (const element of elements) {
-      expect(element.type).toBe(700);
-      expect(element.geometry).toBeDefined();
-    }
-  });
-
-  it('strips showLassoAfterInsert from geometries sent to insertElements (§F-IN-3)', async () => {
-    // showLassoAfterInsert is a insertGeometry-only field; native
-    // insertElements rejects elements whose geometry sub-object contains
-    // it. wrapGeometryAsElement must omit it before the batched call.
+  it('passes showLassoAfterInsert:false through to every inserted geometry (§F-IN-3)', async () => {
+    // emitGeometries sets showLassoAfterInsert:false on every
+    // emitted geometry so the host doesn't auto-lasso anything in
+    // the batched write. Post-insert we explicitly clear the lasso
+    // with setLassoBoxState(2) to leave the pen in write mode.
     const tree = buildSmallTree();
     await insertMindmap({tree});
 
     const insertCalls = getInsertedGeometries();
     for (const [geometry] of insertCalls) {
-      expect(geometry.showLassoAfterInsert).toBeUndefined();
+      expect(geometry.showLassoAfterInsert).toBe(false);
     }
   });
 
-  it('lassos a rectangle that covers every inserted point', async () => {
-    const tree = buildSmallTree();
-    await insertMindmap({tree});
-
-    const [rect] = asMock(PluginCommAPI.lassoElements).mock.calls[0];
-    expect(rect).toEqual(
-      expect.objectContaining({
-        left: expect.any(Number),
-        top: expect.any(Number),
-        right: expect.any(Number),
-        bottom: expect.any(Number),
-      }),
-    );
-    expect(rect.right).toBeGreaterThan(rect.left);
-    expect(rect.bottom).toBeGreaterThan(rect.top);
-
-    // Every inserted geometry's extreme points lie within the lasso
-    // rect. Only points-based geometries are in v0.1's emit mix
-    // (outlines + connectors are polygons and straightLines), so the
-    // naive extend-from-points is correct.
-    const insertCalls = getInsertedGeometries();
-    for (const [geometry] of insertCalls) {
-      for (const p of geometry.points ?? []) {
-        expect(p.x).toBeGreaterThanOrEqual(rect.left - 1e-6);
-        expect(p.x).toBeLessThanOrEqual(rect.right + 1e-6);
-        expect(p.y).toBeGreaterThanOrEqual(rect.top - 1e-6);
-        expect(p.y).toBeLessThanOrEqual(rect.bottom + 1e-6);
-      }
-    }
-  });
-
-  it('rounds the lasso rect to integers so RectSchema.allowUnknown:false + integer validation passes', async () => {
-    // Regression guard for APIError(107) "must be an integer" from
-    // sn-plugin-lib's verifyParams on lassoElements. Upstream
-    // geometry (radial layout centers via Math.cos/Math.sin,
-    // roundedRectPoints corner arcs) is inherently fractional, so
-    // toLassoBounds must floor left/top and ceil right/bottom —
-    // otherwise the firmware surfaces "invalid parameters sent to
-    // the API" immediately after a successful insertElements.
-    const tree = buildSmallTree();
-    await insertMindmap({tree});
-
-    const [rect] = asMock(PluginCommAPI.lassoElements).mock.calls[0];
-    expect(Number.isInteger(rect.left)).toBe(true);
-    expect(Number.isInteger(rect.top)).toBe(true);
-    expect(Number.isInteger(rect.right)).toBe(true);
-    expect(Number.isInteger(rect.bottom)).toBe(true);
-  });
-
-  it('rounds every emitted geometry point to integers before insertElements (native firmware banner guard)', async () => {
+  it('rounds every emitted geometry point to integers before insertGeometry (native firmware banner guard)', async () => {
     // Regression guard for the native firmware toast
     //   "Invalid API parameters. Cannot call the API. Please check
     //    parameter validity!"
@@ -327,33 +278,11 @@ describe('insertMindmap — happy path (§F-IN-1..F-IN-4)', () => {
     // JS-side GeometrySchema does NOT enforce integer x/y (PointSchema
     // only checks `{x: number, y: number}`), so radial-layout fractional
     // coords pass JS validation but are rejected host-side. Rounding at
-    // the insertElements boundary (wrapGeometryAsElement) is required.
+    // the insertGeometry boundary (roundGeometryPoints) is required.
     const tree = buildSmallTree();
     await insertMindmap({tree});
 
     const insertCalls = getInsertedGeometries();
-    for (const [geometry] of insertCalls) {
-      for (const p of geometry.points ?? []) {
-        expect(Number.isInteger(p.x)).toBe(true);
-        expect(Number.isInteger(p.y)).toBe(true);
-      }
-    }
-  });
-
-  it('rounds every sequential-fallback geometry point to integers before insertGeometry', async () => {
-    // Same integer-coord guard on the fallback path. When the note
-    // context is unresolvable, insertMindmap calls
-    // PluginCommAPI.insertGeometry per geometry instead of the batched
-    // insertElements — the native firmware rejects fractional coords
-    // equally on both paths.
-    forceSequentialInsertPath();
-    const tree = buildSmallTree();
-    await insertMindmap({tree});
-
-    expect(PluginCommAPI.insertGeometry).toHaveBeenCalled();
-    const insertCalls = asMock(PluginCommAPI.insertGeometry).mock.calls as Array<
-      [InsertedGeometry]
-    >;
     for (const [geometry] of insertCalls) {
       for (const p of geometry.points ?? []) {
         expect(Number.isInteger(p.x)).toBe(true);
@@ -399,44 +328,35 @@ describe('insertMindmap — auto-expansion (§F-IN-2 / §8.6)', () => {
 });
 
 describe('insertMindmap — page-size fall-through (§F-IN-1)', () => {
-  it('uses defaults when getCurrentFilePath rejects, and falls back to per-geometry insertGeometry', async () => {
+  it('throws when getCurrentFilePath rejects (notePath required for replaceElements)', async () => {
+    // replaceElements needs an explicit notePath + page index; there is
+    // no implicit "current page" fallback. A note-context resolution
+    // failure is therefore terminal in the batched path — the UI layer
+    // surfaces the error banner and the user retries.
     asMock(PluginCommAPI.getCurrentFilePath).mockRejectedValueOnce(
       new Error('native bridge unavailable'),
     );
 
     const tree = createTree();
-    await insertMindmap({tree});
-
+    await expect(insertMindmap({tree})).rejects.toThrow(
+      /notePath\/page/,
+    );
     expect(PluginFileAPI.getPageSize).not.toHaveBeenCalled();
-    // No note context → batched insertElements path is skipped.
-    expect(PluginFileAPI.insertElements).not.toHaveBeenCalled();
-    expect(PluginCommAPI.insertGeometry).toHaveBeenCalled();
-    // Root center should land in the middle of the default page.
-    const [firstGeom] = getInsertedGeometries()[0];
-    const xs = (firstGeom.points ?? []).map((p: {x: number}) => p.x);
-    const ys = (firstGeom.points ?? []).map((p: {y: number}) => p.y);
-    const cx = (Math.min(...xs) + Math.max(...xs)) / 2;
-    const cy = (Math.min(...ys) + Math.max(...ys)) / 2;
-    expect(cx).toBeCloseTo(DEFAULT_PAGE_WIDTH / 2, 0);
-    expect(cy).toBeCloseTo(DEFAULT_PAGE_HEIGHT / 2, 0);
+    expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
   });
 
-  it('uses defaults when getPageSize returns success:false, and falls back to per-geometry insertGeometry', async () => {
+  it('throws when getPageSize returns success:false (notePath required)', async () => {
     asMock(PluginFileAPI.getPageSize).mockResolvedValueOnce({success: false});
 
     const tree = createTree();
-    await insertMindmap({tree});
-
+    await expect(insertMindmap({tree})).rejects.toThrow(
+      /notePath\/page/,
+    );
     expect(PluginFileAPI.getPageSize).toHaveBeenCalledTimes(1);
-    expect(PluginFileAPI.insertElements).not.toHaveBeenCalled();
-    expect(PluginCommAPI.insertGeometry).toHaveBeenCalled();
-    const [firstGeom] = getInsertedGeometries()[0];
-    const xs = (firstGeom.points ?? []).map((p: {x: number}) => p.x);
-    const cx = (Math.min(...xs) + Math.max(...xs)) / 2;
-    expect(cx).toBeCloseTo(DEFAULT_PAGE_WIDTH / 2, 0);
+    expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
   });
 
-  it('uses the returned page size when every step succeeds, and hits the batched insertElements path', async () => {
+  it('uses the returned page size when every step succeeds', async () => {
     asMock(PluginCommAPI.getCurrentFilePath).mockResolvedValueOnce({
       success: true,
       result: '/note/landscape.note',
@@ -457,12 +377,6 @@ describe('insertMindmap — page-size fall-through (§F-IN-1)', () => {
       '/note/landscape.note',
       5,
     );
-    // Batched path — insertElements targets the same note+page.
-    expect(PluginFileAPI.insertElements).toHaveBeenCalledTimes(1);
-    const [notePath, page] = asMock(PluginFileAPI.insertElements).mock
-      .calls[0];
-    expect(notePath).toBe('/note/landscape.note');
-    expect(page).toBe(5);
 
     const [firstGeom] = getInsertedGeometries()[0];
     const xs = (firstGeom.points ?? []).map((p: {x: number}) => p.x);
@@ -543,7 +457,7 @@ describe('insertMindmap — fit-to-page scaling (§F-LY-6)', () => {
     expect(Math.abs(height - 96 * expectedScale)).toBeLessThanOrEqual(1);
   });
 
-  it('centers the union rect on the page', async () => {
+  it('centers the emitted geometries on the page', async () => {
     const tree = createTree();
     for (let i = 0; i < 6; i += 1) {
       addChild(tree, 0);
@@ -551,553 +465,117 @@ describe('insertMindmap — fit-to-page scaling (§F-LY-6)', () => {
 
     await insertMindmap({tree});
 
-    const [rect] = asMock(PluginCommAPI.lassoElements).mock.calls[0];
-    const cx = (rect.left + rect.right) / 2;
-    const cy = (rect.top + rect.bottom) / 2;
+    // Walk every inserted geometry's points and derive their bbox;
+    // that bbox should sit centered on the page.
+    const insertCalls = getInsertedGeometries();
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const [geometry] of insertCalls) {
+      for (const p of geometry.points ?? []) {
+        if (p.x < minX) {
+          minX = p.x;
+        }
+        if (p.y < minY) {
+          minY = p.y;
+        }
+        if (p.x > maxX) {
+          maxX = p.x;
+        }
+        if (p.y > maxY) {
+          maxY = p.y;
+        }
+      }
+    }
+    const cx = (minX + maxX) / 2;
+    const cy = (minY + maxY) / 2;
     expect(cx).toBeCloseTo(DEFAULT_PAGE_WIDTH / 2, 0);
     expect(cy).toBeCloseTo(DEFAULT_PAGE_HEIGHT / 2, 0);
   });
 });
 
 describe('insertMindmap — error + cleanup (§F-IN-5)', () => {
-  it('re-raises a batched insertElements failure and does not call close', async () => {
-    asMock(PluginFileAPI.insertElements).mockResolvedValueOnce({
-      success: false,
-      error: {message: 'simulated: insertElements rejected batch'},
+  it('re-raises a createElement failure and does not touch the page', async () => {
+    // createElement failing mid-build aborts before replaceElements —
+    // no geometries land on the page, so no cleanup is needed.
+    let callCount = 0;
+    asMock(PluginCommAPI.createElement).mockImplementation(async () => {
+      callCount += 1;
+      if (callCount === 2) {
+        return {
+          success: false,
+          error: {message: 'simulated: createElement failed at index 1'},
+        };
+      }
+      return {
+        success: true,
+        result: {
+          uuid: `test-uuid-err-${callCount}`,
+          type: 700,
+          pageNum: 0,
+          layerNum: 0,
+          thickness: 0,
+          geometry: null,
+        },
+      };
     });
 
     const tree = buildSmallTree();
     await expect(insertMindmap({tree})).rejects.toThrow(
-      /insertElements rejected batch/,
+      /createElement failed at index 1/,
     );
-    expect(PluginManager.closePluginView).not.toHaveBeenCalled();
-    // Batched failure is all-or-nothing; nothing landed on the page so
-    // no cleanup lasso / delete should fire.
-    expect(PluginCommAPI.lassoElements).not.toHaveBeenCalled();
-    expect(PluginCommAPI.deleteLassoElements).not.toHaveBeenCalled();
-  });
-
-  it('re-raises the sequential insertGeometry error and does not call close (fallback path)', async () => {
-    forceSequentialInsertPath();
-    asMock(PluginCommAPI.insertGeometry)
-      .mockResolvedValueOnce({success: true})
-      .mockResolvedValueOnce({
-        success: false,
-        error: {message: 'simulated: insertGeometry failed at index 1'},
-      });
-
-    const tree = buildSmallTree();
-    await expect(insertMindmap({tree})).rejects.toThrow(
-      /insertGeometry failed at index 1/,
-    );
+    expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
     expect(PluginManager.closePluginView).not.toHaveBeenCalled();
   });
 
-  it('attempts cleanup via lasso + deleteLassoElements when some inserts succeeded (fallback path)', async () => {
-    forceSequentialInsertPath();
-    asMock(PluginCommAPI.insertGeometry)
-      .mockResolvedValueOnce({success: true})
-      .mockResolvedValueOnce({success: true})
-      .mockResolvedValueOnce({success: false, error: {message: 'boom'}});
-
-    const tree = buildSmallTree();
-    await expect(insertMindmap({tree})).rejects.toThrow(/boom/);
-
-    // One lasso call for cleanup (no final full-map lasso, since we
-    // never reached that step).
-    expect(PluginCommAPI.lassoElements).toHaveBeenCalledTimes(1);
-    expect(PluginCommAPI.deleteLassoElements).toHaveBeenCalledTimes(1);
-  });
-
-  it('skips cleanup when no geometries were inserted (fallback path)', async () => {
-    forceSequentialInsertPath();
-    asMock(PluginCommAPI.insertGeometry).mockResolvedValueOnce({
+  it('re-raises a getElements failure and does not touch the page', async () => {
+    asMock(PluginFileAPI.getElements).mockResolvedValueOnce({
       success: false,
-      error: {message: 'failed on first geometry'},
+      error: {message: 'simulated: getElements refused'},
     });
 
     const tree = buildSmallTree();
     await expect(insertMindmap({tree})).rejects.toThrow(
-      /failed on first geometry/,
+      /getElements refused/,
     );
-
-    expect(PluginCommAPI.lassoElements).not.toHaveBeenCalled();
-    expect(PluginCommAPI.deleteLassoElements).not.toHaveBeenCalled();
+    expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
+    expect(PluginManager.closePluginView).not.toHaveBeenCalled();
   });
 
-  it('swallows cleanup failures and still re-raises the original error (fallback path)', async () => {
-    forceSequentialInsertPath();
-    asMock(PluginCommAPI.insertGeometry)
-      .mockResolvedValueOnce({success: true})
-      .mockResolvedValueOnce({
-        success: false,
-        error: {message: 'primary error'},
-      });
-    asMock(PluginCommAPI.lassoElements).mockRejectedValueOnce(
-      new Error('cleanup lasso failed'),
-    );
-
-    const tree = buildSmallTree();
-    await expect(insertMindmap({tree})).rejects.toThrow(/primary error/);
-  });
-
-  it('re-raises a lassoElements failure at the end of a batched insert, and cleans up the whole batch', async () => {
-    asMock(PluginCommAPI.lassoElements)
-      // First call is the §F-IN-3 post-insert lasso; second call is
-      // the §F-IN-5 cleanup lasso, allowed to succeed so the cleanup
-      // path doesn't mask the original error.
-      .mockResolvedValueOnce({
-        success: false,
-        error: {message: 'lassoElements failed'},
-      })
-      .mockResolvedValueOnce({success: true});
+  it('re-raises a replaceElements failure atomically (no partial-insert cleanup needed)', async () => {
+    // replaceElements is all-or-nothing on the host side. On failure
+    // the page is unchanged — there is no partial-insert state to
+    // clean up, so lassoElements / deleteLassoElements are never
+    // called. closePluginView is skipped so the UI stays open and
+    // shows the error banner.
+    asMock(PluginFileAPI.replaceElements).mockResolvedValueOnce({
+      success: false,
+      error: {message: 'simulated: replaceElements rejected'},
+    });
 
     const tree = buildSmallTree();
     await expect(insertMindmap({tree})).rejects.toThrow(
-      /lassoElements failed/,
+      /replaceElements rejected/,
     );
     expect(PluginManager.closePluginView).not.toHaveBeenCalled();
-    // Cleanup ran because insertElements succeeded before the lasso
-    // step failed — the whole batch is on the page and needs to go.
-    expect(PluginCommAPI.deleteLassoElements).toHaveBeenCalledTimes(1);
-  });
-});
-
-describe('insertMindmap — marker capacity (§F-PE-4)', () => {
-  it('throws MarkerCapacityError before touching the page when tree exceeds the cap', async () => {
-    // MARKER_PUBLISHED_NODE_CAP + 1 nodes (root + cap-many children
-    // trips the ceiling by one).
-    const tree = createTree();
-    for (let i = 0; i < MARKER_PUBLISHED_NODE_CAP; i += 1) {
-      addChild(tree, tree.rootId);
-    }
-
-    let thrown: unknown;
-    try {
-      await insertMindmap({tree});
-    } catch (err) {
-      thrown = err;
-    }
-    expect(thrown).toBeInstanceOf(MarkerCapacityError);
-    if (thrown instanceof MarkerCapacityError) {
-      // N = 1 (root) + MARKER_PUBLISHED_NODE_CAP children.
-      expect(thrown.nodeCount).toBe(MARKER_PUBLISHED_NODE_CAP + 1);
-    }
-
-    // No geometry was ever inserted: emitGeometries throws before
-    // the insertion loop. No lasso, no cleanup, no plugin close.
-    expect(PluginCommAPI.insertGeometry).not.toHaveBeenCalled();
-    expect(PluginFileAPI.insertElements).not.toHaveBeenCalled();
     expect(PluginCommAPI.lassoElements).not.toHaveBeenCalled();
     expect(PluginCommAPI.deleteLassoElements).not.toHaveBeenCalled();
-    expect(PluginManager.closePluginView).not.toHaveBeenCalled();
   });
 
-  it('accepts a tree exactly at the published node cap', async () => {
-    // MARKER_PUBLISHED_NODE_CAP total nodes: root + (cap-1) children.
-    const tree = createTree();
-    for (let i = 0; i < MARKER_PUBLISHED_NODE_CAP - 1; i += 1) {
-      addChild(tree, tree.rootId);
-    }
+  it('completes even if reloadFile returns failure', async () => {
+    // reloadFile is post-write cosmetic housekeeping — the geometries
+    // are already committed on the page by the time it fires. A
+    // failure here does NOT roll back the insert; closePluginView
+    // still fires so the user sees the inserted result.
+    asMock(PluginCommAPI.reloadFile).mockResolvedValueOnce({
+      success: false,
+    });
 
+    const tree = buildSmallTree();
     await expect(insertMindmap({tree})).resolves.toBeUndefined();
-    const insertCalls = getInsertedGeometries();
-    // cap nodes × 1 outline + (cap-1) connectors = 2*cap - 1 non-marker.
-    expect(nonMarkerInserts(insertCalls).length).toBe(
-      2 * MARKER_PUBLISHED_NODE_CAP - 1,
-    );
-  });
-});
-
-describe('insertMindmap — Save round-trip (§F-ED-7)', () => {
-  /**
-   * Minimal stroke fixture at a known page-coord position. We use
-   * polylines (GEO_polygon / straightLine) because they carry a
-   * `points` array that makes before/after translation assertions
-   * direct: every point shifts by the same (dx, dy).
-   *
-   * penType=10 (Fineliner) satisfies the firmware allow-list; tests
-   * that filter by pen color use 0x00 (black) so a simple filter
-   * separates preserved strokes from the 0x9D marker bits.
-   */
-  function polyline(points: Array<{x: number; y: number}>): Geometry {
-    return {
-      type: 'GEO_polygon',
-      points,
-      penColor: 0x00,
-      penType: 10,
-      penWidth: 400,
-      showLassoAfterInsert: true,
-    };
-  }
-
-  /**
-   * Extract preserved-stroke inserts from the insertGeometry mock
-   * call log. Preserved strokes survive emit with their original
-   * `points` array translated by the move delta, so we can
-   * fingerprint them by their fixture's exact point count (2) —
-   * rectangular outlines are 5-point closed polygons, oval outlines
-   * sample at 64+ points, and marker strokes carry penColor 0x9D.
-   * A 2-point GEO_polygon with penColor != marker is always one of
-   * our preserved fixtures.
-   */
-  function preservedStrokeInserts(
-    insertCalls: Array<[InsertedGeometry]>,
-  ): Array<Array<{x: number; y: number}>> {
-    const out: Array<Array<{x: number; y: number}>> = [];
-    for (const [g] of insertCalls) {
-      if (g.type !== 'GEO_polygon' || g.penColor === MARKER_PEN_COLOR) {
-        continue;
-      }
-      const pts = g.points;
-      if (!pts || pts.length !== 2) {
-        continue;
-      }
-      out.push(pts);
-    }
-    return out;
-  }
-
-  /**
-   * Re-capture per-node page bboxes that insertMindmap just produced.
-   * Used by tests to assert that strokes landed at the expected
-   * post-edit page coordinates. We compute it the same way
-   * insertMindmap does: radialLayout + fit-to-page, so the numbers
-   * stay in sync with the orchestrator without poking at private
-   * helpers.
-   */
-  function postEditPageBboxes(tree: Tree): Map<NodeId, Rect> {
-    const base = radialLayout(tree);
-    const available = DEFAULT_PAGE_WIDTH - 2 * INSERT_MARGIN_PX;
-    const availableH = DEFAULT_PAGE_HEIGHT - 2 * INSERT_MARGIN_PX;
-    const scale = Math.min(
-      1,
-      available / Math.max(1, base.unionBbox.w),
-      availableH / Math.max(1, base.unionBbox.h),
-    );
-    const scaledU = {
-      x: base.unionBbox.x * scale,
-      y: base.unionBbox.y * scale,
-      w: base.unionBbox.w * scale,
-      h: base.unionBbox.h * scale,
-    };
-    const tx = DEFAULT_PAGE_WIDTH / 2 - (scaledU.x + scaledU.w / 2);
-    const ty = DEFAULT_PAGE_HEIGHT / 2 - (scaledU.y + scaledU.h / 2);
-    const out = new Map<NodeId, Rect>();
-    for (const [id, r] of base.bboxes) {
-      out.set(id, {
-        x: r.x * scale + tx,
-        y: r.y * scale + ty,
-        w: r.w * scale,
-        h: r.h * scale,
-      });
-    }
-    return out;
-  }
-
-  it('calls deleteLassoElements BEFORE the batched insertElements call when preEdit is present', async () => {
-    const tree = buildSmallTree();
-    const post = postEditPageBboxes(tree);
-    // Fabricate a matching pre-edit: identical bboxes (delta=0) so
-    // the "clears old mindmap" assertion doesn't depend on the
-    // delta math. Empty stroke bucket — this test is about
-    // ordering, not stroke translation.
-    const preEdit: PreEditContext = {
-      preEditPageBboxes: new Map(post),
-      strokesByNodePage: new Map(),
-    };
-
-    await insertMindmap({tree, preEdit});
-
-    expect(PluginCommAPI.deleteLassoElements).toHaveBeenCalledTimes(1);
-    const delOrder = asMock(PluginCommAPI.deleteLassoElements).mock
-      .invocationCallOrder[0];
-    const insertOrder = asMock(PluginFileAPI.insertElements).mock
-      .invocationCallOrder[0];
-    expect(insertOrder).toBeGreaterThan(delOrder);
-  });
-
-  it('does NOT call deleteLassoElements on first-insert (preEdit undefined)', async () => {
-    const tree = buildSmallTree();
-    await insertMindmap({tree});
-
-    // Successful first-insert: no pre-edit delete. The standard
-    // §F-IN-3 post-insert lasso still fires exactly once.
+    expect(PluginFileAPI.replaceElements).toHaveBeenCalledTimes(1);
+    expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
     expect(PluginCommAPI.deleteLassoElements).not.toHaveBeenCalled();
-    expect(PluginCommAPI.lassoElements).toHaveBeenCalledTimes(1);
-  });
-
-  it('aborts before any insert when deleteLassoElements fails', async () => {
-    asMock(PluginCommAPI.deleteLassoElements).mockResolvedValueOnce({
-      success: false,
-      error: {message: 'simulated: delete refused'},
-    });
-
-    const tree = buildSmallTree();
-    const post = postEditPageBboxes(tree);
-    const preEdit: PreEditContext = {
-      preEditPageBboxes: new Map(post),
-      strokesByNodePage: new Map(),
-    };
-
-    await expect(insertMindmap({tree, preEdit})).rejects.toThrow(
-      /delete refused/,
-    );
-
-    // No geometry was ever inserted and no cleanup lasso was needed
-    // — the old mindmap is still on the page intact.
-    expect(PluginCommAPI.insertGeometry).not.toHaveBeenCalled();
-    expect(PluginFileAPI.insertElements).not.toHaveBeenCalled();
-    expect(PluginCommAPI.lassoElements).not.toHaveBeenCalled();
-    expect(PluginManager.closePluginView).not.toHaveBeenCalled();
-  });
-
-  it('translates a preserved stroke by the node move delta', async () => {
-    // Pre-edit: root at an offset 100px right and 50px down from
-    // where radialLayout would place it on a fresh page. Post-edit
-    // layout lands at the centered page position. Move delta =
-    // post − pre, applied to every stroke point.
-    const tree = buildSmallTree();
-    const post = postEditPageBboxes(tree);
-    const rootPost = post.get(tree.rootId);
-    if (!rootPost) {
-      throw new Error('test bug: root missing from post-edit bboxes');
-    }
-    const rootPre: Rect = {
-      x: rootPost.x + 100,
-      y: rootPost.y + 50,
-      w: rootPost.w,
-      h: rootPost.h,
-    };
-    // A single 2-point polyline on the root, in PRE-edit page coords
-    // — points relative to the pre-edit bbox position. Expected
-    // post-edit points are shifted by (post − pre) = (−100, −50).
-    const strokeP1 = {x: rootPre.x + 10, y: rootPre.y + 20};
-    const strokeP2 = {x: rootPre.x + 30, y: rootPre.y + 40};
-    const strokesByNodePage: StrokeBucket = new Map();
-    strokesByNodePage.set(tree.rootId, [polyline([strokeP1, strokeP2])]);
-
-    const preEditPageBboxes = new Map<NodeId, Rect>();
-    // Only the root carries a preserved stroke for this test; other
-    // nodes can have identical pre/post bboxes (delta=0) since no
-    // strokes are keyed on them.
-    for (const [id, bb] of post) {
-      preEditPageBboxes.set(id, id === tree.rootId ? rootPre : bb);
-    }
-
-    await insertMindmap({
-      tree,
-      preEdit: {preEditPageBboxes, strokesByNodePage},
-    });
-
-    // The bucketed stroke reached emitGeometries and was inserted.
-    const preservedPointLists = preservedStrokeInserts(
-      getInsertedGeometries(),
-    );
-    expect(preservedPointLists).toHaveLength(1);
-    const [pts] = preservedPointLists;
-    expect(pts).toEqual([
-      {x: strokeP1.x - 100, y: strokeP1.y - 50},
-      {x: strokeP2.x - 100, y: strokeP2.y - 50},
-    ]);
-    // And these coincide with (rootPost.x + 10, rootPost.y + 20) etc.
-    expect(pts[0]).toEqual({x: rootPost.x + 10, y: rootPost.y + 20});
-    expect(pts[1]).toEqual({x: rootPost.x + 30, y: rootPost.y + 40});
-  });
-
-  it('drops strokes for nodes that were deleted during the edit session', async () => {
-    // Build a tree with one child, run the delete via deleteSubtree
-    // so the post-edit tree only has the root. The pre-edit bbox
-    // map still includes the child (that's the "pre-edit"
-    // snapshot), and its stroke bucket should be silently dropped —
-    // no throw, no emit.
-    const tree = createTree();
-    const childId = addChild(tree, tree.rootId);
-    // Pre-edit: both the root and the (still-present) child had
-    // page bboxes at known locations.
-    const preEditPageBboxes = new Map<NodeId, Rect>([
-      [tree.rootId, {x: 700, y: 900, w: 220, h: 96}],
-      [childId, {x: 1000, y: 900, w: 220, h: 96}],
-    ]);
-    const strokesByNodePage: StrokeBucket = new Map();
-    strokesByNodePage.set(childId, [
-      polyline([
-        {x: 1010, y: 910},
-        {x: 1050, y: 950},
-      ]),
-    ]);
-    // Now delete the child — post-edit tree has root only.
-    deleteSubtree(tree, childId);
-    expect(tree.nodesById.has(childId)).toBe(false); // sanity
-
-    await insertMindmap({
-      tree,
-      preEdit: {preEditPageBboxes, strokesByNodePage},
-    });
-
-    // The child's stroke was dropped because the child no longer
-    // exists in the post-edit tree. No preserved strokes reached
-    // emitGeometries.
-    const preservedPointLists = preservedStrokeInserts(
-      getInsertedGeometries(),
-    );
-    expect(preservedPointLists).toHaveLength(0);
-  });
-
-  it('drops strokes when the pre-edit bbox map is missing a node (defensive)', async () => {
-    // Associator/decoder mismatch: a stroke is bucketed on a node
-    // id that isn't in the pre-edit bbox map. We can't compute a
-    // move delta without a pre bbox, so the bucket must be dropped
-    // silently rather than crashing the whole Save.
-    const tree = buildSmallTree();
-    const post = postEditPageBboxes(tree);
-    // Deliberately empty pre-edit bbox map.
-    const preEditPageBboxes = new Map<NodeId, Rect>();
-    const strokesByNodePage: StrokeBucket = new Map();
-    strokesByNodePage.set(tree.rootId, [
-      polyline([
-        {x: 500, y: 500},
-        {x: 550, y: 550},
-      ]),
-    ]);
-
-    await expect(
-      insertMindmap({
-        tree,
-        preEdit: {preEditPageBboxes, strokesByNodePage},
-      }),
-    ).resolves.toBeUndefined();
-
-    const insertCalls = getInsertedGeometries();
-    const preservedPointLists = preservedStrokeInserts(insertCalls);
-    expect(preservedPointLists).toHaveLength(0);
-    // Delete still happened, even though no strokes were preserved.
-    expect(PluginCommAPI.deleteLassoElements).toHaveBeenCalledTimes(1);
-    // Sanity: non-preserved emits (outlines + connectors + marker)
-    // still went through for the new map.
-    expect(post.size).toBe(4); // buildSmallTree: root + 3 children
-    expect(nonMarkerInserts(insertCalls).length).toBe(7);
-  });
-
-  it('cleanup path still runs when preEdit is present and insert fails mid-stream (fallback path)', async () => {
-    // After the pre-edit delete succeeds, simulate an insertGeometry
-    // failure partway through. §F-IN-5 cleanup should still run
-    // (lasso + delete on the partial emit), re-raising the original
-    // insert error. The pre-edit delete has already fired and is
-    // counted separately from the cleanup delete.
-    //
-    // Mid-stream failure only has a meaning on the sequential
-    // insertGeometry fallback — the batched insertElements call is
-    // all-or-nothing. forceSequentialInsertPath() drives the
-    // orchestrator into the per-geometry loop so this scenario can
-    // be exercised.
-    forceSequentialInsertPath();
-    asMock(PluginCommAPI.insertGeometry)
-      .mockResolvedValueOnce({success: true})
-      .mockResolvedValueOnce({success: true})
-      .mockResolvedValueOnce({
-        success: false,
-        error: {message: 'simulated: insert failed mid-stream'},
-      });
-
-    const tree = buildSmallTree();
-    const post = postEditPageBboxes(tree);
-    const preEdit: PreEditContext = {
-      preEditPageBboxes: new Map(post),
-      strokesByNodePage: new Map(),
-    };
-
-    await expect(insertMindmap({tree, preEdit})).rejects.toThrow(
-      /insert failed mid-stream/,
-    );
-
-    // Two deletes total: one for the pre-edit mindmap (step 0), one
-    // for the §F-IN-5 cleanup of the partial new emit.
-    expect(PluginCommAPI.deleteLassoElements).toHaveBeenCalledTimes(2);
-    // Cleanup lasso ran (and it's the only lasso — the final
-    // §F-IN-3 auto-lasso is skipped on failure).
-    expect(PluginCommAPI.lassoElements).toHaveBeenCalledTimes(1);
-    expect(PluginManager.closePluginView).not.toHaveBeenCalled();
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Coverage gap: roundGeometryPoints for GEO_circle / GEO_ellipse
-// The production emitGeometries doesn't emit circles/ellipses today,
-// but preserved strokes can carry any geometry type. Passing one via
-// strokesByNodePage exercises the circle/ellipse arm of
-// roundGeometryPoints (§F-IN-3 firmware integer requirement).
-// ---------------------------------------------------------------------------
-
-describe('insertMindmap — circle/ellipse rounding (roundGeometryPoints §F-IN-3)', () => {
-  it('rounds GEO_circle ellipseCenterPoint to integers when inserted', async () => {
-    const tree = buildSmallTree();
-    const base = radialLayout(tree);
-    const available = DEFAULT_PAGE_WIDTH - 2 * INSERT_MARGIN_PX;
-    const availableH = DEFAULT_PAGE_HEIGHT - 2 * INSERT_MARGIN_PX;
-    const scale = Math.min(
-      1,
-      available / Math.max(1, base.unionBbox.w),
-      availableH / Math.max(1, base.unionBbox.h),
-    );
-    const tx =
-      DEFAULT_PAGE_WIDTH / 2 -
-      (base.unionBbox.x * scale + (base.unionBbox.w * scale) / 2);
-    const ty =
-      DEFAULT_PAGE_HEIGHT / 2 -
-      (base.unionBbox.y * scale + (base.unionBbox.h * scale) / 2);
-    // Compute the root's post-edit page bbox so we can build a
-    // matching pre-edit bbox for the delta = 0 case.
-    const rootLayoutBbox = base.bboxes.get(tree.rootId)!;
-    const rootPostBbox: Rect = {
-      x: rootLayoutBbox.x * scale + tx,
-      y: rootLayoutBbox.y * scale + ty,
-      w: rootLayoutBbox.w * scale,
-      h: rootLayoutBbox.h * scale,
-    };
-
-    // Place a GEO_circle preserved stroke on the root with a
-    // fractional center so the rounding is observable.
-    const circleStroke: Geometry = {
-      type: 'GEO_circle',
-      // Fractional coords — must be rounded to nearest integer on insert.
-      ellipseCenterPoint: {x: rootPostBbox.x + 10.7, y: rootPostBbox.y + 20.3},
-      ellipseMajorAxisRadius: 15,
-      ellipseMinorAxisRadius: 15,
-      ellipseAngle: 0,
-      penColor: 0x00,
-      penType: 10,
-      penWidth: 400,
-    };
-
-    const strokesByNodePage = new Map([[tree.rootId, [circleStroke]]]);
-    const preEditPageBboxes = new Map<NodeId, Rect>();
-    for (const [id, bb] of base.bboxes) {
-      preEditPageBboxes.set(id, {
-        x: bb.x * scale + tx,
-        y: bb.y * scale + ty,
-        w: bb.w * scale,
-        h: bb.h * scale,
-      });
-    }
-
-    await insertMindmap({
-      tree,
-      preEdit: {preEditPageBboxes, strokesByNodePage},
-    });
-
-    // Find the inserted GEO_circle among the inserted geometries.
-    const allInserts = getInsertedGeometries();
-    const circleInserts = allInserts
-      .map(([g]) => g)
-      .filter(g => g.type === 'GEO_circle');
-    expect(circleInserts.length).toBeGreaterThan(0);
-    const inserted = circleInserts[0] as {
-      ellipseCenterPoint?: {x: number; y: number};
-    };
-    expect(inserted.ellipseCenterPoint).toBeDefined();
-    // Both coords must be exact integers after rounding.
-    expect(Number.isInteger(inserted.ellipseCenterPoint!.x)).toBe(true);
-    expect(Number.isInteger(inserted.ellipseCenterPoint!.y)).toBe(true);
   });
 });

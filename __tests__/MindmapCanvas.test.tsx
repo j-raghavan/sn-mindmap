@@ -34,84 +34,92 @@ import {create, act} from 'react-test-renderer';
 // the PluginCommAPI / PluginFileAPI surface that Phase 2.2's insert
 // pipeline dips into. Default mock responses succeed; individual
 // tests override them when exercising error paths.
-jest.mock('sn-plugin-lib', () => ({
-  PluginManager: {
-    closePluginView: jest.fn().mockResolvedValue(true),
-  },
-  PluginCommAPI: {
-    insertGeometry: jest.fn().mockResolvedValue({success: true}),
-    getCurrentFilePath: jest
-      .fn()
-      .mockResolvedValue({success: true, result: '/note/test.note'}),
-    getCurrentPageNum: jest
-      .fn()
-      .mockResolvedValue({success: true, result: 0}),
-    lassoElements: jest.fn().mockResolvedValue({success: true}),
-    deleteLassoElements: jest.fn().mockResolvedValue({success: true}),
-  },
-  PluginFileAPI: {
-    getPageSize: jest
-      .fn()
-      .mockResolvedValue({success: true, result: {width: 1404, height: 1872}}),
-    // Batched insert path — insertMindmap prefers PluginFileAPI.insertElements
-    // when the note context resolves cleanly (default mocks above return
-    // success). Sequential insertGeometry is only used in the fallback
-    // path forced by rejecting getCurrentFilePath.
-    insertElements: jest.fn().mockResolvedValue({success: true}),
-  },
-}));
+jest.mock('sn-plugin-lib', () => {
+  let uuidCounter = 0;
+  const mintElement = () => ({
+    uuid: `canvas-uuid-${uuidCounter++}`,
+    type: 700,
+    pageNum: 0,
+    layerNum: 0,
+    thickness: 0,
+    geometry: null as unknown,
+  });
+  return {
+    Element: {TYPE_GEO: 700},
+    PluginManager: {
+      closePluginView: jest.fn().mockResolvedValue(true),
+    },
+    PluginCommAPI: {
+      createElement: jest
+        .fn()
+        .mockImplementation(async () => ({success: true, result: mintElement()})),
+      insertGeometry: jest.fn().mockResolvedValue({success: true}),
+      getCurrentFilePath: jest
+        .fn()
+        .mockResolvedValue({success: true, result: '/note/test.note'}),
+      getCurrentPageNum: jest
+        .fn()
+        .mockResolvedValue({success: true, result: 0}),
+      lassoElements: jest.fn().mockResolvedValue({success: true}),
+      deleteLassoElements: jest.fn().mockResolvedValue({success: true}),
+      setLassoBoxState: jest.fn().mockResolvedValue({success: true}),
+      reloadFile: jest.fn().mockResolvedValue({success: true}),
+    },
+    PluginFileAPI: {
+      getPageSize: jest
+        .fn()
+        .mockResolvedValue({success: true, result: {width: 1404, height: 1872}}),
+      getElements: jest.fn().mockResolvedValue({success: true, result: []}),
+      replaceElements: jest.fn().mockResolvedValue({success: true}),
+    },
+  };
+});
 
 import MindmapCanvas from '../src/MindmapCanvas';
 import {PluginCommAPI, PluginFileAPI, PluginManager} from 'sn-plugin-lib';
-import {MARKER_PEN_COLOR} from '../src/marker/encode';
 import {addChild, addSibling, createTree} from '../src/model/tree';
 
 /**
- * Collect the geometries that insertMindmap emitted, independent of
- * the firmware path used. The batched path (PluginFileAPI.insertElements)
- * wraps each geometry as `{type:700, geometry}` and submits the array
- * in a single call; the sequential fallback (PluginCommAPI.insertGeometry)
- * calls once per geometry. This helper normalizes both shapes to a
- * single flat list of geometries so count / filter assertions stay
- * path-agnostic.
+ * Collect the geometries that insertMindmap emitted. The current
+ * insert path bundles every geometry into a single replaceElements
+ * call (one Element per geometry, with the geometry hanging off the
+ * `.geometry` field). Walk the most recent replaceElements call, skip
+ * any pre-existing page elements fed in by the getElements mock, and
+ * yield the geometry list the rest of this file was already written
+ * against.
  */
 function collectInsertedGeometries(): Array<{
   type?: string;
   penColor?: number;
 }> {
-  const batchCalls = (PluginFileAPI.insertElements as jest.Mock).mock.calls;
-  if (batchCalls.length > 0) {
-    const out: Array<{type?: string; penColor?: number}> = [];
-    for (const call of batchCalls) {
-      const elements = call[2] as Array<{geometry: {type?: string; penColor?: number}}>;
-      for (const element of elements) {
-        out.push(element.geometry);
-      }
-    }
-    return out;
+  const calls = (PluginFileAPI.replaceElements as jest.Mock).mock.calls;
+  if (calls.length === 0) {
+    return [];
   }
-  return (PluginCommAPI.insertGeometry as jest.Mock).mock.calls.map(
-    ([geometry]) => geometry,
-  );
+  const latest = calls[calls.length - 1];
+  const combined = latest[2] as Array<{
+    geometry?: {type?: string; penColor?: number} | null;
+  }>;
+  // Existing page elements land at the front of `combined`; our
+  // newly-minted Elements sit at the tail. mintElement() initialises
+  // `.geometry` to null and insertMindmap overwrites it with the
+  // emitted Geometry, so every real insert has a truthy `.geometry`.
+  const out: Array<{type?: string; penColor?: number}> = [];
+  for (const el of combined) {
+    if (el?.geometry) {
+      out.push(el.geometry);
+    }
+  }
+  return out;
 }
 
 /**
- * Filter inserted geometries down to the "primary" emit mix
- * (outlines + connectors + preserved strokes). Marker strokes share
- * the straightLine type but carry pen color 0x9D (§6.4); every insert
- * produces several hundred of them, so assertions that care about the
- * structural geometry count filter them out. Path-agnostic: works
- * with both the batched insertElements and sequential insertGeometry
- * mocks.
+ * Count every inserted geometry. Marker strokes were removed along
+ * with the edit/decode pipeline, so there's no pen-color filter to
+ * apply — the emit today is just outlines + connectors.
  */
 function nonMarkerInsertCount(): number {
-  return collectInsertedGeometries().filter(
-    geometry =>
-      !(
-        geometry?.type === 'straightLine' &&
-        geometry?.penColor === MARKER_PEN_COLOR
-      ),
-  ).length;
+  return collectInsertedGeometries().length;
 }
 
 
@@ -729,11 +737,12 @@ describe('MindmapCanvas', () => {
   describe('Phase 2.2 — Insert button wires to insertMindmap (§F-IN-*)', () => {
     beforeEach(() => {
       (PluginCommAPI.insertGeometry as jest.Mock).mockClear();
-      (PluginCommAPI.insertGeometry as jest.Mock).mockResolvedValue({
+      (PluginFileAPI.replaceElements as jest.Mock).mockClear();
+      (PluginFileAPI.replaceElements as jest.Mock).mockResolvedValue({
         success: true,
       });
-      (PluginFileAPI.insertElements as jest.Mock).mockClear();
-      (PluginFileAPI.insertElements as jest.Mock).mockResolvedValue({
+      (PluginCommAPI.createElement as jest.Mock).mockClear();
+      (PluginCommAPI.insertGeometry as jest.Mock).mockResolvedValue({
         success: true,
       });
       (PluginCommAPI.lassoElements as jest.Mock).mockClear();
@@ -771,18 +780,19 @@ describe('MindmapCanvas', () => {
         await flushPromises();
       });
 
-      // 2 outlines + 1 connector = 3 non-marker geometries, then a
-      // single lasso and a single close. Marker bits (§6.4, penColor
-      // 0x9D) are emitted alongside but filtered out of this count
-      // so the assertion stays stable if the marker payload shifts.
+      // 2 outlines + 1 connector = 3 geometries, one batched
+      // replaceElements, then setLassoBoxState + reloadFile + close.
+      // (Marker strokes were removed with the edit/decode pipeline.)
       expect(nonMarkerInsertCount()).toBe(3);
-      expect(PluginCommAPI.lassoElements).toHaveBeenCalledTimes(1);
+      expect(PluginFileAPI.replaceElements).toHaveBeenCalledTimes(1);
       expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
       unmount();
     });
 
     it('shows an error banner when insert fails and keeps the plugin view open', async () => {
-      (PluginFileAPI.insertElements as jest.Mock).mockResolvedValueOnce({
+      // replaceElements rejecting causes insertMindmap to throw
+      // before closePluginView fires.
+      (PluginFileAPI.replaceElements as jest.Mock).mockResolvedValueOnce({
         success: false,
         error: {message: 'simulated insert failure'},
       });
@@ -803,9 +813,8 @@ describe('MindmapCanvas', () => {
     });
 
     it('debounces rapid double-taps so only one insert runs at a time', async () => {
-      // Make the batched insertElements slow enough that a second tap
-      // can land while the first is still in flight. Using a promise
-      // we resolve manually to avoid timing flake.
+      // Gate replaceElements on a promise we resolve manually so a
+      // second tap can land while the first insert is still in flight.
       // TS's flow analysis can't see that the Promise executor fires
       // synchronously, so we initialize resolveFirst with a no-op and
       // reassign inside the executor to keep the type `() => void`.
@@ -813,7 +822,7 @@ describe('MindmapCanvas', () => {
       const firstPending = new Promise<void>(r => {
         resolveFirst = r;
       });
-      (PluginFileAPI.insertElements as jest.Mock).mockImplementationOnce(
+      (PluginFileAPI.replaceElements as jest.Mock).mockImplementationOnce(
         async () => {
           await firstPending;
           return {success: true};
@@ -833,1238 +842,13 @@ describe('MindmapCanvas', () => {
         await flushPromises();
       });
 
-      // At this point insertElements has been called exactly once —
-      // the second tap was debounced via insertingRef.
-      expect(PluginFileAPI.insertElements).toHaveBeenCalledTimes(1);
+      // replaceElements was called exactly once — the second tap was
+      // debounced via insertingRef.
+      expect(PluginFileAPI.replaceElements).toHaveBeenCalledTimes(1);
 
       // Let the first insert complete cleanly.
       resolveFirst();
       await flushAsync();
-      unmount();
-    });
-  });
-
-  describe('Phase 4.3 — isEditMode top-bar gating', () => {
-    // Until §F-ED-7 Save lands (Phase 4.5), edit-mode is Cancel-only.
-    // These tests lock in that contract so Phase 4.4/4.5 edits can't
-    // regress it without a visible test churn.
-
-    it('hides the Insert button when isEditMode=true', () => {
-      const {renderer, unmount} = renderCanvas(
-        <MindmapCanvas isEditMode />,
-      );
-      const insertBtns = renderer.root.findAllByProps({
-        accessibilityLabel: 'Insert',
-      });
-      expect(insertBtns.length).toBe(0);
-      unmount();
-    });
-
-    it('still renders the Cancel button when isEditMode=true', () => {
-      const {renderer, unmount} = renderCanvas(
-        <MindmapCanvas isEditMode />,
-      );
-      const cancelBtns = renderer.root.findAllByProps({
-        accessibilityLabel: 'Cancel',
-      });
-      // One Pressable is registered with the accessibilityLabel; the
-      // host View underneath forwards the prop so the host layer
-      // surfaces it too. Either way the user-facing affordance must
-      // be present.
-      expect(cancelBtns.length).toBeGreaterThan(0);
-      unmount();
-    });
-
-    it('still renders the Clear button when isEditMode=true', () => {
-      // Clear is topology-only ("reset to fresh root") and remains
-      // useful in edit mode for "start this edit over". Phase 4.5
-      // revisits whether Clear should also be gated; for now it is
-      // explicitly allowed.
-      const {renderer, unmount} = renderCanvas(
-        <MindmapCanvas isEditMode />,
-      );
-      const clearBtns = renderer.root.findAllByProps({
-        accessibilityLabel: 'Clear',
-      });
-      expect(clearBtns.length).toBeGreaterThan(0);
-      unmount();
-    });
-
-    it('shows the Insert button when isEditMode is omitted (authoring default)', () => {
-      // Regression guard: isEditMode defaults to false, so the
-      // authoring canvas is unaffected by this new prop.
-      const {renderer, unmount} = renderCanvas(<MindmapCanvas />);
-      const insertBtns = renderer.root.findAllByProps({
-        accessibilityLabel: 'Insert',
-      });
-      expect(insertBtns.length).toBeGreaterThan(0);
-      unmount();
-    });
-
-    it('does not call insertGeometry when isEditMode=true (Insert is unreachable)', async () => {
-      (PluginCommAPI.insertGeometry as jest.Mock).mockClear();
-      const {unmount} = renderCanvas(<MindmapCanvas isEditMode />);
-      await flushAsync();
-      expect(PluginCommAPI.insertGeometry).not.toHaveBeenCalled();
-      unmount();
-    });
-  });
-
-  describe('Phase 4.4 — preserved-stroke rendering (§F-ED-6)', () => {
-    // These tests lock in the read-only label-stroke rendering path.
-    // Preserved strokes come in bucketed per-node in NODE-LOCAL coords
-    // (offset from each node's pre-edit page bbox top-left, per the
-    // EditMindmap-side projection); the canvas must render them
-    // anchored to each node's CURRENT radial-layout bbox so strokes
-    // follow the node as the user edits topology.
-
-    // A minimal pen-style fixture — the sn-plugin-lib firmware allow
-    // list expects penType=10 (Fineliner) in emissions, but Phase 4.4
-    // read-only rendering doesn't touch penType; any numeric value
-    // is fine for these tests.
-    const PEN = {penColor: 0x00, penType: 10, penWidth: 400} as const;
-
-    it('renders polyline stroke segments with accessibilityLabel tagged by node id', () => {
-      // Root-only tree → one visible node. A 3-point polyline becomes
-      // 2 segments. The accessibility label lets us count segments
-      // per node without reading into style math.
-      const tree = createTree();
-      const strokes = new Map<number, Array<unknown>>();
-      strokes.set(tree.rootId, [
-        {
-          type: 'GEO_polygon',
-          points: [
-            {x: 5, y: 10},
-            {x: 15, y: 10},
-            {x: 25, y: 20},
-          ],
-          ...PEN,
-        },
-      ]);
-      const {renderer, unmount} = renderCanvas(
-        <MindmapCanvas
-          initialTree={tree}
-          isEditMode
-          initialPreservedStrokes={strokes as never}
-        />,
-      );
-      const segments = findHostByLabel(
-        renderer,
-        `preserved-stroke-node-${tree.rootId}`,
-      );
-      expect(segments).toHaveLength(2);
-      unmount();
-    });
-
-    it('anchors polyline stroke to the node\'s current bbox (left/top derived from layout)', () => {
-      // Single-segment polyline on the root. We can reason about the
-      // expected stage-coord position analytically: bbox top-left -
-      // origin + midX - length/2 for the segment.
-      const tree = createTree();
-      const from = {x: 10, y: 20};
-      const to = {x: 60, y: 20};
-      const strokes = new Map<number, Array<unknown>>();
-      strokes.set(tree.rootId, [
-        {type: 'GEO_polygon', points: [from, to], ...PEN},
-      ]);
-      const {renderer, unmount} = renderCanvas(
-        <MindmapCanvas
-          initialTree={tree}
-          isEditMode
-          initialPreservedStrokes={strokes as never}
-        />,
-      );
-      const segments = findHostByLabel(
-        renderer,
-        `preserved-stroke-node-${tree.rootId}`,
-      );
-      expect(segments).toHaveLength(1);
-      const style = flattenStyle(segments[0].props.style);
-      // length = 50, thickness = penWidth * 1/40 (10 px). midX=35,
-      // midY=20. Stage offset for the root depends on the union bbox
-      // — the root is centered on (0,0) so its bbox top-left is
-      // (-NODE_WIDTH/2, -NODE_HEIGHT/2), and that also equals the
-      // stage origin (unionBbox = rootBbox for a lone root), so
-      // bbox.x - origin.x = 0 and bbox.y - origin.y = 0. The segment
-      // renders at (midX - length/2, midY - thickness/2) = (10, 15).
-      expect(style.width).toBe(50);
-      expect(style.left).toBe(10);
-      // thickness = max(2, 400/40) = 10, so top = 20 - 5 = 15.
-      expect(style.top).toBe(15);
-      expect(style.height).toBe(10);
-      unmount();
-    });
-
-    it('renders ellipse stroke as a single bordered View', () => {
-      const tree = createTree();
-      const strokes = new Map<number, Array<unknown>>();
-      strokes.set(tree.rootId, [
-        {
-          type: 'GEO_ellipse',
-          ellipseCenterPoint: {x: 40, y: 30},
-          ellipseMajorAxisRadius: 20,
-          ellipseMinorAxisRadius: 12,
-          ellipseAngle: 0,
-          ...PEN,
-        },
-      ]);
-      const {renderer, unmount} = renderCanvas(
-        <MindmapCanvas
-          initialTree={tree}
-          isEditMode
-          initialPreservedStrokes={strokes as never}
-        />,
-      );
-      const hits = findHostByLabel(
-        renderer,
-        `preserved-stroke-node-${tree.rootId}`,
-      );
-      // Single ellipse → exactly one labeled host View (no per-segment
-      // breakdown like the polyline case).
-      expect(hits).toHaveLength(1);
-      const style = flattenStyle(hits[0].props.style);
-      expect(style.width).toBe(40);
-      expect(style.height).toBe(24);
-      // borderRadius = min(rx, ry) so an oval has rounded ends.
-      expect(style.borderRadius).toBe(12);
-      unmount();
-    });
-
-    it('renders each bucket\'s strokes against that bucket\'s node bbox', () => {
-      // Two-node tree: root + one child. Each node gets its own stroke
-      // with distinguishable pen widths; we assert each stroke's label
-      // resolves to exactly the node we stashed it on.
-      const tree = createTree();
-      addChild(tree, tree.rootId);
-      const childId = tree.nodesById.get(tree.rootId)!.childIds[0];
-      const strokes = new Map<number, Array<unknown>>();
-      strokes.set(tree.rootId, [
-        {
-          type: 'GEO_polygon',
-          points: [
-            {x: 0, y: 0},
-            {x: 10, y: 0},
-          ],
-          ...PEN,
-        },
-      ]);
-      strokes.set(childId, [
-        {
-          type: 'GEO_polygon',
-          points: [
-            {x: 0, y: 0},
-            {x: 5, y: 5},
-          ],
-          penColor: 0x00,
-          penType: 10,
-          // Different pen width so we can distinguish root-stroke vs
-          // child-stroke host Views by height (thickness).
-          penWidth: 800,
-        },
-      ]);
-      const {renderer, unmount} = renderCanvas(
-        <MindmapCanvas
-          initialTree={tree}
-          isEditMode
-          initialPreservedStrokes={strokes as never}
-        />,
-      );
-      const rootSegs = findHostByLabel(
-        renderer,
-        `preserved-stroke-node-${tree.rootId}`,
-      );
-      const childSegs = findHostByLabel(
-        renderer,
-        `preserved-stroke-node-${childId}`,
-      );
-      expect(rootSegs).toHaveLength(1);
-      expect(childSegs).toHaveLength(1);
-      // thickness = penWidth/40 clamped to MIN_STROKE_PX=2. Root:
-      // 400/40 = 10. Child: 800/40 = 20.
-      expect(flattenStyle(rootSegs[0].props.style).height).toBe(10);
-      expect(flattenStyle(childSegs[0].props.style).height).toBe(20);
-      unmount();
-    });
-
-    it('strokes follow the node across layout shifts (add-child re-layout)', () => {
-      // Establish the child's initial bbox, render with a stroke on
-      // the child, then add another child to the root — the first
-      // child's bbox may shift (radial layout redistributes) and the
-      // stroke should render at the new bbox position.
-      const tree = createTree();
-      addChild(tree, tree.rootId);
-      const childId = tree.nodesById.get(tree.rootId)!.childIds[0];
-      const strokes = new Map<number, Array<unknown>>();
-      strokes.set(childId, [
-        {
-          type: 'GEO_polygon',
-          points: [
-            {x: 0, y: 0},
-            {x: 10, y: 0},
-          ],
-          ...PEN,
-        },
-      ]);
-      const {renderer, unmount} = renderCanvas(
-        <MindmapCanvas
-          initialTree={tree}
-          isEditMode
-          initialPreservedStrokes={strokes as never}
-        />,
-      );
-      const before = findHostByLabel(
-        renderer,
-        `preserved-stroke-node-${childId}`,
-      );
-      expect(before).toHaveLength(1);
-      const beforeStyle = flattenStyle(before[0].props.style);
-      // Capture the pre-shift position before we mutate the tree.
-      const beforeLeft = beforeStyle.left as number;
-      const beforeTop = beforeStyle.top as number;
-
-      // Add a sibling to force a re-layout. Radial layout fans nodes
-      // around the root; adding a second child changes the first
-      // child's angular slot (fan → full-ring transition happens at
-      // FAN_THRESHOLD=2, but any change in child count tweaks spacing
-      // along the connector). At the very least the stage origin or
-      // the child's bbox moves; if both remained pixel-identical, the
-      // test would catch a future regression where layout stops
-      // responding to child count.
-      pressByLabel(renderer, `add-sibling-${childId}`);
-      const after = findHostByLabel(
-        renderer,
-        `preserved-stroke-node-${childId}`,
-      );
-      expect(after).toHaveLength(1);
-      const afterStyle = flattenStyle(after[0].props.style);
-      const afterLeft = afterStyle.left as number;
-      const afterTop = afterStyle.top as number;
-      // Width/height should stay equal — the stroke itself didn't
-      // resize, only its anchor moved.
-      expect(afterStyle.width).toBe(beforeStyle.width);
-      expect(afterStyle.height).toBe(beforeStyle.height);
-      // At least one axis moved. The particular delta depends on
-      // radialLayout internals, so this is a loose-but-honest
-      // "strokes track the node" assertion.
-      expect(afterLeft !== beforeLeft || afterTop !== beforeTop).toBe(true);
-      unmount();
-    });
-
-    it('drops strokes for nodes that aren\'t in the tree (e.g. stale bucket keys)', () => {
-      // Defensive: a bucket keyed on a NodeId that doesn't resolve to
-      // a rendered node is silently dropped (no throw, no stray
-      // Views). Mirrors emitGeometries' empty-bucket behavior.
-      const tree = createTree();
-      const bogus = new Map<number, Array<unknown>>();
-      bogus.set(9999, [
-        {
-          type: 'GEO_polygon',
-          points: [
-            {x: 0, y: 0},
-            {x: 10, y: 0},
-          ],
-          ...PEN,
-        },
-      ]);
-      const {renderer, unmount} = renderCanvas(
-        <MindmapCanvas
-          initialTree={tree}
-          isEditMode
-          initialPreservedStrokes={bogus as never}
-        />,
-      );
-      expect(findHostByLabel(renderer, 'preserved-stroke-node-9999')).toHaveLength(
-        0,
-      );
-      expect(
-        findHostByLabel(renderer, `preserved-stroke-node-${tree.rootId}`),
-      ).toHaveLength(0);
-      unmount();
-    });
-
-    it('does not render strokes for nodes hidden inside a collapsed subtree', () => {
-      // Build root → A → B. Collapse A; B is hidden. Preserved strokes
-      // stashed on B must not render. Strokes on A itself DO render
-      // because A is still visible (collapsed hides descendants only).
-      const tree = createTree();
-      addChild(tree, tree.rootId);
-      const a = tree.nodesById.get(tree.rootId)!.childIds[0];
-      addChild(tree, a);
-      const b = tree.nodesById.get(a)!.childIds[0];
-      const strokes = new Map<number, Array<unknown>>();
-      strokes.set(a, [
-        {
-          type: 'GEO_polygon',
-          points: [
-            {x: 0, y: 0},
-            {x: 10, y: 0},
-          ],
-          ...PEN,
-        },
-      ]);
-      strokes.set(b, [
-        {
-          type: 'GEO_polygon',
-          points: [
-            {x: 0, y: 0},
-            {x: 10, y: 0},
-          ],
-          ...PEN,
-        },
-      ]);
-      const {renderer, unmount} = renderCanvas(
-        <MindmapCanvas
-          initialTree={tree}
-          isEditMode
-          initialPreservedStrokes={strokes as never}
-        />,
-      );
-      // Pre-collapse: both A and B strokes render.
-      expect(findHostByLabel(renderer, `preserved-stroke-node-${a}`)).toHaveLength(
-        1,
-      );
-      expect(findHostByLabel(renderer, `preserved-stroke-node-${b}`)).toHaveLength(
-        1,
-      );
-      // Collapse A; B's strokes should disappear, A's stay.
-      pressByLabel(renderer, `collapse-${a}`);
-      expect(findHostByLabel(renderer, `preserved-stroke-node-${a}`)).toHaveLength(
-        1,
-      );
-      expect(findHostByLabel(renderer, `preserved-stroke-node-${b}`)).toHaveLength(
-        0,
-      );
-      unmount();
-    });
-
-    it('renders nothing when initialPreservedStrokes is undefined', () => {
-      // Sanity / regression: the prop is optional. An authoring
-      // canvas never passes it.
-      const {renderer, unmount} = renderCanvas(<MindmapCanvas isEditMode />);
-      const all = renderer.root.findAll(
-        node =>
-          typeof node.type === 'string' &&
-          typeof node.props.accessibilityLabel === 'string' &&
-          node.props.accessibilityLabel.startsWith('preserved-stroke-'),
-      );
-      expect(all).toHaveLength(0);
-      unmount();
-    });
-
-    it('drops empty-points polylines silently (defensive against corrupt input)', () => {
-      // Firmware output always has ≥ 2 points, but the decoder can't
-      // guarantee that. A malformed stroke mustn't crash the render.
-      const tree = createTree();
-      const strokes = new Map<number, Array<unknown>>();
-      strokes.set(tree.rootId, [
-        {type: 'GEO_polygon', points: [], ...PEN},
-        {type: 'GEO_polygon', points: [{x: 0, y: 0}], ...PEN},
-      ]);
-      const {renderer, unmount} = renderCanvas(
-        <MindmapCanvas
-          initialTree={tree}
-          isEditMode
-          initialPreservedStrokes={strokes as never}
-        />,
-      );
-      expect(
-        findHostByLabel(renderer, `preserved-stroke-node-${tree.rootId}`),
-      ).toHaveLength(0);
-      unmount();
-    });
-
-    it('drops zero-length segments between duplicate consecutive points', () => {
-      // Micro-sampling can produce consecutive points at the same
-      // position. A zero-length rotated View would render as nothing
-      // anyway but would still be a wasted <View> in the tree.
-      // PreservedStrokeView skips them.
-      const tree = createTree();
-      const strokes = new Map<number, Array<unknown>>();
-      strokes.set(tree.rootId, [
-        {
-          type: 'GEO_polygon',
-          points: [
-            {x: 0, y: 0},
-            {x: 10, y: 0},
-            {x: 10, y: 0}, // dup → zero-length segment skipped
-            {x: 20, y: 0},
-          ],
-          ...PEN,
-        },
-      ]);
-      const {renderer, unmount} = renderCanvas(
-        <MindmapCanvas
-          initialTree={tree}
-          isEditMode
-          initialPreservedStrokes={strokes as never}
-        />,
-      );
-      // 4 points → 3 segments total; one is zero-length → 2 rendered.
-      expect(
-        findHostByLabel(renderer, `preserved-stroke-node-${tree.rootId}`),
-      ).toHaveLength(2);
-      unmount();
-    });
-
-    it('ignores preserved strokes when isEditMode is omitted (authoring)', () => {
-      // Phase 4.4 chose not to gate the render on isEditMode inside
-      // MindmapCanvas (the prop name itself signals intent). This test
-      // documents the current behavior: strokes render regardless of
-      // mode, but only EditMindmap ever passes the prop — authoring
-      // callers leave it undefined and this code path stays cold.
-      //
-      // If Phase 4.5 decides to gate rendering explicitly on
-      // isEditMode, this test should flip to expect 0.
-      const tree = createTree();
-      const strokes = new Map<number, Array<unknown>>();
-      strokes.set(tree.rootId, [
-        {
-          type: 'GEO_polygon',
-          points: [
-            {x: 0, y: 0},
-            {x: 10, y: 0},
-          ],
-          ...PEN,
-        },
-      ]);
-      const {renderer, unmount} = renderCanvas(
-        <MindmapCanvas
-          initialTree={tree}
-          initialPreservedStrokes={strokes as never}
-        />,
-      );
-      expect(
-        findHostByLabel(renderer, `preserved-stroke-node-${tree.rootId}`),
-      ).toHaveLength(1);
-      unmount();
-    });
-  });
-
-  describe('Phase 4.5 — Save button wires to insertMindmap (§F-ED-7)', () => {
-    // Phase 4.5 replaces the hidden-in-edit Insert button with a
-    // "Save" button that runs the round-trip §F-ED-7 pipeline:
-    // deleteLassoElements → translate preserved strokes by each
-    // node's move delta → emit → insert → lasso(unionRect) → close.
-    // The UX mirrors Insert's debounce + error-banner behaviour and
-    // the full orchestration lives in insertMindmap; these tests
-    // cover the Save-specific UI wiring.
-
-    beforeEach(() => {
-      (PluginCommAPI.insertGeometry as jest.Mock).mockClear();
-      (PluginCommAPI.insertGeometry as jest.Mock).mockResolvedValue({
-        success: true,
-      });
-      (PluginFileAPI.insertElements as jest.Mock).mockClear();
-      (PluginFileAPI.insertElements as jest.Mock).mockResolvedValue({
-        success: true,
-      });
-      (PluginCommAPI.lassoElements as jest.Mock).mockClear();
-      (PluginCommAPI.lassoElements as jest.Mock).mockResolvedValue({
-        success: true,
-      });
-      (PluginCommAPI.deleteLassoElements as jest.Mock).mockClear();
-      (PluginCommAPI.deleteLassoElements as jest.Mock).mockResolvedValue({
-        success: true,
-      });
-      (PluginManager.closePluginView as jest.Mock).mockClear();
-      (PluginManager.closePluginView as jest.Mock).mockResolvedValue(true);
-    });
-
-    function buildPreEdit(tree: ReturnType<typeof createTree>): {
-      preEditPageBboxes: Map<number, {x: number; y: number; w: number; h: number}>;
-      strokesByNodePage: Map<number, never[]>;
-    } {
-      // Identical pre/post bboxes keeps delta=0 and makes assertions
-      // about the delete + insert sequence independent of
-      // translation math. Stroke bucket empty for the same reason —
-      // §F-ED-7 translation is covered in insert.test.ts.
-      const pre = new Map<number, {x: number; y: number; w: number; h: number}>();
-      for (const id of tree.nodesById.keys()) {
-        pre.set(id, {x: id * 100, y: id * 100, w: 220, h: 96});
-      }
-      return {preEditPageBboxes: pre, strokesByNodePage: new Map()};
-    }
-
-    it('renders a Save Pressable with label "Save" when isEditMode=true', () => {
-      const {renderer, unmount} = renderCanvas(<MindmapCanvas isEditMode />);
-      const save = findPressable(renderer, 'Save');
-      expect(save.props.accessibilityState?.disabled).toBe(false);
-      expect(save.props.disabled).toBe(false);
-      // Insert is hidden in edit mode (Phase 4.3 contract carried
-      // forward to Phase 4.5 — the two buttons are mutually exclusive).
-      expect(findHostByLabel(renderer, 'Insert')).toHaveLength(0);
-      unmount();
-    });
-
-    it('does not render Save in authoring mode (isEditMode omitted)', () => {
-      // Authoring flow must stay on "Insert". A stray Save label
-      // here would cause the authoring canvas to try to re-insert
-      // without a preEdit context.
-      const {renderer, unmount} = renderCanvas(<MindmapCanvas />);
-      expect(findHostByLabel(renderer, 'Save')).toHaveLength(0);
-      // Insert is visible as before.
-      expect(findHostByLabel(renderer, 'Insert').length).toBeGreaterThan(0);
-      unmount();
-    });
-
-    it('tapping Save drives the full §F-ED-7 pipeline (delete + emit + insert + close)', async () => {
-      const tree = createTree();
-      addChild(tree, tree.rootId);
-      const preEdit = buildPreEdit(tree);
-      const {renderer, unmount} = renderCanvas(
-        <MindmapCanvas initialTree={tree} isEditMode preEdit={preEdit} />,
-      );
-
-      const save = findPressable(renderer, 'Save');
-      const onPress = save.props.onPress as () => void;
-      await act(async () => {
-        onPress();
-        await flushPromises();
-        await flushPromises();
-      });
-
-      // deleteLassoElements fires first (before any insert call).
-      expect(PluginCommAPI.deleteLassoElements).toHaveBeenCalledTimes(1);
-      // 2 outlines + 1 connector = 3 non-marker geometries emitted.
-      expect(nonMarkerInsertCount()).toBe(3);
-      expect(PluginCommAPI.lassoElements).toHaveBeenCalledTimes(1);
-      expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
-      unmount();
-    });
-
-    it('shows "Saving…" while the save is in flight', async () => {
-      // Keep insertElements pending so we can observe the mid-flight
-      // button state. Matches the Insert-path debounce tests below.
-      let resolveFirst: () => void = () => {};
-      const pending = new Promise<void>(r => {
-        resolveFirst = r;
-      });
-      (PluginFileAPI.insertElements as jest.Mock).mockImplementationOnce(
-        async () => {
-          await pending;
-          return {success: true};
-        },
-      );
-
-      const tree = createTree();
-      const preEdit = buildPreEdit(tree);
-      const {renderer, unmount} = renderCanvas(
-        <MindmapCanvas initialTree={tree} isEditMode preEdit={preEdit} />,
-      );
-
-      const save = findPressable(renderer, 'Save');
-      const onPress = save.props.onPress as () => void;
-      await act(async () => {
-        onPress();
-        await flushPromises();
-      });
-      // The button's label should have swapped to the pending state
-      // — look it up by the new label.
-      const pendingBtn = findPressable(renderer, 'Save');
-      expect(pendingBtn.props.accessibilityState?.disabled).toBe(true);
-      // Resolve so the test cleans up.
-      resolveFirst();
-      await flushAsync();
-      unmount();
-    });
-
-    it('shows an error banner when save fails and keeps the plugin open', async () => {
-      (PluginCommAPI.deleteLassoElements as jest.Mock).mockResolvedValueOnce({
-        success: false,
-        error: {message: 'simulated: delete refused'},
-      });
-
-      const tree = createTree();
-      const preEdit = buildPreEdit(tree);
-      const {renderer, unmount} = renderCanvas(
-        <MindmapCanvas initialTree={tree} isEditMode preEdit={preEdit} />,
-      );
-      const save = findPressable(renderer, 'Save');
-      const onPress = save.props.onPress as () => void;
-      await act(async () => {
-        onPress();
-        await flushPromises();
-        await flushPromises();
-      });
-
-      const banners = findHostByLabel(renderer, 'insert-error');
-      expect(banners).toHaveLength(1);
-      expect(PluginManager.closePluginView).not.toHaveBeenCalled();
-      // No partial insert happened — the failure aborted before any
-      // insert call.
-      expect(PluginCommAPI.insertGeometry).not.toHaveBeenCalled();
-      expect(PluginFileAPI.insertElements).not.toHaveBeenCalled();
-      unmount();
-    });
-
-    it('debounces rapid double-taps so only one save runs at a time', async () => {
-      // Same debounce pattern as the Insert button — the underlying
-      // insertingRef is shared, so a double-tap during the Save's
-      // in-flight window must no-op.
-      let resolveFirst: () => void = () => {};
-      const pending = new Promise<void>(r => {
-        resolveFirst = r;
-      });
-      (PluginFileAPI.insertElements as jest.Mock).mockImplementationOnce(
-        async () => {
-          await pending;
-          return {success: true};
-        },
-      );
-
-      const tree = createTree();
-      const preEdit = buildPreEdit(tree);
-      const {renderer, unmount} = renderCanvas(
-        <MindmapCanvas initialTree={tree} isEditMode preEdit={preEdit} />,
-      );
-      const save = findPressable(renderer, 'Save');
-      const onPress = save.props.onPress as () => void;
-      await act(async () => {
-        onPress();
-        await flushPromises();
-      });
-      await act(async () => {
-        onPress(); // second tap while first is in flight — no-op
-        await flushPromises();
-      });
-
-      // deleteLassoElements only fired once despite two taps, because
-      // insertingRef short-circuits handleSave's second entry.
-      expect(PluginCommAPI.deleteLassoElements).toHaveBeenCalledTimes(1);
-      expect(PluginFileAPI.insertElements).toHaveBeenCalledTimes(1);
-
-      resolveFirst();
-      await flushAsync();
-      unmount();
-    });
-
-    it('still works without preEdit (defensive degraded mode)', async () => {
-      // If isEditMode=true but no preEdit is supplied (EditMindmap
-      // always supplies it in practice), Save should still be
-      // tappable and still run the emit/insert path — it just skips
-      // the delete step because insertMindmap has no pre-edit
-      // context to act on.
-      const tree = createTree();
-      const {renderer, unmount} = renderCanvas(
-        <MindmapCanvas initialTree={tree} isEditMode />,
-      );
-      const save = findPressable(renderer, 'Save');
-      const onPress = save.props.onPress as () => void;
-      await act(async () => {
-        onPress();
-        await flushPromises();
-        await flushPromises();
-      });
-
-      // No delete (preEdit was undefined).
-      expect(PluginCommAPI.deleteLassoElements).not.toHaveBeenCalled();
-      // But the first-insert pipeline still ran to completion.
-      expect(nonMarkerInsertCount()).toBeGreaterThan(0);
-      expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
-      unmount();
-    });
-  });
-
-  describe('Phase 4.6 — pre-Save out-of-map confirmation dialog (§8.1)', () => {
-    // The §F-ED-5 associator produces an `outOfMap` bucket for
-    // strokes whose centroid fell outside every node's bbox. On Save
-    // we show a confirmation dialog BEFORE running insertMindmap so
-    // the user can back out and re-lasso wider if they intended
-    // those strokes to be labels. Dropping the strokes on commit is
-    // automatic — they were never routed into the preEdit bucket —
-    // so the dialog's only job is gating the pipeline and counting.
-    //
-    // These tests focus on that gating: no out-of-map ⇒ no dialog,
-    // some out-of-map ⇒ dialog blocks the pipeline until the user
-    // presses "Save anyway" (or Cancel, which just dismisses without
-    // closing the plugin so the user can keep editing).
-
-    beforeEach(() => {
-      (PluginCommAPI.insertGeometry as jest.Mock).mockClear();
-      (PluginCommAPI.insertGeometry as jest.Mock).mockResolvedValue({
-        success: true,
-      });
-      (PluginFileAPI.insertElements as jest.Mock).mockClear();
-      (PluginFileAPI.insertElements as jest.Mock).mockResolvedValue({
-        success: true,
-      });
-      (PluginCommAPI.lassoElements as jest.Mock).mockClear();
-      (PluginCommAPI.lassoElements as jest.Mock).mockResolvedValue({
-        success: true,
-      });
-      (PluginCommAPI.deleteLassoElements as jest.Mock).mockClear();
-      (PluginCommAPI.deleteLassoElements as jest.Mock).mockResolvedValue({
-        success: true,
-      });
-      (PluginManager.closePluginView as jest.Mock).mockClear();
-      (PluginManager.closePluginView as jest.Mock).mockResolvedValue(true);
-    });
-
-    /** Simplest out-of-map stroke fixture (a short polyline). */
-    function buildOutOfMap(count: number): unknown[] {
-      const arr: unknown[] = [];
-      for (let i = 0; i < count; i++) {
-        arr.push({
-          type: 'GEO_polygon',
-          points: [
-            {x: -100 - i, y: -100 - i},
-            {x: -80 - i, y: -80 - i},
-          ],
-          penColor: 0x00,
-          penType: 10,
-          penWidth: 400,
-        });
-      }
-      return arr;
-    }
-
-    /** Minimal preEdit context matching Phase 4.5's helper. */
-    function buildPreEdit(tree: ReturnType<typeof createTree>): {
-      preEditPageBboxes: Map<number, {x: number; y: number; w: number; h: number}>;
-      strokesByNodePage: Map<number, never[]>;
-    } {
-      const pre = new Map<number, {x: number; y: number; w: number; h: number}>();
-      for (const id of tree.nodesById.keys()) {
-        pre.set(id, {x: id * 100, y: id * 100, w: 220, h: 96});
-      }
-      return {preEditPageBboxes: pre, strokesByNodePage: new Map()};
-    }
-
-    it('runs the pipeline directly when outOfMap is empty (no dialog)', async () => {
-      // The gate must be a no-op when there's nothing to warn about,
-      // otherwise the simple common-case Save grows an extra tap.
-      const tree = createTree();
-      const preEdit = buildPreEdit(tree);
-      const {renderer, unmount} = renderCanvas(
-        <MindmapCanvas
-          initialTree={tree}
-          isEditMode
-          preEdit={preEdit}
-          initialOutOfMapStrokes={[]}
-        />,
-      );
-      const save = findPressable(renderer, 'Save');
-      await act(async () => {
-        (save.props.onPress as () => void)();
-        await flushPromises();
-        await flushPromises();
-      });
-      // Pipeline fired, no dialog ever rendered.
-      expect(findHostByLabel(renderer, 'save-confirm-dialog')).toHaveLength(0);
-      expect(PluginCommAPI.deleteLassoElements).toHaveBeenCalledTimes(1);
-      expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
-      unmount();
-    });
-
-    it('also skips the dialog when initialOutOfMapStrokes is omitted', async () => {
-      // Defensive case: if EditMindmap forgets to pass the prop we
-      // should still save rather than silently deadlock on a dialog
-      // the user can't dismiss because it never rendered.
-      const tree = createTree();
-      const preEdit = buildPreEdit(tree);
-      const {renderer, unmount} = renderCanvas(
-        <MindmapCanvas initialTree={tree} isEditMode preEdit={preEdit} />,
-      );
-      const save = findPressable(renderer, 'Save');
-      await act(async () => {
-        (save.props.onPress as () => void)();
-        await flushPromises();
-        await flushPromises();
-      });
-      expect(findHostByLabel(renderer, 'save-confirm-dialog')).toHaveLength(0);
-      expect(PluginCommAPI.deleteLassoElements).toHaveBeenCalledTimes(1);
-      unmount();
-    });
-
-    it('opens the dialog and blocks the pipeline when outOfMap is non-empty', async () => {
-      const tree = createTree();
-      const preEdit = buildPreEdit(tree);
-      const {renderer, unmount} = renderCanvas(
-        <MindmapCanvas
-          initialTree={tree}
-          isEditMode
-          preEdit={preEdit}
-          initialOutOfMapStrokes={buildOutOfMap(2) as never}
-        />,
-      );
-      const save = findPressable(renderer, 'Save');
-      await act(async () => {
-        (save.props.onPress as () => void)();
-        await flushPromises();
-      });
-      // Dialog rendered — use findHostByLabel because
-      // save-confirm-dialog is on a plain <View> host, not a
-      // Pressable composite.
-      expect(findHostByLabel(renderer, 'save-confirm-dialog').length).toBeGreaterThan(0);
-      // Nothing in the Save pipeline should have fired yet — we're
-      // still inside the confirmation gate.
-      expect(PluginCommAPI.deleteLassoElements).not.toHaveBeenCalled();
-      expect(PluginCommAPI.insertGeometry).not.toHaveBeenCalled();
-      expect(PluginManager.closePluginView).not.toHaveBeenCalled();
-      unmount();
-    });
-
-    it('the dialog body announces the correct out-of-map count', async () => {
-      // The count is the user's only clue for "how much am I about to
-      // drop" — it must reflect the actual outOfMap bucket length.
-      const cases: Array<{n: number; needle: string}> = [
-        {n: 1, needle: '1 stroke fell outside'},
-        {n: 2, needle: '2 strokes fell outside'},
-        {n: 7, needle: '7 strokes fell outside'},
-      ];
-      for (const c of cases) {
-        const tree = createTree();
-        const preEdit = buildPreEdit(tree);
-        const {renderer, unmount} = renderCanvas(
-          <MindmapCanvas
-            initialTree={tree}
-            isEditMode
-            preEdit={preEdit}
-            initialOutOfMapStrokes={buildOutOfMap(c.n) as never}
-          />,
-        );
-        const save = findPressable(renderer, 'Save');
-        await act(async () => {
-          (save.props.onPress as () => void)();
-          await flushPromises();
-        });
-        const body = findHostByLabel(renderer, 'save-confirm-body');
-        expect(body.length).toBeGreaterThan(0);
-        const text = (body[0].props.children as unknown[])
-          .filter((x): x is string => typeof x === 'string')
-          .join('');
-        expect(text).toContain(c.needle);
-        unmount();
-      }
-    });
-
-    it('"Save anyway" closes the dialog and runs the full §F-ED-7 pipeline', async () => {
-      const tree = createTree();
-      const preEdit = buildPreEdit(tree);
-      const {renderer, unmount} = renderCanvas(
-        <MindmapCanvas
-          initialTree={tree}
-          isEditMode
-          preEdit={preEdit}
-          initialOutOfMapStrokes={buildOutOfMap(3) as never}
-        />,
-      );
-      const save = findPressable(renderer, 'Save');
-      await act(async () => {
-        (save.props.onPress as () => void)();
-        await flushPromises();
-      });
-      const proceed = findPressable(renderer, 'save-confirm-proceed');
-      await act(async () => {
-        (proceed.props.onPress as () => void)();
-        await flushPromises();
-        await flushPromises();
-      });
-      // Dialog is gone…
-      expect(findHostByLabel(renderer, 'save-confirm-dialog')).toHaveLength(0);
-      // …and the full pipeline ran.
-      expect(PluginCommAPI.deleteLassoElements).toHaveBeenCalledTimes(1);
-      expect(nonMarkerInsertCount()).toBeGreaterThan(0);
-      expect(PluginCommAPI.lassoElements).toHaveBeenCalledTimes(1);
-      expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
-      unmount();
-    });
-
-    it('"Cancel" dismisses the dialog without running the pipeline or closing the plugin', async () => {
-      const tree = createTree();
-      const preEdit = buildPreEdit(tree);
-      const {renderer, unmount} = renderCanvas(
-        <MindmapCanvas
-          initialTree={tree}
-          isEditMode
-          preEdit={preEdit}
-          initialOutOfMapStrokes={buildOutOfMap(1) as never}
-        />,
-      );
-      const save = findPressable(renderer, 'Save');
-      await act(async () => {
-        (save.props.onPress as () => void)();
-        await flushPromises();
-      });
-      const cancel = findPressable(renderer, 'save-confirm-cancel');
-      await act(async () => {
-        (cancel.props.onPress as () => void)();
-        await flushPromises();
-      });
-      // Dialog dismissed but nothing else happened — user can tap
-      // Cancel in the top bar to close the plugin and re-lasso.
-      expect(findHostByLabel(renderer, 'save-confirm-dialog')).toHaveLength(0);
-      expect(PluginCommAPI.deleteLassoElements).not.toHaveBeenCalled();
-      expect(PluginCommAPI.insertGeometry).not.toHaveBeenCalled();
-      expect(PluginManager.closePluginView).not.toHaveBeenCalled();
-      unmount();
-    });
-
-    it('tapping the backdrop dismisses the dialog (tap-outside-to-cancel idiom)', async () => {
-      // Per spec §646 transient overlays should honor tap-outside to
-      // cancel. Backdrop is a Pressable with onPress=handleSaveCancel.
-      const tree = createTree();
-      const preEdit = buildPreEdit(tree);
-      const {renderer, unmount} = renderCanvas(
-        <MindmapCanvas
-          initialTree={tree}
-          isEditMode
-          preEdit={preEdit}
-          initialOutOfMapStrokes={buildOutOfMap(1) as never}
-        />,
-      );
-      const save = findPressable(renderer, 'Save');
-      await act(async () => {
-        (save.props.onPress as () => void)();
-        await flushPromises();
-      });
-      const backdrop = findPressable(renderer, 'save-confirm-backdrop');
-      await act(async () => {
-        (backdrop.props.onPress as () => void)();
-        await flushPromises();
-      });
-      expect(findHostByLabel(renderer, 'save-confirm-dialog')).toHaveLength(0);
-      expect(PluginCommAPI.deleteLassoElements).not.toHaveBeenCalled();
-      unmount();
-    });
-
-    it('re-opens the dialog on a subsequent Save tap after the user cancelled', async () => {
-      // Regression guard: saveConfirmOpen must go back to false on
-      // cancel so the next Save tap re-triggers the gate. If the
-      // state got stuck the user would be silently auto-saving on the
-      // second tap and losing the out-of-map strokes without a prompt.
-      const tree = createTree();
-      const preEdit = buildPreEdit(tree);
-      const {renderer, unmount} = renderCanvas(
-        <MindmapCanvas
-          initialTree={tree}
-          isEditMode
-          preEdit={preEdit}
-          initialOutOfMapStrokes={buildOutOfMap(1) as never}
-        />,
-      );
-      // First tap → dialog → cancel.
-      const save = findPressable(renderer, 'Save');
-      await act(async () => {
-        (save.props.onPress as () => void)();
-        await flushPromises();
-      });
-      const cancel = findPressable(renderer, 'save-confirm-cancel');
-      await act(async () => {
-        (cancel.props.onPress as () => void)();
-        await flushPromises();
-      });
-      expect(findHostByLabel(renderer, 'save-confirm-dialog')).toHaveLength(0);
-      // Second tap → dialog shows again.
-      const save2 = findPressable(renderer, 'Save');
-      await act(async () => {
-        (save2.props.onPress as () => void)();
-        await flushPromises();
-      });
-      expect(findHostByLabel(renderer, 'save-confirm-dialog').length).toBeGreaterThan(0);
-      unmount();
-    });
-
-    it('does not render the dialog in authoring mode (isEditMode omitted)', () => {
-      // The prop combination shouldn't happen in practice (authoring
-      // doesn't know about lasso association) but a stray prop must
-      // not spawn an on-authoring-canvas dialog either way.
-      const tree = createTree();
-      const {renderer, unmount} = renderCanvas(
-        <MindmapCanvas
-          initialTree={tree}
-          initialOutOfMapStrokes={buildOutOfMap(2) as never}
-        />,
-      );
-      // The Save button itself isn't rendered in authoring mode, and
-      // the dialog's isEditMode guard keeps it off-screen even if
-      // saveConfirmOpen somehow got flipped.
-      expect(findHostByLabel(renderer, 'save-confirm-dialog')).toHaveLength(0);
-      expect(findHostByLabel(renderer, 'Save')).toHaveLength(0);
-      unmount();
-    });
-  });
-
-  describe('Phase 5 — §F-PE-4 marker-capacity modal', () => {
-    // Building a tree with > MARKER_PUBLISHED_NODE_CAP nodes forces
-    // encodeMarkerBytes to throw MarkerCapacityError, which bubbles up
-    // through emitGeometries → insertMindmap → the canvas catch block.
-    // The new contract: surface a persistent modal (not the transient
-    // 2 s insert-error banner), keep the plugin view open, let the
-    // user OK the modal and return to the canvas to reduce nodes.
-
-    beforeEach(() => {
-      (PluginCommAPI.insertGeometry as jest.Mock).mockClear();
-      (PluginCommAPI.insertGeometry as jest.Mock).mockResolvedValue({
-        success: true,
-      });
-      (PluginFileAPI.insertElements as jest.Mock).mockClear();
-      (PluginFileAPI.insertElements as jest.Mock).mockResolvedValue({
-        success: true,
-      });
-      (PluginCommAPI.lassoElements as jest.Mock).mockClear();
-      (PluginCommAPI.lassoElements as jest.Mock).mockResolvedValue({
-        success: true,
-      });
-      (PluginCommAPI.deleteLassoElements as jest.Mock).mockClear();
-      (PluginCommAPI.deleteLassoElements as jest.Mock).mockResolvedValue({
-        success: true,
-      });
-      (PluginManager.closePluginView as jest.Mock).mockClear();
-      (PluginManager.closePluginView as jest.Mock).mockResolvedValue(true);
-    });
-
-    /**
-     * Build a right-chain tree with `nodeCount` total nodes (including
-     * the root). A chain is the cheapest over-cap structure: one
-     * addChild per link, no layout fan-out cost. For nodeCount=51 the
-     * marker encoder will throw MarkerCapacityError on the first
-     * encodeMarkerBytes call because MARKER_PUBLISHED_NODE_CAP = 50.
-     */
-    function buildOversizedTree(nodeCount: number): ReturnType<typeof createTree> {
-      const t = createTree();
-      let last = t.rootId;
-      for (let i = 1; i < nodeCount; i += 1) {
-        last = addChild(t, last);
-      }
-      return t;
-    }
-
-    it('opens the capacity modal (not the transient banner) when Insert exceeds the cap', async () => {
-      const tree = buildOversizedTree(51);
-      const {renderer, unmount} = renderCanvas(
-        <MindmapCanvas initialTree={tree} />,
-      );
-      const insert = findPressable(renderer, 'Insert');
-      await act(async () => {
-        (insert.props.onPress as () => void)();
-        await flushPromises();
-        await flushPromises();
-      });
-      // Capacity modal is present…
-      expect(findHostByLabel(renderer, 'capacity-error-dialog').length).toBeGreaterThan(0);
-      // …and the transient banner route was NOT taken (the banner is
-      // not for persistent errors; the spec text needs to stay up
-      // until the user dismisses it).
-      expect(findHostByLabel(renderer, 'insert-error')).toHaveLength(0);
-      // Plugin view must stay open so the user can edit the tree.
-      expect(PluginManager.closePluginView).not.toHaveBeenCalled();
-      // Nothing landed on the page — emit failed before insertGeometry.
-      expect(PluginCommAPI.insertGeometry).not.toHaveBeenCalled();
-      unmount();
-    });
-
-    it('modal body is the verbatim §F-PE-4 capacity message', async () => {
-      const tree = buildOversizedTree(51);
-      const {renderer, unmount} = renderCanvas(
-        <MindmapCanvas initialTree={tree} />,
-      );
-      const insert = findPressable(renderer, 'Insert');
-      await act(async () => {
-        (insert.props.onPress as () => void)();
-        await flushPromises();
-        await flushPromises();
-      });
-      const body = findHostByLabel(renderer, 'capacity-error-body');
-      expect(body.length).toBeGreaterThan(0);
-      expect(body[0].props.children).toContain('more structure than can be embedded');
-      expect(body[0].props.children).toContain('Reduce nodes');
-      expect(body[0].props.children).toContain('multiple mindmaps');
-      // Spec cross-refs (§F-PE-4) must not leak into user-facing text.
-      expect(body[0].props.children).not.toMatch(/§/);
-      unmount();
-    });
-
-    it('"OK" dismisses the capacity modal and leaves the plugin open', async () => {
-      const tree = buildOversizedTree(51);
-      const {renderer, unmount} = renderCanvas(
-        <MindmapCanvas initialTree={tree} />,
-      );
-      const insert = findPressable(renderer, 'Insert');
-      await act(async () => {
-        (insert.props.onPress as () => void)();
-        await flushPromises();
-        await flushPromises();
-      });
-      expect(findHostByLabel(renderer, 'capacity-error-dialog').length).toBeGreaterThan(0);
-      // Tap OK to acknowledge.
-      const ok = findPressable(renderer, 'capacity-error-proceed');
-      act(() => {
-        (ok.props.onPress as () => void)();
-      });
-      // Modal dismissed, plugin still open.
-      expect(findHostByLabel(renderer, 'capacity-error-dialog')).toHaveLength(0);
-      expect(PluginManager.closePluginView).not.toHaveBeenCalled();
-      unmount();
-    });
-
-    it('capacity modal has no cancel button (acknowledge-only)', async () => {
-      // The only path past this error is reducing nodes — "cancel" has
-      // no distinct meaning, so ConfirmDialog is invoked without a
-      // secondaryLabel and the cancel button is omitted entirely.
-      const tree = buildOversizedTree(51);
-      const {renderer, unmount} = renderCanvas(
-        <MindmapCanvas initialTree={tree} />,
-      );
-      const insert = findPressable(renderer, 'Insert');
-      await act(async () => {
-        (insert.props.onPress as () => void)();
-        await flushPromises();
-        await flushPromises();
-      });
-      expect(findHostByLabel(renderer, 'capacity-error-dialog').length).toBeGreaterThan(0);
-      expect(findHostByLabel(renderer, 'capacity-error-cancel')).toHaveLength(0);
-      unmount();
-    });
-
-    it('also routes Save failures with MarkerCapacityError into the modal', async () => {
-      // The save path shares handleInsertError so both entry points
-      // must produce the same modal. The regression guard is cheap —
-      // just drive Save with an oversized tree and assert the same
-      // modal surfaces.
-      const tree = buildOversizedTree(51);
-      const preEdit = {
-        preEditPageBboxes: new Map(
-          Array.from(tree.nodesById.keys()).map(id => [
-            id,
-            {x: id * 100, y: id * 100, w: 220, h: 96},
-          ]),
-        ),
-        strokesByNodePage: new Map(),
-      };
-      const {renderer, unmount} = renderCanvas(
-        <MindmapCanvas initialTree={tree} isEditMode preEdit={preEdit} />,
-      );
-      const save = findPressable(renderer, 'Save');
-      await act(async () => {
-        (save.props.onPress as () => void)();
-        await flushPromises();
-        await flushPromises();
-      });
-      expect(findHostByLabel(renderer, 'capacity-error-dialog').length).toBeGreaterThan(0);
-      // Save ran deleteLassoElements first (§F-ED-7 step 0 happens
-      // before emit), but no new geometry landed on the page.
-      expect(PluginCommAPI.insertGeometry).not.toHaveBeenCalled();
-      expect(PluginManager.closePluginView).not.toHaveBeenCalled();
-      unmount();
-    });
-
-    it('at-cap tree (= MARKER_PUBLISHED_NODE_CAP) does not open the capacity modal', async () => {
-      // Sanity boundary: exactly MARKER_PUBLISHED_NODE_CAP nodes must
-      // succeed — the error is for > cap only.
-      const tree = buildOversizedTree(50);
-      const {renderer, unmount} = renderCanvas(
-        <MindmapCanvas initialTree={tree} />,
-      );
-      const insert = findPressable(renderer, 'Insert');
-      await act(async () => {
-        (insert.props.onPress as () => void)();
-        await flushPromises();
-        await flushPromises();
-      });
-      expect(findHostByLabel(renderer, 'capacity-error-dialog')).toHaveLength(0);
-      // Normal success path: plugin closed.
-      expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
       unmount();
     });
   });

@@ -34,7 +34,6 @@ jest.mock('sn-plugin-lib', () => ({
 import {PluginManager} from 'sn-plugin-lib';
 import {
   _resetForTests,
-  BUTTON_ID_EDIT_MINDMAP,
   BUTTON_ID_TOOLBAR,
   getLastButtonEvent,
   installPluginRouter,
@@ -72,10 +71,6 @@ beforeEach(() => {
 describe('button ID constants', () => {
   it('BUTTON_ID_TOOLBAR is 100 (§7.3)', () => {
     expect(BUTTON_ID_TOOLBAR).toBe(100);
-  });
-
-  it('BUTTON_ID_EDIT_MINDMAP is 200 (§7.3)', () => {
-    expect(BUTTON_ID_EDIT_MINDMAP).toBe(200);
   });
 });
 

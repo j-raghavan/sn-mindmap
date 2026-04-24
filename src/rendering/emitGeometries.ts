@@ -50,26 +50,14 @@ import {
   type Point,
   type Rect,
 } from '../geometry';
-import {encodeMarker} from '../marker/encode';
 import {flattenForEmit, type NodeId, type Tree} from '../model/tree';
 import type {LayoutResult} from '../layout/radial';
-import type {StrokeBucket} from '../model/strokes';
 import {STANDARD_PEN_WIDTH} from '../layout/constants';
 import {nodeFrame} from './nodeFrame';
 
 export type EmitInput = {
   tree: Tree;
   layout: LayoutResult;
-  /**
-   * Only present on re-insert from edit (§F-ED-7). Undefined on
-   * first-insert (§F-IN-2 step 3 — the plugin does not own labels
-   * during initial authoring).
-   *
-   * Strokes in this bucket MUST already be translated by the caller
-   * to post-edit coordinates. emitGeometries is a pure pass-through
-   * for stroke payloads; it never scales, rotates, or resamples.
-   */
-  preservedStrokesByNode?: StrokeBucket;
 };
 
 export type EmitOutput = {
@@ -79,12 +67,13 @@ export type EmitOutput = {
 };
 
 /**
- * Assemble the full emit list for a mindmap per §F-IN-2. See the
- * file-level comment for the ordering contract and the division of
- * labor between this module and the caller (insert.ts).
+ * Assemble the full emit list for a mindmap per §F-IN-2. Outputs node
+ * outlines first (in pre-order) then connector straightLines. The
+ * marker + preserved-label-strokes passes were removed along with the
+ * edit/decode pipeline (v0.1 is insert-only).
  */
 export function emitGeometries(input: EmitInput): EmitOutput {
-  const {tree, layout, preservedStrokesByNode} = input;
+  const {tree, layout} = input;
   const geometries: Geometry[] = [];
 
   // Pre-order walk of the FULLY EXPANDED tree (§F-IN-2). We do NOT
@@ -93,12 +82,8 @@ export function emitGeometries(input: EmitInput): EmitOutput {
   const nodes = flattenForEmit(tree);
 
   // -----------------------------------------------------------------
-  // 1. Node outlines.
+  // 1. Node outlines (pre-order).
   // -----------------------------------------------------------------
-  // Order is the pre-order visit order so tests and the marker-record
-  // encoder (Phase 3) see outlines in the same order as the packed
-  // node table. That symmetry simplifies debugging "this node's
-  // outline is index N, its marker record is offset N×10" in logcat.
   for (const node of nodes) {
     const bbox = bboxOrThrow(layout, node.id);
     geometries.push(withNoAutoLasso(nodeFrame(bbox, node.shape)));
@@ -108,15 +93,11 @@ export function emitGeometries(input: EmitInput): EmitOutput {
   // 2. Connectors.
   // -----------------------------------------------------------------
   // One straightLine per parent/child pair, in the same pre-order
-  // visit so a given child's connector appears immediately after its
-  // subtree's outlines in the full geometry list — convenient for
-  // stroke-layer inspection. Connector endpoints are the intersection
-  // of the center-to-center line with each rectangle's border, so the
+  // visit. Endpoints are clipped to each node's bounding box so the
   // line visibly starts at the parent's outline and ends at the
-  // child's (§F-IN-2 step 2: "stopping at the parent's and child's
-  // node outlines"). If the two rects overlap (shouldn't happen with
-  // sane layouts but guarded for fuzz-testing), we fall back to
-  // center-to-center to avoid NaN endpoints.
+  // child's (§F-IN-2 step 2). If the two rects overlap (shouldn't
+  // happen with sane layouts but guarded for fuzz-testing) we fall
+  // back to center-to-center to avoid NaN endpoints.
   for (const node of nodes) {
     if (node.parentId === null) {
       continue;
@@ -133,14 +114,6 @@ export function emitGeometries(input: EmitInput): EmitOutput {
       childBbox,
     );
 
-    // §F-IN-2 step 2: "Connector pen width follows the node border
-    // weight of its child". The only OVAL in v0.1 is the root, which
-    // has no parent and therefore never appears as a connector's
-    // child — so STANDARD_PEN_WIDTH is correct for every connector.
-    // Left as an explicit constant (rather than reading from the
-    // child's outline geometry) so a future Oval-anywhere extension
-    // requires touching this one line rather than post-processing
-    // the connector list.
     const line: LineGeometry = {
       ...PEN_DEFAULTS,
       penWidth: STANDARD_PEN_WIDTH,
@@ -149,65 +122,6 @@ export function emitGeometries(input: EmitInput): EmitOutput {
       showLassoAfterInsert: false,
     };
     geometries.push(line);
-  }
-
-  // -----------------------------------------------------------------
-  // 3. Marker (§6).
-  // -----------------------------------------------------------------
-  // Marker origin = top-left of the node union-bbox (§6.1). The
-  // spec permits a "small fixed offset" to guard against
-  // marker-vs-node confusion; we don't apply one here because the
-  // marker pen-color discriminator (0x9D) already keeps marker
-  // candidates separate from the black-fineliner outlines, and a
-  // zero offset makes lasso-bbox-topleft → marker-origin inference
-  // exact when the user's lasso covers the whole block (decoder
-  // still has a ±2-cell retry loop for on-device jitter).
-  //
-  // §6.3 stores per-node bboxes in mindmap-local coords (origin =
-  // marker top-left). layout.bboxes is in page coords, so we
-  // translate here; width/height pass through unchanged.
-  const markerOrigin: Point = {x: layout.unionBbox.x, y: layout.unionBbox.y};
-  const nodeBboxesRel = new Map<NodeId, Rect>();
-  for (const [id, r] of layout.bboxes) {
-    nodeBboxesRel.set(id, {
-      x: r.x - markerOrigin.x,
-      y: r.y - markerOrigin.y,
-      w: r.w,
-      h: r.h,
-    });
-  }
-  const markerGeoms = encodeMarker({
-    tree,
-    nodeBboxesById: nodeBboxesRel,
-    markerOrigin,
-  });
-  for (const g of markerGeoms) {
-    geometries.push(g);
-  }
-
-  // -----------------------------------------------------------------
-  // 4. Preserved label strokes.
-  // -----------------------------------------------------------------
-  // Ascending NodeId order (not pre-order) because:
-  //   - The caller has already translated each bucket by its node's
-  //     move delta; there's no spatial reason to prefer one order
-  //     over the other.
-  //   - NodeId order is a stable total ordering that survives tree
-  //     restructuring during edit, which makes snapshot tests
-  //     trivial to author in Phase 4.
-  //   - Within a single node's bucket, we preserve the original
-  //     stroke order — the firmware assigned them in time order when
-  //     they were originally written.
-  if (preservedStrokesByNode) {
-    const nodeIds = [...preservedStrokesByNode.keys()].sort(
-      (a, b) => a - b,
-    );
-    for (const nodeId of nodeIds) {
-      const bucket = preservedStrokesByNode.get(nodeId)!;
-      for (const stroke of bucket) {
-        geometries.push(withNoAutoLasso(stroke));
-      }
-    }
   }
 
   return {

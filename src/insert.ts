@@ -1,88 +1,72 @@
 /**
- * High-level insert flow (§5.3, §F-IN-1..F-IN-5; §F-ED-7 on re-insert).
+ * High-level insert flow (§5.3, §F-IN-1..F-IN-5).
  *
- * First-insert sequence:
- *   1. resolvePageContext() — the three-step fall-through from
- *      sn-shapes/src/ShapePalette.tsx via PluginCommAPI
- *      getCurrentFilePath -> getCurrentPageNum -> PluginFileAPI
- *      getPageSize. Also captures notePath + page for the batched
- *      insertElements fast path (§F-IN-3). Defaults kick in if any
- *      step fails (§F-IN-1).
- *   2. Auto-expand every subtree in the tree so no node is hidden
- *      at emit time (§F-IN-2 / §8.6).
- *   3. Run radial layout (./layout/radial.ts).
- *   4. Fit-to-page scale if wider than the page (§F-LY-6). Applies
- *      to node positions and outline dimensions; preserved label
- *      strokes on re-insert are TRANSLATED, not scaled, so they pass
- *      through the scale step untouched.
- *   5. Emit geometries via ./rendering/emitGeometries.ts — outlines,
- *      connectors, marker, and on re-insert preserved label strokes.
- *      Every emission sets showLassoAfterInsert: false (§F-IN-3).
- *   6. Insert every geometry as a single batched
- *      PluginFileAPI.insertElements call (§F-IN-3). Each emitted
- *      Geometry is wrapped as an Element of TYPE_GEO (700). The
- *      batched path is massively faster than sequential
- *      insertGeometry calls — the marker alone emits ~2500 per-bit
- *      straight-lines and a per-geometry loop stalls the plugin for
- *      tens of seconds on device (the user sees this as "Insert
- *      hangs after the mindmap appears"). If the note context is
- *      unavailable (resolvePageContext fell through to defaults) we
- *      fall back to sequential PluginCommAPI.insertGeometry so the
- *      code still works in environments where the file bridge hasn't
- *      been wired up.
- *   7. Call PluginCommAPI.lassoElements(unionRect) explicitly to
- *      auto-select the whole block (§F-IN-3 / §11).
- *   8. PluginManager.closePluginView() to dismiss (§F-IN-4).
+ *   1. resolvePageContext() — getCurrentFilePath → getCurrentPageNum →
+ *      PluginFileAPI.getPageSize. Required for the batched
+ *      replaceElements write; falling back to default dimensions when
+ *      the chain fails rejects the insert with a clear error (the
+ *      batched path can't operate without a concrete notePath/page).
+ *   2. Auto-expand every subtree so no node is hidden at emit time.
+ *   3. radialLayout() in mindmap-local coords, root at origin.
+ *   4. Fit-to-page scale if wider than the page (§F-LY-6), then
+ *      translate so the unionBbox sits centered on the page.
+ *   5. emitGeometries() → outlines (pre-order) + connectors clipped
+ *      to each node's bbox. No marker, no preserved label strokes —
+ *      re-edit is out of scope for v0.1.
+ *   6. For each emitted geometry: PluginCommAPI.createElement(TYPE_GEO)
+ *      to mint a native-backed Element, populate pageNum / layerNum /
+ *      thickness / geometry. Then ONE PluginFileAPI.replaceElements
+ *      call with [existing..., newElements]. Confirmed on device to
+ *      cost one host-side fsync (vs. one per insertGeometry), which
+ *      is what makes the insert finish in ~1 s instead of ~80 s.
+ *   7. setLassoBoxState(2) → reloadFile() (mirrors shape-snap's
+ *      executeFastPath tail). This clears any residual lasso state
+ *      and refreshes the view so the user's pen immediately returns
+ *      to handwriting mode — the user can write labels on the
+ *      inserted rectangles right away without tapping out of a lasso
+ *      selection first.
+ *   8. PluginManager.closePluginView() to dismiss.
  *
- * Re-insert (Save) sequence — triggered by an optional `preEdit`
- * context on InsertInput (§F-ED-7):
- *   0. After resolving page size, call
- *      PluginCommAPI.deleteLassoElements() to remove the previously-
- *      inserted mindmap from the page. EditMindmap enters through the
- *      lasso-toolbar "Edit Mindmap" entry, so the firmware's lasso is
- *      already wrapped around the old block — a single
- *      deleteLassoElements clears the whole thing (outlines,
- *      connectors, marker bits, and preserved label strokes).
- *   2a. After step 4's fit-to-page, compute per-node MOVE DELTA:
- *           delta = postEditPageBbox.topLeft - preEditPageBbox.topLeft
- *       for every node present in BOTH the pre-edit and post-edit
- *       layouts. Strokes for nodes that exist only pre-edit (deleted
- *       subtree) are dropped; nodes that exist only post-edit (new
- *       Add Child / Add Sibling) have no strokes to translate.
- *   2b. translateStrokes(bucket, delta) for each surviving bucket.
- *       Rigid translation only — no scale, rotate, or resample
- *       (§F-LY-6, §8.1). This preserves every stroke's original pen
- *       style and point list, modulo the coordinate shift.
- *   5. Hand the translated bucket to emitGeometries as the existing
- *      preservedStrokesByNode param. The remaining insert / lasso /
- *      close steps run unchanged.
- *
- * Error handling (§F-IN-5): on any failure after one or more
- * geometries have been inserted, best-effort cleanup by lassoing the
- * partial union rect and calling deleteLassoElements before
- * re-raising to the UI. Cleanup failures are swallowed — the original
- * error is what the user needs to act on, and manual cleanup is
- * acceptable for v0.1.
- *
- * Save-specific failure modes:
- *   - deleteLassoElements (step 0) failure aborts the whole save
- *     before any new geometry lands on the page, so no cleanup is
- *     needed and the user's old mindmap stays intact.
- *   - Any failure during the post-delete insert loop leaves the page
- *     in a mixed state: the old mindmap has been removed, and the
- *     partial new emit is cleaned up by the standard §F-IN-5 path.
- *     v0.1 accepts that the user may see an empty page and need to
- *     undo; we do not attempt to restore the original strokes.
+ * Error handling: replaceElements is all-or-nothing on the host, so
+ * there is never a partial-insert state to clean up. On failure the
+ * page is untouched; we throw and let the UI surface the banner.
  */
-import {PluginCommAPI, PluginFileAPI, PluginManager} from 'sn-plugin-lib';
+import {
+  Element,
+  PluginCommAPI,
+  PluginFileAPI,
+  PluginManager,
+} from 'sn-plugin-lib';
 
 import type {Geometry, Rect} from './geometry';
 import type {LayoutResult} from './layout/radial';
 import {radialLayout} from './layout/radial';
-import {translateStrokes, type StrokeBucket} from './model/strokes';
 import {cloneTree, type NodeId, type Tree} from './model/tree';
-import {emitGeometries, unionRectOfGeometries} from './rendering/emitGeometries';
+import {emitGeometries} from './rendering/emitGeometries';
 import type {ApiRes} from './pluginApi';
+
+/**
+ * Debug instrumentation. Every log line is prefixed with [INSERT] so
+ * `grep '\[INSERT\]' logcat.txt` surfaces the full pipeline trace and
+ * makes the boundaries between JS work and native bridge awaits
+ * unambiguous when diagnosing hangs or silent failures. Keep this
+ * free-function style (not a class) so tree-shaking is irrelevant —
+ * console.log is always a no-op in release if the host disables it.
+ */
+const TAG = '[INSERT]';
+function log(step: string, detail?: unknown): void {
+  if (detail === undefined) {
+    console.log(`${TAG} ${step}`);
+  } else {
+    let serialized: string;
+    try {
+      serialized = JSON.stringify(detail);
+    } catch {
+      serialized = String(detail);
+    }
+    console.log(`${TAG} ${step} :: ${serialized}`);
+  }
+}
 
 /**
  * Nomad portrait defaults, mirrored from sn-shapes/src/ShapePalette.tsx.
@@ -99,90 +83,24 @@ export const DEFAULT_PAGE_HEIGHT = 1872;
  */
 export const INSERT_MARGIN_PX = 80;
 
-/**
- * Firmware Element-type code for a Geometry record
- * (Element.TYPE_GEO == 700; see sn-plugin-lib's Element.d.ts). We
- * re-declare it locally rather than importing the runtime Element
- * class so unit tests can exercise the batched path without pulling
- * the whole ElementDataAccessor/native-cache machinery into jsdom.
- */
-export const ELEMENT_TYPE_GEO = 700;
-
-/**
- * Pre-edit context needed to translate preserved label strokes from
- * the pre-edit layout into the post-edit layout's coordinates on
- * Save. Supplied by EditMindmap on the §F-ED-7 round-trip — the
- * plugin holds neither the pre-edit layout nor the strokes outside
- * edit mode, so everything insertMindmap needs to reconstruct the
- * move delta lives in this bundle.
- *
- * - `preEditPageBboxes`: where each node WAS in page coords (decoder
- *   nodeBboxesById shifted by markerOriginPage), keyed by the
- *   decoder's post-decode NodeId.
- * - `strokesByNodePage`: associateStrokes output in PAGE coords —
- *   each stroke lives at its original pen-captured page coordinate.
- *   Not pre-translated by the caller; insertMindmap applies the
- *   delta internally so the cross-coord-system knowledge stays in
- *   one place (§F-ED-7).
- */
-export type PreEditContext = {
-  preEditPageBboxes: Map<NodeId, Rect>;
-  strokesByNodePage: StrokeBucket;
-};
-
 export type InsertInput = {
   tree: Tree;
-  /**
-   * Only supplied on re-insert from edit mode (§F-ED-7). Present →
-   * insertMindmap:
-   *   1. Calls PluginCommAPI.deleteLassoElements() right after
-   *      page-size resolution to clear the pre-edit mindmap from
-   *      the page (the lasso is already wrapped around it, courtesy
-   *      of the "Edit Mindmap" entry point).
-   *   2. Computes a per-node move delta
-   *        postEditPageBbox.topLeft − preEditPageBbox.topLeft
-   *      for every node in both the pre-edit and post-edit layouts.
-   *   3. Translates each node's stroke bucket by its delta (rigid —
-   *      no scaling, §F-LY-6).
-   *   4. Drops strokes for nodes that no longer exist in the
-   *      post-edit tree (the user deleted a subtree). Strokes for
-   *      newly-added nodes never existed pre-edit, so there's
-   *      nothing to translate for them either.
-   *   5. Hands the translated bucket to emitGeometries via the same
-   *      preservedStrokesByNode path the first-insert flow has
-   *      always supported (the first-insert flow just always passes
-   *      `undefined`).
-   *
-   * Undefined → first-insert. The plugin never owns labels at
-   * initial authoring (§F-IN-2 step 3).
-   */
-  preEdit?: PreEditContext;
 };
 
 /**
  * Run the full insert flow. Resolves when the plugin view has been
- * dismissed by closePluginView(). Rejects on any unrecoverable
- * error, after best-effort cleanup (§F-IN-5).
+ * dismissed by closePluginView(). Rejects on any unrecoverable error.
  */
 export async function insertMindmap(input: InsertInput): Promise<void> {
-  const pageCtx = await resolvePageContext();
-  const {width: pageWidth, height: pageHeight} = pageCtx;
+  log('enter', {
+    nodeCount: input.tree.nodesById.size,
+    rootId: input.tree.rootId,
+  });
 
-  // §F-ED-7 step 0 — re-insert path only. Delete the pre-edit
-  // mindmap from the page BEFORE we start emitting the new one. The
-  // "Edit Mindmap" entry leaves the lasso wrapped around the old
-  // block, so a single deleteLassoElements reclaims everything
-  // (outlines, connectors, marker strokes, preserved label strokes).
-  // Done before layout/emit so a failure here leaves the old mindmap
-  // intact and we can throw cleanly — no partial state to clean up.
-  if (input.preEdit !== undefined) {
-    const delRes = (await PluginCommAPI.deleteLassoElements()) as ApiRes<boolean>;
-    if (!delRes?.success) {
-      throw new Error(
-        delRes?.error?.message ?? 'deleteLassoElements failed',
-      );
-    }
-  }
+  log('resolvePageContext:before');
+  const pageCtx = await resolvePageContext();
+  log('resolvePageContext:after', pageCtx);
+  const {width: pageWidth, height: pageHeight} = pageCtx;
 
   // §F-IN-2 step 0 — auto-expand every subtree so the layout + emit
   // passes see the fully expanded tree. We clone so the caller's
@@ -190,12 +108,18 @@ export async function insertMindmap(input: InsertInput): Promise<void> {
   // and the user expects to return to the canvas with their collapse
   // choices intact if the insert fails).
   const expanded = autoExpand(input.tree);
+  log('autoExpand:done', {nodeCount: expanded.nodesById.size});
 
   // §F-LY-1..F-LY-3 — radial layout in mindmap-local coords (root at
   // origin). The emit step needs bboxes for outlines and centers for
   // connector endpoints, and §F-IN-3 needs the union-rect for the
   // post-insert lasso.
   const baseLayout = radialLayout(expanded);
+  log('radialLayout:done', {
+    unionBbox: baseLayout.unionBbox,
+    centers: baseLayout.centers.size,
+    bboxes: baseLayout.bboxes.size,
+  });
 
   // §F-LY-6 — scale uniformly to fit if the map is wider than the
   // page (minus INSERT_MARGIN_PX on each side). Scale is capped at 1
@@ -214,161 +138,194 @@ export async function insertMindmap(input: InsertInput): Promise<void> {
     pageWidth,
     pageHeight,
   );
+  log('transformLayout:done', {
+    scale,
+    unionBbox: pageLayout.unionBbox,
+  });
 
-  // §F-ED-7 — compute post-edit stroke bucket. For first-insert this
-  // is undefined (the plugin doesn't own labels at authoring time).
-  // For Save, we translate every pre-edit bucket by its node's move
-  // delta; nodes deleted in this edit session drop out silently.
-  const preservedStrokesByNode =
-    input.preEdit === undefined
-      ? undefined
-      : translateStrokesForSave(input.preEdit, pageLayout.bboxes);
-
-  // §F-IN-2 — assemble the geometry list (outlines, connectors,
-  // marker, preserved strokes on re-insert).
-  //
-  // §F-PE-4: emitGeometries calls encodeMarker, which throws
-  // MarkerCapacityError when the tree exceeds MARKER_PUBLISHED_NODE_CAP.
-  // We let that error propagate verbatim — the UI layer (MindmapCanvas)
-  // catches it and surfaces the capacity modal. Nothing is on the page
-  // yet at this point, so there is no cleanup to do; the general
-  // try/catch below only wraps the per-geometry insertion loop that
-  // follows.
+  // §F-IN-2 — assemble the geometry list (outlines + connectors).
   const {geometries, unionRect} = emitGeometries({
     tree: expanded,
     layout: pageLayout,
-    preservedStrokesByNode,
+  });
+  log('emitGeometries:done', {
+    total: geometries.length,
+    byType: countByType(geometries),
+    unionRect,
   });
 
-  // §F-IN-3 — hand every emitted geometry to the firmware. Two
-  // paths:
-  //   - Fast path (preferred): when we successfully resolved the
-  //     current note's path and page, wrap every Geometry as an
-  //     Element of TYPE_GEO (700) and call PluginFileAPI.insertElements
-  //     once. This is a SINGLE RPC to the native side regardless of
-  //     how many geometries the emit produced. Essential for the
-  //     marker payload, which alone is ~2500 per-bit straightLines —
-  //     a sequential loop there stalls the plugin by tens of seconds
-  //     on device (each insertGeometry over the JS-to-native bridge
-  //     costs ~200–300 ms wall clock, per the 21:20 session in the
-  //     Nomad logcat).
-  //   - Fallback: if no note context is available (e.g. the
-  //     three-step chain in resolvePageContext fell through to
-  //     defaults, or a future unit test runs without mocking the
-  //     file bridge), use the original per-geometry insertGeometry
-  //     loop. It's slow but semantically equivalent, and keeps
-  //     resolvePageContext's defaults path working.
-  // On success, `insertedCount` is set to the full geometry count so
-  // the cleanup path has the full list if lassoElements fails next.
-  // The fast path either inserts everything atomically or nothing,
-  // which matches the semantics insertElements provides on device.
-  let insertedCount = 0;
+  // §F-IN-3 — batched write. Build one native-backed Element per
+  // emitted geometry (createElement returns an Element whose native
+  // side carries the uuid / angles / contoursSrc accessors the host
+  // validator expects; our old hand-built {type:700,…} object missed
+  // that plumbing and got rejected with APIError 106), then call
+  // replaceElements(notePath, page, [existing..., newElements]) ONCE.
+  //
+  // Performance: single replaceElements = one host-side fsync instead
+  // of one per geometry, cutting insert wall-time from ~80 s (309
+  // geometries × ~260 ms/fsync observed on the 08:45 probe run) to
+  // ~1–2 s. replaceElements itself is the only disk-touching step;
+  // every createElement is bridge-only.
+  //
+  // Atomicity: replaceElements is all-or-nothing on the host. If it
+  // fails, the page is untouched, so there's nothing to clean up —
+  // we just re-raise and let the UI layer surface the error banner.
+  if (pageCtx.notePath === null || pageCtx.page === null) {
+    throw new Error(
+      'insertMindmap: resolvePageContext returned null notePath/page; ' +
+        'replaceElements requires both',
+    );
+  }
   try {
-    if (pageCtx.notePath !== null && pageCtx.page !== null) {
-      const elements = geometries.map(wrapGeometryAsElement);
-      const res = (await PluginFileAPI.insertElements(
-        pageCtx.notePath,
-        pageCtx.page,
-        elements,
-      )) as ApiRes<boolean>;
-      if (!res?.success) {
-        throw new Error(res?.error?.message ?? 'insertElements failed');
-      }
-      insertedCount = geometries.length;
-    } else {
-      for (const geometry of geometries) {
-        const res = (await PluginCommAPI.insertGeometry(
-          roundGeometryPoints(geometry),
-        )) as ApiRes<boolean>;
-        if (!res?.success) {
-          throw new Error(res?.error?.message ?? 'insertGeometry failed');
-        }
-        insertedCount += 1;
-      }
-    }
+    log('buildElements:before', {count: geometries.length});
+    const newElements = await buildElementsForInsert(
+      geometries,
+      pageCtx.page,
+    );
+    log('buildElements:done', {built: newElements.length});
 
-    // §F-IN-3 — single explicit lasso call over the union rect of
-    // every geometry we emitted. The firmware's per-geometry
-    // auto-lasso doesn't stack across a batch, so this is what makes
-    // the whole block show up as a single selection.
-    const lassoRes = (await PluginCommAPI.lassoElements(
-      toLassoBounds(unionRect),
+    log('getElements:before');
+    const getRes = (await PluginFileAPI.getElements(
+      pageCtx.page,
+      pageCtx.notePath,
+    )) as ApiRes<unknown[]>;
+    log('getElements:after', {
+      success: getRes?.success,
+      errorMessage: getRes?.error?.message,
+      existingCount: Array.isArray(getRes?.result)
+        ? (getRes?.result as unknown[]).length
+        : null,
+    });
+    if (!getRes?.success || !Array.isArray(getRes.result)) {
+      throw new Error(getRes?.error?.message ?? 'getElements failed');
+    }
+    const existing = getRes.result as unknown[];
+
+    const combined = [...existing, ...newElements];
+    log('replaceElements:before', {
+      existingCount: existing.length,
+      addedCount: newElements.length,
+      totalCount: combined.length,
+    });
+    const replaceRes = (await PluginFileAPI.replaceElements(
+      pageCtx.notePath,
+      pageCtx.page,
+      combined as object[],
     )) as ApiRes<boolean>;
-    if (!lassoRes?.success) {
-      throw new Error(lassoRes?.error?.message ?? 'lassoElements failed');
+    log('replaceElements:after', {
+      success: replaceRes?.success,
+      errorCode: (replaceRes?.error as {code?: number} | undefined)?.code,
+      errorMessage: replaceRes?.error?.message,
+    });
+    if (!replaceRes?.success) {
+      throw new Error(replaceRes?.error?.message ?? 'replaceElements failed');
     }
 
-    // §F-IN-4 — dismiss the plugin. Awaited so the promise chain
-    // accurately represents "insert complete" to the caller, even
-    // though sn-shapes's ShapePalette doesn't await the same call
-    // (it fires and forgets inside a React event handler).
-    await PluginManager.closePluginView();
+    // Force the host to repaint the page with the newly-inserted
+    // geometries. reloadFile is non-fatal: its success is cosmetic
+    // (the page would repaint on the next interaction anyway), so
+    // we log and continue even on failure.
+    //
+    // NB: shape-snap calls setLassoBoxState(2) before reloadFile,
+    // but it does so AFTER an explicit lassoElements (to clear the
+    // selection that lasso produced). Our flow never lassos, so the
+    // call returns APIError 904 "no lasso action has been performed"
+    // — it's meaningless here. Skipped.
+    log('reloadFile:before');
+    const reloadRes = (await PluginCommAPI.reloadFile()) as ApiRes<boolean>;
+    log('reloadFile:after', reloadRes);
+
+    // Dismiss the plugin. NOT awaited — the host's response to
+    // closePluginView can be slow on-device, and we don't want the
+    // caller's `isInserting` UI state to stay pinned on "Inserting…"
+    // while that round-trip settles. sn-shapes's ShapePalette uses
+    // the same fire-and-forget pattern for this exact reason
+    // (https://github.com/… — see ShapePalette.tsx). Failures are
+    // visible via the :after line landing late or not at all.
+    log('closePluginView:fire');
+    PluginManager.closePluginView().then(
+      () => log('closePluginView:after'),
+      err =>
+        log('closePluginView:threw', {
+          message: err instanceof Error ? err.message : String(err),
+        }),
+    );
   } catch (err) {
-    // §F-IN-5 — best-effort cleanup. Only attempted when something
-    // actually landed on the page; a failed resolvePageContext or a
-    // zeroth-geometry failure leaves the page untouched and there's
-    // nothing to clean up.
-    if (insertedCount > 0) {
-      await attemptCleanup(geometries.slice(0, insertedCount));
-    }
+    log('catch', {
+      message: err instanceof Error ? err.message : String(err),
+      stack: err instanceof Error ? err.stack : undefined,
+    });
+    // replaceElements is atomic, so there is never a partial insert
+    // to clean up. The error re-raises unchanged.
     throw err;
   }
 }
 
 /**
- * Wrap a Geometry into the Element envelope that
- * PluginFileAPI.insertElements expects (type = TYPE_GEO / 700).
- *
- * Key rules enforced here:
- *
- * 1. `uuid` — native insertPageTrails rejects elements without a
- *    non-empty uuid string (the JS ElementSchema marks it optional,
- *    but native enforces it).
- *
- * 2. `layerNum: 0` — native expects this field; omitting it causes
- *    the "Invalid API parameters" rejection even though sn-plugin-lib
- *    JS schema marks it optional.
- *
- * 3. `showLassoAfterInsert` stripped — this field is documented as
- *    "Used only by insertGeometry; ignored by other APIs". Native's
- *    insertElements parser does NOT tolerate it inside the geometry
- *    sub-object and returns "Invalid API parameters" when it is
- *    present. We omit it explicitly here.
- *
- * 4. Point coordinates are rounded to integers (roundGeometryPoints)
- *    — fractional coords pass JS GeometrySchema but are rejected
- *    host-side in com.ratta.supernote.note.
+ * Breakdown of a Geometry[] by its `type` discriminator, used only by
+ * the `[INSERT] emitGeometries:done` log line to summarise the emit
+ * payload without dumping every point list. Kept next to insertMindmap
+ * because it exists purely for diagnostic output — no business logic
+ * consumes the shape.
  */
-function wrapGeometryAsElement(geometry: Geometry): {
-  type: number;
-  uuid: string;
-  layerNum: number;
-  geometry: Omit<Geometry, 'showLassoAfterInsert'>;
-} {
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const {showLassoAfterInsert: _drop, ...geoForNative} =
-    roundGeometryPoints(geometry);
-  return {
-    type: ELEMENT_TYPE_GEO,
-    uuid: uuidV4(),
-    layerNum: 0,
-    geometry: geoForNative,
-  };
+function countByType(geometries: Geometry[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const g of geometries) {
+    counts[g.type] = (counts[g.type] ?? 0) + 1;
+  }
+  return counts;
 }
 
 /**
- * Generate a RFC 4122 v4 UUID using Math.random.
- * Avoids a dependency on the `crypto` global, which is not typed in the
- * project's TS lib and may be absent on older Hermes builds.
+ * Build one native-backed `Element` per emitted Geometry, ready to
+ * hand to `PluginFileAPI.replaceElements`. For each geometry:
+ *
+ *   1. PluginCommAPI.createElement(Element.TYPE_GEO) — the native
+ *      side mints a new Element with the `uuid`, `angles` /
+ *      `contoursSrc` ElementDataAccessor instances, and the other
+ *      internal plumbing the host's validator requires. Our earlier
+ *      hand-built `{type:700, uuid, geometry}` objects missed this
+ *      plumbing and were rejected with APIError 106 — confirmed on
+ *      device by the 08:45 probe run that proved createElement +
+ *      replaceElements is the viable batched path.
+ *
+ *   2. Populate `pageNum` / `layerNum` / `thickness` / `geometry` on
+ *      the returned Element — same field shape `shape-snap` uses in
+ *      `createGeometryElement`. Points are rounded to integers here
+ *      (fractional coords are rejected host-side; see the comment on
+ *      `roundGeometryPoints`).
+ *
+ * Throws on the first `createElement` failure — this is treated as a
+ * terminal error since the batched write can't proceed without a
+ * complete Element list, and partial inserts aren't possible with the
+ * replaceElements semantics.
  */
-function uuidV4(): string {
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
-    // eslint-disable-next-line no-bitwise
-    const r = (Math.random() * 16) | 0;
-    // eslint-disable-next-line no-bitwise
-    const v = c === 'x' ? r : (r & 0x3) | 0x8;
-    return v.toString(16);
-  });
+async function buildElementsForInsert(
+  geometries: Geometry[],
+  page: number,
+): Promise<unknown[]> {
+  const out: unknown[] = [];
+  for (let i = 0; i < geometries.length; i += 1) {
+    const geom = geometries[i];
+    const res = (await PluginCommAPI.createElement(
+      Element.TYPE_GEO,
+    )) as ApiRes<Record<string, unknown>>;
+    if (!res?.success || !res.result) {
+      throw new Error(
+        `createElement failed at index ${i}: ${
+          res?.error?.message ?? 'unknown error'
+        }`,
+      );
+    }
+    const element = res.result;
+    const rounded = roundGeometryPoints(geom);
+    element.pageNum = page;
+    element.layerNum = 0;
+    element.thickness = rounded.penWidth;
+    element.geometry = rounded;
+    out.push(element);
+  }
+  return out;
 }
 
 /**
@@ -414,18 +371,18 @@ function roundGeometryPoints(geometry: Geometry): Geometry {
 }
 
 /**
- * Resolve everything insertMindmap needs to know about the current
- * page: its dimensions (for fit-to-page scale), its file path and
- * page index (for the batched PluginFileAPI.insertElements call).
- *
- * Mirrors the three-step fall-through from sn-shapes verbatim for
- * the dimensions — any null-ish/failure result at any step, or a
- * thrown exception, returns the Nomad portrait defaults. When the
- * note context is unavailable (path / page / size unresolvable), we
- * still return dimensions-only with `notePath: null` and
- * `page: null` so the caller falls back to the slower per-geometry
- * insertGeometry loop (which only needs the firmware's implicit
- * "current page" context via PluginCommAPI, not an explicit path).
+ * Resolve everything the insert pipeline needs from the host about
+ * the current page: page dimensions (for fit-to-page scale), plus
+ * notePath + page index used by the replaceElements probe (§F-IN-1).
+ * Mirrors the three-step fall-through from sn-shapes:
+ * PluginCommAPI.getCurrentFilePath -> getCurrentPageNum ->
+ * PluginFileAPI.getPageSize. Any null-ish / failure result at any
+ * step, or a thrown exception, returns the Nomad portrait defaults
+ * (with notePath/page = null, which the probe treats as "don't
+ * attempt"). The per-geometry insertGeometry loop doesn't consume
+ * notePath or page — it relies on the firmware's implicit
+ * "current page" context — so a null pair still lets the slow path
+ * run to completion.
  */
 type PageContext = {
   width: number;
@@ -450,18 +407,16 @@ async function resolvePageContext(): Promise<PageContext> {
       typeof pathRes.result === 'string' &&
       typeof pageRes.result === 'number'
     ) {
-      const notePath = pathRes.result;
-      const page = pageRes.result;
       const sizeRes = (await PluginFileAPI.getPageSize(
-        notePath,
-        page,
+        pathRes.result,
+        pageRes.result,
       )) as ApiRes<{width: number; height: number}>;
       if (sizeRes?.success && sizeRes.result) {
         return {
           width: sizeRes.result.width,
           height: sizeRes.result.height,
-          notePath,
-          page,
+          notePath: pathRes.result,
+          page: pageRes.result,
         };
       }
     }
@@ -469,60 +424,6 @@ async function resolvePageContext(): Promise<PageContext> {
     // Fall through to defaults.
   }
   return defaults;
-}
-
-/**
- * §F-ED-7 — per-node stroke translation for Save.
- *
- * Given the pre-edit page bboxes and stroke buckets carried over from
- * EditMindmap, plus the FRESH post-edit page bboxes computed by
- * transformLayout, produce a new bucket whose strokes live in
- * post-edit page coordinates.
- *
- * Algorithm:
- *   For every (nodeId, strokes) in preEdit.strokesByNodePage:
- *     - look up preEditBbox for that id → if missing, drop bucket.
- *       Missing pre-edit bbox is a decoder-vs-associator mismatch that
- *       shouldn't happen in practice but isn't worth crashing over.
- *     - look up postEditBbox for that id → if missing, drop bucket.
- *       This is the "user deleted this subtree during edit" case. The
- *       strokes simply go with the node (§F-ED-7 doesn't specify an
- *       orphan destination and there isn't a sensible one — the node
- *       is gone, so its labels go with it).
- *     - delta = postEditBbox.topLeft − preEditBbox.topLeft.
- *     - translateStrokes(strokes, delta) → post-edit page coords.
- *
- * Pure function — preEdit and the post-edit bbox map are untouched;
- * translateStrokes itself never mutates inputs. Stable iteration
- * order: the returned Map preserves insertion order from
- * preEdit.strokesByNodePage, which was built in the decoder's BFS
- * order (so tests and logs can rely on a deterministic layout).
- *
- * Newly-added nodes never appear as keys in preEdit.strokesByNodePage
- * because strokes came from the pre-edit lasso; they therefore end up
- * with no preserved strokes automatically, which is the right
- * behavior — the user hasn't written any labels for them yet.
- */
-function translateStrokesForSave(
-  preEdit: PreEditContext,
-  postEditPageBboxes: Map<NodeId, Rect>,
-): StrokeBucket {
-  const out: StrokeBucket = new Map();
-  for (const [id, strokes] of preEdit.strokesByNodePage) {
-    const pre = preEdit.preEditPageBboxes.get(id);
-    const post = postEditPageBboxes.get(id);
-    if (!pre || !post) {
-      // Either a decoder/associator mismatch (pre missing) or the
-      // node was deleted in this edit session (post missing). Drop
-      // the bucket silently — §F-ED-7 has no restoration path for
-      // deleted subtrees' labels, and a hard error here would
-      // block every Save whose user deleted anything.
-      continue;
-    }
-    const delta = {x: post.x - pre.x, y: post.y - pre.y};
-    out.set(id, translateStrokes(strokes, delta));
-  }
-  return out;
 }
 
 /**
@@ -610,58 +511,5 @@ function transformLayout(
       h: scaledU.h,
     },
   };
-}
-
-/**
- * Translate the plugin's Rect format (x/y/w/h) into the firmware's
- * lasso-bounds format (left/top/right/bottom). Exposed as a free
- * function so the cleanup path can reuse it without re-deriving the
- * conversion.
- *
- * The firmware's RectSchema (sn-plugin-lib VerifyUtils) requires all
- * four fields to be integers and rejects floats with APIError(107)
- * ("must be an integer"), which surfaces in the UI as "invalid
- * parameters sent to the API". Upstream geometry — radial layout
- * centers (Math.cos/Math.sin) and rounded-corner polygon vertices
- * (roundedRectPoints) — is inherently fractional, so we floor/ceil
- * here to produce the smallest integer rect that still encloses the
- * union. Widening by <1 unit has no user-visible effect because the
- * firmware canvas resolution is in the thousands per side.
- */
-function toLassoBounds(rect: Rect): {
-  left: number;
-  top: number;
-  right: number;
-  bottom: number;
-} {
-  return {
-    left: Math.floor(rect.x),
-    top: Math.floor(rect.y),
-    right: Math.ceil(rect.x + rect.w),
-    bottom: Math.ceil(rect.y + rect.h),
-  };
-}
-
-/**
- * §F-IN-5 — best-effort cleanup. Lasso the rectangle covering every
- * geometry that was successfully inserted, then call
- * deleteLassoElements. Failures at either step are swallowed: the
- * user will see the original insertGeometry error and can use the
- * firmware's undo action (the "undo" chevron in the standard note
- * toolbar) to back out anything this cleanup couldn't reclaim.
- */
-async function attemptCleanup(inserted: Geometry[]): Promise<void> {
-  const partial = unionRectOfGeometries(inserted);
-  try {
-    const lassoRes = (await PluginCommAPI.lassoElements(
-      toLassoBounds(partial),
-    )) as ApiRes<boolean>;
-    if (lassoRes?.success) {
-      await PluginCommAPI.deleteLassoElements();
-    }
-  } catch {
-    // Swallow. Original error in the caller is what the user needs
-    // to see; §F-IN-5 explicitly permits manual cleanup for v0.1.
-  }
 }
 
