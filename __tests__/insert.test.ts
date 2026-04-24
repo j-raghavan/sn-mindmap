@@ -578,4 +578,96 @@ describe('insertMindmap — error + cleanup (§F-IN-5)', () => {
     expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
     expect(PluginCommAPI.deleteLassoElements).not.toHaveBeenCalled();
   });
+
+  it('falls back to the default "createElement failed" message when the host omits error.message', async () => {
+    // The `?? 'unknown error'` nullish-coalesce branch fires when the
+    // host rejects a createElement but doesn't populate error.message.
+    asMock(PluginCommAPI.createElement).mockResolvedValueOnce({success: false});
+
+    const tree = buildSmallTree();
+    await expect(insertMindmap({tree})).rejects.toThrow(
+      /createElement failed at index 0: unknown error/,
+    );
+    expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
+  });
+
+  it('falls back to "getElements failed" when error.message is missing', async () => {
+    asMock(PluginFileAPI.getElements).mockResolvedValueOnce({success: false});
+
+    const tree = buildSmallTree();
+    await expect(insertMindmap({tree})).rejects.toThrow(/getElements failed/);
+    expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
+  });
+
+  it('rejects when getElements returns success:true but a non-array result', async () => {
+    // Second half of the getElements guard: `!Array.isArray(getRes.result)`.
+    // Host contract guarantees an array, so the only way to hit this
+    // branch is a malformed mock — same error message as the
+    // success:false path, because the fallback string is shared.
+    asMock(PluginFileAPI.getElements).mockResolvedValueOnce({
+      success: true,
+      result: {notAnArray: true},
+    });
+
+    const tree = buildSmallTree();
+    await expect(insertMindmap({tree})).rejects.toThrow(/getElements failed/);
+    expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
+  });
+
+  it('falls back to "replaceElements failed" when error.message is missing', async () => {
+    asMock(PluginFileAPI.replaceElements).mockResolvedValueOnce({success: false});
+
+    const tree = buildSmallTree();
+    await expect(insertMindmap({tree})).rejects.toThrow(/replaceElements failed/);
+  });
+
+  it('stringifies non-serialisable log details via the String(detail) fallback', async () => {
+    // Force log()'s JSON.stringify to throw by feeding it a circular
+    // object. reloadFile's result flows straight into
+    // log('reloadFile:after', …) — returning a self-referencing object
+    // drops the pipeline into the String(detail) fallback (catch arm
+    // of log). The insert itself still completes, since reloadFile
+    // failure is non-fatal.
+    const circular: {success: boolean; self?: unknown} = {success: true};
+    circular.self = circular;
+    asMock(PluginCommAPI.reloadFile).mockResolvedValueOnce(circular);
+
+    const tree = buildSmallTree();
+    await expect(insertMindmap({tree})).resolves.toBeUndefined();
+    expect(PluginFileAPI.replaceElements).toHaveBeenCalledTimes(1);
+  });
+
+  it('re-raises a non-Error thrown value via the String(err) branch of the outer catch', async () => {
+    // The outer catch logs via
+    //   `err instanceof Error ? err.message : String(err)`.
+    // To exercise the false arm we throw a plain string from
+    // createElement — the value propagates all the way back to the
+    // insertMindmap caller unchanged.
+    asMock(PluginCommAPI.createElement).mockImplementationOnce(async () => {
+      throw 'plain string failure';
+    });
+
+    const tree = buildSmallTree();
+    await expect(insertMindmap({tree})).rejects.toBe('plain string failure');
+    expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
+  });
+
+  it('swallows closePluginView rejection (fire-and-forget)', async () => {
+    // closePluginView is fired but NOT awaited by insertMindmap — the
+    // native bridge's response can lag and we don't want to pin the
+    // caller's "Inserting…" UI state on it. A post-insert rejection
+    // is logged via the err-arm of .then but must NOT propagate back
+    // to the caller or trigger an unhandled-rejection warning.
+    asMock(PluginManager.closePluginView).mockRejectedValueOnce(
+      new Error('bridge closed'),
+    );
+
+    const tree = buildSmallTree();
+    await expect(insertMindmap({tree})).resolves.toBeUndefined();
+    expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
+    // Flush microtasks so the fire-and-forget rejection handler runs
+    // before the test ends (otherwise Jest flags the unhandled rejection).
+    await Promise.resolve();
+    await Promise.resolve();
+  });
 });

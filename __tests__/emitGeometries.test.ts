@@ -317,6 +317,19 @@ describe('unionRectOfGeometries — standalone', () => {
       unionRectOfGeometries([{type: 'unknown-variant'} as unknown as Geometry]),
     ).toThrow(/unknown geometry variant/);
   });
+
+  it('returns {0,0,0,0} when every polygon has an empty point list', () => {
+    // Degenerate input: geometries.length > 0 so we skip the early-out,
+    // but no extend() call ever fires because each polygon's points[]
+    // is empty. The post-loop `minX === Infinity` sentinel catches this.
+    const emptyPoly: PolygonGeometry = {
+      ...PEN_DEFAULTS,
+      type: 'GEO_polygon',
+      points: [],
+      showLassoAfterInsert: false,
+    };
+    expect(unionRectOfGeometries([emptyPoly])).toEqual({x: 0, y: 0, w: 0, h: 0});
+  });
 });
 
 describe('emitGeometries — layout consistency errors', () => {
@@ -348,6 +361,74 @@ describe('emitGeometries — layout consistency errors', () => {
 });
 
 describe('emitGeometries — connector clipping edge cases', () => {
+  /**
+   * Build a two-node tree (root + one child) and wrap a synthetic
+   * LayoutResult around it so tests can drive clipSegmentBetweenRects
+   * through every failure mode — parent-center outside parent rect,
+   * axis-parallel lines that miss a slab, non-parallel lines that miss
+   * a rect entirely, and overlapping rects. The real radialLayout
+   * always places centers INSIDE their own bboxes, so these pathologies
+   * are only reachable with a fabricated layout.
+   */
+  function oneChildLayout(
+    rootCenter: {x: number; y: number},
+    rootBbox: Rect,
+    childCenter: {x: number; y: number},
+    childBbox: Rect,
+  ): {tree: Tree; layout: LayoutResult} {
+    const tree = createTree();
+    const childId = addChild(tree, tree.rootId);
+    const layout: LayoutResult = {
+      centers: new Map([
+        [tree.rootId, rootCenter],
+        [childId, childCenter],
+      ]),
+      bboxes: new Map([
+        [tree.rootId, rootBbox],
+        [childId, childBbox],
+      ]),
+      unionBbox: rootBbox,
+    };
+    return {tree, layout};
+  }
+
+  it('falls back to center pair when the line is axis-parallel and origin lies outside the parent bbox slab (slabIntersect null)', () => {
+    // Vertical line (dx=0) from a parent centre whose x sits far to
+    // the right of the parent bbox. slabIntersect's d=0 branch hits the
+    // `p0 < lo || p0 > hi` early-null, driving clipSegmentBetweenRects
+    // into the center-pair fallback.
+    const {tree, layout} = oneChildLayout(
+      {x: 1000, y: 0},
+      {x: -50, y: -50, w: 100, h: 100},
+      {x: 1000, y: 500},
+      {x: 950, y: 450, w: 100, h: 100},
+    );
+    const {geometries} = emitGeometries({tree, layout});
+    const lines = geometries.filter(isLine);
+    expect(lines).toHaveLength(1);
+    // Fallback: endpoints equal the (broken) centres verbatim.
+    expect(lines[0].points[0]).toEqual({x: 1000, y: 0});
+    expect(lines[0].points[1]).toEqual({x: 1000, y: 500});
+  });
+
+  it('falls back to center pair when the line misses the parent bbox (slab tEnter > tExit)', () => {
+    // Non-axis-parallel line whose parametric entry/exit on the parent
+    // bbox's two slabs don't overlap — slabIntersect returns null
+    // mid-loop via the `tEnter > tExit` guard. Both dx and dy are
+    // non-zero so the axis-parallel early return is bypassed.
+    const {tree, layout} = oneChildLayout(
+      {x: 100, y: 100},
+      {x: 0, y: 0, w: 50, h: 50},
+      {x: 300, y: 50},
+      {x: 250, y: 25, w: 100, h: 50},
+    );
+    const {geometries} = emitGeometries({tree, layout});
+    const lines = geometries.filter(isLine);
+    expect(lines).toHaveLength(1);
+    expect(lines[0].points[0]).toEqual({x: 100, y: 100});
+    expect(lines[0].points[1]).toEqual({x: 300, y: 50});
+  });
+
   it('falls back to center pair when parent and child share the same bbox', () => {
     // Two nodes at the same position: parent center is inside both
     // rects, so the clipping's "exit parent, enter child" ordering
