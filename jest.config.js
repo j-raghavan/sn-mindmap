@@ -38,14 +38,21 @@ module.exports = {
       branches: 100, functions: 100, lines: 100, statements: 100,
     },
     './src/insert.ts': {
-      // Line 363: roundGeometryPoints' GEO_circle / GEO_ellipse case is
-      // defensive — emitGeometries only produces polygons and
-      // straightLines today, so the ellipseCenterPoint rounding path
-      // is structurally unreachable from the full insert pipeline.
-      // Kept so that future callers emitting circles or ellipses don't
-      // silently skip the integer-rounding the native firmware
-      // requires.
-      branches: 91, functions: 100, lines: 99, statements: 99,
+      // Two structurally-unreachable defensive guards account for the
+      // <100% line/statement coverage:
+      //   - roundGeometryPoints' GEO_circle / GEO_ellipse case
+      //     (line ~479) — emitGeometries only produces polygons and
+      //     straightLines today, so the ellipseCenterPoint rounding
+      //     path is unreachable from the full insert pipeline. Kept
+      //     so that future callers emitting circles or ellipses don't
+      //     silently skip the integer-rounding the native firmware
+      //     requires.
+      //   - collectLabeledNodes' `if (!bbox) continue;` (line ~332) —
+      //     radialLayout populates bboxes for every node in the tree,
+      //     so a labeled node without a layout bbox cannot occur in
+      //     practice. Kept as a defense-in-depth guard against a
+      //     future layout change emitting a partial bboxes map.
+      branches: 91, functions: 100, lines: 98, statements: 98,
     },
   },
 };

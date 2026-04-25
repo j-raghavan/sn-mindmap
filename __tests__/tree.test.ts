@@ -24,6 +24,8 @@ import {
   deleteSubtree,
   flattenForEmit,
   setCollapsed,
+  setLabel,
+  shapeForDepth,
   ShapeKind,
   type Tree,
 } from '../src/model/tree';
@@ -274,6 +276,57 @@ describe('tree', () => {
       const tree: Tree = createTree();
       const clone: Tree = cloneTree(tree);
       expect(clone.rootId).toBe(tree.rootId);
+    });
+  });
+
+  describe('shapeForDepth', () => {
+    it('depth 0 → OVAL (root central idea)', () => {
+      expect(shapeForDepth(0)).toBe(ShapeKind.OVAL);
+    });
+
+    it('depth 1 → ROUNDED_RECTANGLE', () => {
+      expect(shapeForDepth(1)).toBe(ShapeKind.ROUNDED_RECTANGLE);
+    });
+
+    it('depth 2 → RECTANGLE', () => {
+      expect(shapeForDepth(2)).toBe(ShapeKind.RECTANGLE);
+    });
+
+    it('depth ≥ 3 → PARALLELOGRAM', () => {
+      expect(shapeForDepth(3)).toBe(ShapeKind.PARALLELOGRAM);
+      expect(shapeForDepth(7)).toBe(ShapeKind.PARALLELOGRAM);
+    });
+  });
+
+  describe('setLabel', () => {
+    it('stores a trimmed label', () => {
+      const tree = createTree();
+      const a = addChild(tree, 0);
+      setLabel(tree, a, '  hello  ');
+      expect(tree.nodesById.get(a)?.label).toBe('hello');
+    });
+
+    it('treats an empty string as no label', () => {
+      const tree = createTree('seed');
+      setLabel(tree, 0, '');
+      expect(tree.nodesById.get(0)?.label).toBeUndefined();
+    });
+
+    it('treats a whitespace-only string as no label', () => {
+      const tree = createTree('seed');
+      setLabel(tree, 0, '   ');
+      expect(tree.nodesById.get(0)?.label).toBeUndefined();
+    });
+
+    it('treats undefined as no label', () => {
+      const tree = createTree('seed');
+      setLabel(tree, 0, undefined);
+      expect(tree.nodesById.get(0)?.label).toBeUndefined();
+    });
+
+    it('throws on unknown node id', () => {
+      const tree = createTree();
+      expect(() => setLabel(tree, 999, 'x')).toThrow(/unknown node/);
     });
   });
 });

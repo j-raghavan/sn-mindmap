@@ -20,12 +20,17 @@
  */
 import {
   nodeFrame,
+  parallelogramPoints,
   rectanglePoints,
   roundedRectPoints,
 } from '../src/rendering/nodeFrame';
 import {ShapeKind} from '../src/model/tree';
 import {PEN_DEFAULTS, type Rect} from '../src/geometry';
-import {ROOT_PEN_WIDTH, SIBLING_CORNER_RADIUS} from '../src/layout/constants';
+import {
+  PARALLELOGRAM_SKEW_PX,
+  ROOT_PEN_WIDTH,
+  SIBLING_CORNER_RADIUS,
+} from '../src/layout/constants';
 
 // Standard node bbox matching NODE_WIDTH × NODE_HEIGHT = 220 × 96 at
 // the origin; positioned off-origin to catch bbox.x / bbox.y bugs
@@ -154,6 +159,36 @@ describe('nodeFrame', () => {
     });
   });
 
+  describe('PARALLELOGRAM', () => {
+    it('emits a GEO_polygon with 5 points (4 corners + close)', () => {
+      const geo = nodeFrame(BBOX, ShapeKind.PARALLELOGRAM);
+      expect(geo.type).toBe('GEO_polygon');
+      if (geo.type !== 'GEO_polygon') {
+        return;
+      }
+      expect(geo.points).toHaveLength(5);
+      expect(geo.points[0]).toEqual(geo.points[4]);
+    });
+
+    it('top edge shifts right by skew, bottom edge shifts left', () => {
+      const geo = nodeFrame(BBOX, ShapeKind.PARALLELOGRAM);
+      if (geo.type !== 'GEO_polygon') {
+        throw new Error('wrong type');
+      }
+      const s = PARALLELOGRAM_SKEW_PX;
+      const [p0, p1, p2, p3] = geo.points;
+      expect(p0).toEqual({x: BBOX.x + s, y: BBOX.y});
+      expect(p1).toEqual({x: BBOX.x + BBOX.w, y: BBOX.y});
+      expect(p2).toEqual({x: BBOX.x + BBOX.w - s, y: BBOX.y + BBOX.h});
+      expect(p3).toEqual({x: BBOX.x, y: BBOX.y + BBOX.h});
+    });
+
+    it('uses PEN_DEFAULTS.penWidth by default', () => {
+      const geo = nodeFrame(BBOX, ShapeKind.PARALLELOGRAM);
+      expect(geo.penWidth).toBe(PEN_DEFAULTS.penWidth);
+    });
+  });
+
   describe('NodeFrameOptions.penWidth override', () => {
     it('overrides OVAL default', () => {
       const geo = nodeFrame(BBOX, ShapeKind.OVAL, {penWidth: 123});
@@ -168,6 +203,11 @@ describe('nodeFrame', () => {
     it('overrides ROUNDED_RECTANGLE default', () => {
       const geo = nodeFrame(BBOX, ShapeKind.ROUNDED_RECTANGLE, {penWidth: 7});
       expect(geo.penWidth).toBe(7);
+    });
+
+    it('overrides PARALLELOGRAM default', () => {
+      const geo = nodeFrame(BBOX, ShapeKind.PARALLELOGRAM, {penWidth: 99});
+      expect(geo.penWidth).toBe(99);
     });
   });
 
@@ -249,5 +289,29 @@ describe('roundedRectPoints (exported helper)', () => {
         expect(pts[start + j]).toEqual(pts[start]);
       }
     }
+  });
+});
+
+describe('parallelogramPoints (exported helper)', () => {
+  it('returns 4 open corner points slanted by the requested skew', () => {
+    const pts = parallelogramPoints(BBOX, 20);
+    expect(pts).toHaveLength(4);
+    expect(pts[0]).toEqual({x: BBOX.x + 20, y: BBOX.y});
+    expect(pts[1]).toEqual({x: BBOX.x + BBOX.w, y: BBOX.y});
+    expect(pts[2]).toEqual({x: BBOX.x + BBOX.w - 20, y: BBOX.y + BBOX.h});
+    expect(pts[3]).toEqual({x: BBOX.x, y: BBOX.y + BBOX.h});
+  });
+
+  it('clamps skew to bbox.w / 2 (shape never collapses to a line)', () => {
+    const pts = parallelogramPoints(BBOX, 9999);
+    // Top-left x is clamped to BBOX.x + BBOX.w / 2 (= halfway across).
+    expect(pts[0].x).toBe(BBOX.x + BBOX.w / 2);
+    expect(pts[2].x).toBe(BBOX.x + BBOX.w - BBOX.w / 2);
+  });
+
+  it('treats negative skew as zero (degenerates to a rectangle)', () => {
+    const pts = parallelogramPoints(BBOX, -10);
+    expect(pts[0]).toEqual({x: BBOX.x, y: BBOX.y});
+    expect(pts[2]).toEqual({x: BBOX.x + BBOX.w, y: BBOX.y + BBOX.h});
   });
 });

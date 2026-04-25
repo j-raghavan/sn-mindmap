@@ -38,7 +38,7 @@ jest.mock('sn-plugin-lib', () => {
     geometry: null as unknown,
   });
   return {
-    Element: {TYPE_GEO: 700},
+    Element: {TYPE_GEO: 700, TYPE_TEXT: 600},
     PluginCommAPI: {
       createElement: jest
         .fn()
@@ -83,6 +83,7 @@ import {
   addChild,
   createTree,
   setCollapsed,
+  setLabel,
   type Tree,
 } from '../src/model/tree';
 
@@ -289,6 +290,59 @@ describe('insertMindmap — happy path (§F-IN-1..F-IN-4)', () => {
         expect(Number.isInteger(p.y)).toBe(true);
       }
     }
+  });
+});
+
+describe('insertMindmap — labeled nodes (TYPE_TEXT path)', () => {
+  it('emits one TYPE_TEXT element per labeled node alongside the geometry elements', async () => {
+    // Build a tree where root + one child carry labels; the other
+    // two children are unlabeled and should NOT contribute TYPE_TEXT
+    // elements (collectLabeledNodes filters them by trim() emptiness).
+    const tree = createTree();
+    setLabel(tree, 0, 'Root idea');
+    const a = addChild(tree, 0, 'Child A');
+    addChild(tree, 0); // unlabeled
+    addChild(tree, 0); // unlabeled
+    void a;
+
+    await insertMindmap({tree});
+
+    // 4 outlines + 3 connectors = 7 TYPE_GEO; 2 labels = 2 TYPE_TEXT.
+    const createCalls = asMock(PluginCommAPI.createElement).mock.calls;
+    const geoCount = createCalls.filter(([k]) => k === 700).length;
+    const textCount = createCalls.filter(([k]) => k === 600).length;
+    expect(geoCount).toBe(7);
+    expect(textCount).toBe(2);
+  });
+
+  it('populates textBox with the label, padded textRect, clamped fontSize and centre alignment', async () => {
+    const tree = createTree();
+    setLabel(tree, 0, '  Padded label  ');
+
+    await insertMindmap({tree});
+
+    const replaceCall = asMock(PluginFileAPI.replaceElements).mock.calls[0];
+    const combined = replaceCall[2] as Array<{
+      textBox?: {
+        textContentFull?: string;
+        textRect?: {left: number; top: number; right: number; bottom: number};
+        fontSize?: number;
+        textAlign?: number;
+      };
+    }>;
+    const textElements = combined.filter(el => el?.textBox !== undefined);
+    expect(textElements).toHaveLength(1);
+    const tb = textElements[0].textBox!;
+    // setLabel already trimmed the stored label.
+    expect(tb.textContentFull).toBe('Padded label');
+    // 8 px padding on every side.
+    expect(tb.textRect!.left).toBeLessThan(tb.textRect!.right);
+    expect(tb.textRect!.top).toBeLessThan(tb.textRect!.bottom);
+    // fontSize is clamped between 20 and 48.
+    expect(tb.fontSize).toBeGreaterThanOrEqual(20);
+    expect(tb.fontSize).toBeLessThanOrEqual(48);
+    // Centre alignment.
+    expect(tb.textAlign).toBe(1);
   });
 });
 
@@ -657,6 +711,70 @@ describe('insertMindmap — error + cleanup (§F-IN-5)', () => {
     const tree = buildSmallTree();
     await expect(insertMindmap({tree})).rejects.toBe('plain string failure');
     expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
+  });
+
+  it('re-raises a createElement(text) failure for labeled nodes', async () => {
+    // First N createElement calls (TYPE_GEO) succeed, then the
+    // TYPE_TEXT createElement for the labeled root fails. Pipeline
+    // must abort before replaceElements.
+    let geoCalls = 0;
+    asMock(PluginCommAPI.createElement).mockImplementation(
+      async (kind: number) => {
+        if (kind === 600) {
+          // TYPE_TEXT
+          return {
+            success: false,
+            error: {message: 'simulated: text element rejected'},
+          };
+        }
+        geoCalls += 1;
+        return {
+          success: true,
+          result: {
+            uuid: `geo-${geoCalls}`,
+            type: 700,
+            pageNum: 0,
+            layerNum: 0,
+            thickness: 0,
+            geometry: null,
+          },
+        };
+      },
+    );
+
+    const tree = buildSmallTree();
+    setLabel(tree, 0, 'root');
+    await expect(insertMindmap({tree})).rejects.toThrow(
+      /createElement\(text\) failed at index 0/,
+    );
+    expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
+  });
+
+  it('falls back to "createElement(text)" default message when error.message missing', async () => {
+    asMock(PluginCommAPI.createElement).mockImplementation(
+      async (kind: number) => {
+        if (kind === 600) {
+          return {success: false};
+        }
+        return {
+          success: true,
+          result: {
+            uuid: `geo-${Math.random()}`,
+            type: 700,
+            pageNum: 0,
+            layerNum: 0,
+            thickness: 0,
+            geometry: null,
+          },
+        };
+      },
+    );
+
+    const tree = buildSmallTree();
+    setLabel(tree, 0, 'root');
+    await expect(insertMindmap({tree})).rejects.toThrow(
+      /createElement\(text\) failed at index 0: unknown error/,
+    );
   });
 
   it('swallows closePluginView rejection (fire-and-forget)', async () => {
