@@ -322,7 +322,23 @@ describe('MindmapCanvas', () => {
       unmount();
     });
 
-    it('RECTANGLE child renders with borderRadius = 0', () => {
+    it('depth-2 grandchild (RECTANGLE) renders with borderRadius = 0', () => {
+      // v1.0 shape-by-depth: depth-1 children are ROUNDED_RECTANGLE,
+      // depth-2 grandchildren are RECTANGLE. The borderRadius=0 case
+      // therefore lives one level deeper than it used to.
+      const tree = createTree();
+      const a = addChild(tree, tree.rootId);
+      const aa = addChild(tree, a);
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      const node = findHostSingle(renderer, `node-${aa}`);
+      const style = flattenStyle(node.props.style);
+      expect(style.borderRadius).toBe(0);
+      unmount();
+    });
+
+    it('depth-1 child (ROUNDED_RECTANGLE) renders with SIBLING_CORNER_RADIUS', () => {
       const tree = createTree();
       const a = addChild(tree, tree.rootId);
       const {renderer, unmount} = renderCanvas(
@@ -330,21 +346,29 @@ describe('MindmapCanvas', () => {
       );
       const node = findHostSingle(renderer, `node-${a}`);
       const style = flattenStyle(node.props.style);
-      expect(style.borderRadius).toBe(0);
+      // SIBLING_CORNER_RADIUS = 15 per layout/constants.ts.
+      expect(style.borderRadius).toBe(15);
       unmount();
     });
 
-    it('ROUNDED_RECTANGLE sibling renders with SIBLING_CORNER_RADIUS', () => {
+    it('depth-3+ descendants render as PARALLELOGRAM with skewX transform', () => {
+      // PARALLELOGRAM nodes inherit borderRadius=0 (sharp corners);
+      // the slant comes from a transform: [{skewX: '-12deg'}] on the
+      // outline View. The label nests its own counter-skew so it
+      // reads upright — that detail isn't asserted here, just the
+      // outline-level skew.
       const tree = createTree();
       const a = addChild(tree, tree.rootId);
-      const s = addSibling(tree, a);
+      const aa = addChild(tree, a);
+      const aaa = addChild(tree, aa);
       const {renderer, unmount} = renderCanvas(
         <MindmapCanvas initialTree={tree} />,
       );
-      const node = findHostSingle(renderer, `node-${s}`);
+      const node = findHostSingle(renderer, `node-${aaa}`);
       const style = flattenStyle(node.props.style);
-      // SIBLING_CORNER_RADIUS = 15 per layout/constants.ts.
-      expect(style.borderRadius).toBe(15);
+      expect(style.borderRadius).toBe(0);
+      const transforms = style.transform as Array<Record<string, string>>;
+      expect(transforms?.some(t => t.skewX === '-12deg')).toBe(true);
       unmount();
     });
   });
@@ -418,26 +442,33 @@ describe('MindmapCanvas', () => {
   });
 
   describe('Phase 1.4b — selection behaviour', () => {
-    it('tapping the same node twice clears selection', () => {
-      const tree = createTree();
-      const a = addChild(tree, tree.rootId);
+    it('tapping a node selects it AND opens the edit-label modal', () => {
+      // Tap = select + edit (per the v0.2 label-first UX). Tapping
+      // an already-selected node still re-opens the modal so the
+      // user can iterate on the label without first deselecting.
+      const tree = createTree('root label');
+      const a = addChild(tree, tree.rootId, 'a label');
       const {renderer, unmount} = renderCanvas(
         <MindmapCanvas initialTree={tree} />,
       );
       pressByLabel(renderer, `node-${a}`);
       expect(findHostByLabel(renderer, `delete-${a}`)).toHaveLength(1);
-      pressByLabel(renderer, `node-${a}`);
-      expect(findHostByLabel(renderer, `delete-${a}`)).toHaveLength(0);
+      // Modal opened — its label-input field is visible.
+      expect(findHostByLabel(renderer, 'label-input')).toHaveLength(1);
       unmount();
     });
 
     it('tapping the background clears selection', () => {
-      const tree = createTree();
-      const a = addChild(tree, tree.rootId);
+      const tree = createTree('root label');
+      const a = addChild(tree, tree.rootId, 'a label');
       const {renderer, unmount} = renderCanvas(
         <MindmapCanvas initialTree={tree} />,
       );
       pressByLabel(renderer, `node-${a}`);
+      // The tap above also opened the edit-label modal — close it
+      // by tapping its Cancel button so the background-press test
+      // reflects the actual user gesture for clearing selection.
+      pressByLabel(renderer, 'label-cancel');
       expect(findHostByLabel(renderer, `delete-${a}`)).toHaveLength(1);
       pressByLabel(renderer, 'mindmap-background');
       expect(findHostByLabel(renderer, `delete-${a}`)).toHaveLength(0);
@@ -446,46 +477,87 @@ describe('MindmapCanvas', () => {
   });
 
   describe('Phase 1.4b — mutations re-render the tree', () => {
-    it('Add Child adds a new child node and its connector', () => {
-      const {renderer, unmount} = renderCanvas(<MindmapCanvas />);
-      // Start: single root → 1 node, 0 connectors.
+    /**
+     * Type a label into the modal's TextInput and tap Create. Used by
+     * every Add Child / Add Sibling / Edit assertion below — the modal
+     * is now mandatory between gesture and tree mutation.
+     */
+    function fillModalAndCreate(
+      renderer: Renderer,
+      label: string,
+    ): void {
+      const input = renderer.root.findAllByProps({
+        accessibilityLabel: 'label-input',
+      })[0];
+      act(() => {
+        (input.props.onChangeText as (s: string) => void)(label);
+      });
+      pressByLabel(renderer, 'label-create');
+    }
+
+    it('Add Child opens the modal, then adds the new child + connector on Create', () => {
+      const tree = createTree('root');
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      // Start: single root, no connectors, no modal.
       expect(findHostByLabel(renderer, 'connector')).toHaveLength(0);
+      expect(findHostByLabel(renderer, 'label-modal')).toHaveLength(0);
       pressByLabel(renderer, 'add-child-0');
-      // Now there should be 2 nodes (root + new child id=1) and 1
-      // connector.
+      // Add Child opens the modal — node-1 is NOT created yet.
+      expect(findHostByLabel(renderer, 'label-modal')).toHaveLength(1);
+      expect(findHostByLabel(renderer, 'node-1')).toHaveLength(0);
+      // Type a label and tap Create. node-1 + connector now appear.
+      fillModalAndCreate(renderer, 'first child');
       expect(findHostByLabel(renderer, 'node-1')).toHaveLength(1);
       expect(findHostByLabel(renderer, 'connector')).toHaveLength(1);
       unmount();
     });
 
-    it('Add Sibling inserts a peer next to the tapped node', () => {
-      const tree = createTree();
-      const a = addChild(tree, tree.rootId);
+    it('Add Sibling opens the modal, then inserts a peer on Create', () => {
+      const tree = createTree('root');
+      const a = addChild(tree, tree.rootId, 'a');
       const {renderer, unmount} = renderCanvas(
         <MindmapCanvas initialTree={tree} />,
       );
       pressByLabel(renderer, `add-sibling-${a}`);
-      // Root now has 2 children: `a` and a new sibling. We know the
-      // next id assigned by allocateNode is nextId at the time of
-      // the action; since the canvas cloned the tree the caller's
-      // tree has nextId=2 still, but the canvas's copy has minted
-      // id=2. Check by counting rendered nodes: root, a, and the new
-      // sibling = 3 nodes.
+      expect(findHostByLabel(renderer, 'label-modal')).toHaveLength(1);
+      // Sibling not in the tree yet.
+      expect(findHostByLabel(renderer, 'node-2')).toHaveLength(0);
+      fillModalAndCreate(renderer, 'sibling label');
+      // Root now has 2 children: `a` and a new sibling (id=2).
       expect(findHostByLabel(renderer, 'node-0')).toHaveLength(1);
       expect(findHostByLabel(renderer, `node-${a}`)).toHaveLength(1);
       expect(findHostByLabel(renderer, 'node-2')).toHaveLength(1);
       unmount();
     });
 
-    it('Delete removes the subtree and clears selection', () => {
-      const tree = createTree();
-      const a = addChild(tree, tree.rootId);
-      const aa = addChild(tree, a);
+    it('Cancel from the Add Child modal does NOT add a node', () => {
+      const tree = createTree('root');
       const {renderer, unmount} = renderCanvas(
         <MindmapCanvas initialTree={tree} />,
       );
-      // Select `a` so its Delete icon is rendered.
+      pressByLabel(renderer, 'add-child-0');
+      pressByLabel(renderer, 'label-cancel');
+      // No new node, no connector.
+      expect(findHostByLabel(renderer, 'node-1')).toHaveLength(0);
+      expect(findHostByLabel(renderer, 'connector')).toHaveLength(0);
+      // Modal closed.
+      expect(findHostByLabel(renderer, 'label-modal')).toHaveLength(0);
+      unmount();
+    });
+
+    it('Delete removes the subtree and clears selection', () => {
+      const tree = createTree('root');
+      const a = addChild(tree, tree.rootId, 'a');
+      const aa = addChild(tree, a, 'aa');
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      // Tap selects + opens the edit-label modal — dismiss it so the
+      // assertions below interact with the canvas directly.
       pressByLabel(renderer, `node-${a}`);
+      pressByLabel(renderer, 'label-cancel');
       pressByLabel(renderer, `delete-${a}`);
       // Both `a` and `aa` should be gone; only the root remains.
       expect(findHostByLabel(renderer, `node-${a}`)).toHaveLength(0);
@@ -518,12 +590,20 @@ describe('MindmapCanvas', () => {
 
   describe('Phase 1.4b — initialTree is defensively cloned', () => {
     it('mutations on the canvas do not leak back into the caller tree', () => {
-      const tree = createTree();
+      const tree = createTree('root');
       const snapshotBefore = tree.nodesById.size;
       const {renderer, unmount} = renderCanvas(
         <MindmapCanvas initialTree={tree} />,
       );
       pressByLabel(renderer, 'add-child-0');
+      // Add Child opens the modal — type a label and Create.
+      const input = renderer.root.findAllByProps({
+        accessibilityLabel: 'label-input',
+      })[0];
+      act(() => {
+        (input.props.onChangeText as (s: string) => void)('first child');
+      });
+      pressByLabel(renderer, 'label-create');
       // Canvas rendered 2 nodes.
       expect(findHostByLabel(renderer, 'node-0')).toHaveLength(1);
       expect(findHostByLabel(renderer, 'node-1')).toHaveLength(1);
@@ -689,6 +769,34 @@ describe('MindmapCanvas', () => {
       // Button disarms back to "Clear" after commit.
       expect(findHostByLabel(renderer, 'Clear')).toHaveLength(1);
       expect(findHostByLabel(renderer, 'Confirm Clear')).toHaveLength(0);
+      unmount();
+    });
+
+    it('reopens the central-idea modal after Clear (full reset to initial-open state)', () => {
+      // Per the v0.2 label-first UX: tapping Clear → confirm should
+      // leave the user in the same state as their first plugin open —
+      // an empty tree with the "Central idea" modal already on screen.
+      // Without re-arming `pending` in handleClear, the user would
+      // see an unlabeled root + chevron icons floating with no modal,
+      // which is the bug that prompted this test.
+      const tree = createTree('original idea');
+      addChild(tree, tree.rootId, 'a');
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      // Mount with a labeled root + child → no modal initially.
+      expect(findHostByLabel(renderer, 'label-modal')).toHaveLength(0);
+      pressByLabel(renderer, 'Clear');
+      pressByLabel(renderer, 'Confirm Clear');
+      // Tree is reset AND the central-idea modal is open.
+      expect(findHostByLabel(renderer, 'node-1')).toHaveLength(0);
+      expect(findHostByLabel(renderer, 'label-modal')).toHaveLength(1);
+      // The modal's input is empty — the previous root label does
+      // not leak into the new prompt.
+      const inputs = renderer.root.findAllByProps({
+        accessibilityLabel: 'label-input',
+      });
+      expect(inputs[0]?.props.value ?? '').toBe('');
       unmount();
     });
 

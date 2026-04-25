@@ -62,6 +62,7 @@ import {
   Pressable,
   StyleSheet,
   Text,
+  TextInput,
   View,
 } from 'react-native';
 import {PluginManager} from 'sn-plugin-lib';
@@ -72,6 +73,7 @@ import {
   createTree,
   deleteSubtree,
   setCollapsed,
+  setLabel,
   ShapeKind,
   type MindmapNode,
   type NodeId,
@@ -112,6 +114,31 @@ const ICON_SIZE = 28;
 const ICON_GAP = 8;
 
 /**
+ * Pill dimensions for the Add Child / Add Sibling buttons. v1.0.1
+ * carries a single Unicode glyph instead of a "+ Child" / "+ Sibling"
+ * word label — the glyphs convey direction more clearly than English
+ * text on a small e-ink button. Width is just wide enough that the
+ * glyph plus a couple of pixels of horizontal padding keeps the
+ * rounded ends from clipping the character; height matches sn-shapes'
+ * top-bar pill height so the canvas affordances feel consistent with
+ * the host UI.
+ *
+ * Glyphs:
+ *   Sibling (`→`, U+2192)  — "next at this level"
+ *   Child   (`↳`, U+21B3)  — "step down a level then over", same
+ *                            visual idiom as a git-branch icon: a
+ *                            path that drops then turns rightwards.
+ */
+const ADD_PILL_WIDTH = 36;
+const ADD_PILL_HEIGHT = 28;
+
+/** Sibling glyph — unicode RIGHTWARDS ARROW. */
+const SIBLING_GLYPH = '\u2192';
+
+/** Child glyph — unicode DOWNWARDS ARROW WITH TIP RIGHTWARDS. */
+const CHILD_GLYPH = '\u21B3';
+
+/**
  * Pixels of viewport margin left around the mindmap when fit-scaling
  * on open (§F-AC-2 "centered on screen"). Chosen large enough that
  * the action icons — which sit OUTSIDE each node's bbox by ICON_GAP
@@ -149,11 +176,56 @@ export type MindmapCanvasProps = {
  * Tree so React's state identity comparison notices the change.
  */
 type Action =
-  | {type: 'ADD_CHILD'; parentId: NodeId}
-  | {type: 'ADD_SIBLING'; nodeId: NodeId}
+  | {type: 'ADD_CHILD'; parentId: NodeId; label: string}
+  | {type: 'ADD_SIBLING'; nodeId: NodeId; label: string}
+  | {type: 'SET_LABEL'; nodeId: NodeId; label: string}
   | {type: 'DELETE_SUBTREE'; nodeId: NodeId}
   | {type: 'TOGGLE_COLLAPSE'; nodeId: NodeId}
   | {type: 'CLEAR'};
+
+/**
+ * Pending label-modal context. Drives the Modal-with-TextInput that
+ * captures a node's label before it lands in the tree.
+ *
+ * Modes:
+ *   - `root`   the canvas is brand-new (or just Cleared) and the
+ *              user hasn't named the central idea yet. Cancel
+ *              closes the plugin entirely — there's nothing to
+ *              author without a root label.
+ *   - `child`  the user tapped Add Child on `parentId`. Create
+ *              dispatches ADD_CHILD with the entered text; Cancel
+ *              dismisses the modal without adding a node.
+ *   - `sibling`the user tapped Add Sibling on `nodeId`. Create
+ *              dispatches ADD_SIBLING; Cancel dismisses.
+ *   - `edit`   the user tapped an existing node body. Create
+ *              dispatches SET_LABEL on that node; Cancel dismisses
+ *              without changing it.
+ */
+type PendingMode =
+  | {kind: 'root'; nodeId: NodeId}
+  | {kind: 'child'; parentId: NodeId}
+  | {kind: 'sibling'; nodeId: NodeId}
+  | {kind: 'edit'; nodeId: NodeId};
+
+/**
+ * On mount: open the central-idea modal automatically iff the tree
+ * has just the unlabeled root and nothing else. This matches the
+ * authored UX: the very first thing the user sees is a prompt for
+ * the central idea, not an empty canvas.
+ *
+ * If `initialTree` was supplied with a labeled root (e.g. tests, or
+ * a future "load existing mindmap" path), no modal opens.
+ */
+function initialPendingForTree(tree: Tree): PendingMode | null {
+  const root = tree.nodesById.get(tree.rootId);
+  if (!root) {
+    return null;
+  }
+  if (tree.nodesById.size === 1 && !root.label) {
+    return {kind: 'root', nodeId: tree.rootId};
+  }
+  return null;
+}
 
 /**
  * Pure reducer: clones the previous tree and applies the mutators
@@ -170,10 +242,13 @@ function treeReducer(state: Tree, action: Action): Tree {
   const next = cloneTree(state);
   switch (action.type) {
     case 'ADD_CHILD':
-      addChild(next, action.parentId);
+      addChild(next, action.parentId, action.label);
       return next;
     case 'ADD_SIBLING':
-      addSibling(next, action.nodeId);
+      addSibling(next, action.nodeId, action.label);
+      return next;
+    case 'SET_LABEL':
+      setLabel(next, action.nodeId, action.label);
       return next;
     case 'DELETE_SUBTREE':
       deleteSubtree(next, action.nodeId);
@@ -263,8 +338,24 @@ export default function MindmapCanvas({
   // only its children disappear).
   const visibleIds = useMemo(() => computeVisibleSet(tree), [tree]);
 
+  // Label-edit modal state (§F-AC-2 / authoring labels). Drives a
+  // <Modal> with a <TextInput> rendered below the Stage. `pending`
+  // null means no modal is shown; otherwise it carries which mode
+  // (root / child / sibling / edit) and the parent / sibling / target
+  // node id to apply the entered label to. Initial state is the root
+  // edit modal whenever the root is unlabeled — exactly the
+  // "first show prompts for the central idea" UX the user asked for.
+  const [pending, setPending] = useState<PendingMode | null>(() =>
+    initialPendingForTree(tree),
+  );
+
+  // Tap on a labeled node body: open its edit modal. Tap on an
+  // unlabeled node body: same — modal opens to set its label. The
+  // modal-edit gesture also selects the node, so the existing per-
+  // node Delete affordance still works after the modal closes.
   const handleSelect = useCallback((nodeId: NodeId) => {
-    setSelectedId(prev => (prev === nodeId ? null : nodeId));
+    setSelectedId(nodeId);
+    setPending({kind: 'edit', nodeId});
   }, []);
 
   const handleBackgroundPress = useCallback(() => {
@@ -272,12 +363,57 @@ export default function MindmapCanvas({
   }, []);
 
   const handleAddChild = useCallback((parentId: NodeId) => {
-    dispatch({type: 'ADD_CHILD', parentId});
+    setPending({kind: 'child', parentId});
   }, []);
 
   const handleAddSibling = useCallback((nodeId: NodeId) => {
-    dispatch({type: 'ADD_SIBLING', nodeId});
+    setPending({kind: 'sibling', nodeId});
   }, []);
+
+  // Modal Create button — dispatches the right action based on the
+  // current pending mode. Empty / whitespace-only labels are blocked
+  // upstream by the modal's disabled-Create state, but we trim again
+  // here so the reducer can't be tricked into setting an empty label
+  // by a stale render.
+  const handleLabelCreate = useCallback(
+    (rawLabel: string) => {
+      const label = rawLabel.trim();
+      if (!label || pending === null) {
+        return;
+      }
+      switch (pending.kind) {
+        case 'root':
+        case 'edit':
+          dispatch({type: 'SET_LABEL', nodeId: pending.nodeId, label});
+          break;
+        case 'child':
+          dispatch({type: 'ADD_CHILD', parentId: pending.parentId, label});
+          break;
+        case 'sibling':
+          dispatch({type: 'ADD_SIBLING', nodeId: pending.nodeId, label});
+          break;
+      }
+      setPending(null);
+    },
+    [pending],
+  );
+
+  // Modal Cancel button. From the initial root-label modal the only
+  // sensible thing is to close the plugin — there is no labeled tree
+  // to fall back to. From every other mode (child / sibling / edit
+  // of an existing node), Cancel just dismisses the modal.
+  const handleLabelCancel = useCallback(() => {
+    if (pending?.kind === 'root') {
+      // Fire-and-forget — same pattern insert.ts uses for the post-
+      // insert close. We don't care about the dismissal promise; the
+      // host does its own teardown when the view backgrounds.
+      PluginManager.closePluginView().catch(() => {
+        /* ignore — UI is gone anyway */
+      });
+      return;
+    }
+    setPending(null);
+  }, [pending]);
 
   const handleDelete = useCallback(
     (nodeId: NodeId) => {
@@ -302,6 +438,14 @@ export default function MindmapCanvas({
   // A second tap within CLEAR_CONFIRM_MS commits the reset; otherwise
   // the disarm timer silently puts the button back to "Clear".
   const [clearArmed, setClearArmed] = useState(false);
+  // Increments on every Clear commit. Applied as the React `key` on
+  // the canvas surface so a Clear forces React to unmount the whole
+  // stage subtree and remount fresh — which dirties enough screen
+  // area on the next paint that the Supernote's e-ink driver triggers
+  // a full refresh of the canvas region. Without this, partial-refresh
+  // mode leaves the previous tree's icon chevrons visible as ghost
+  // pixels even though their Views no longer exist in the React tree.
+  const [clearTick, setClearTick] = useState(0);
   const clearArmedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
     return () => {
@@ -333,10 +477,22 @@ export default function MindmapCanvas({
       }, CLEAR_CONFIRM_MS);
       return;
     }
-    // Second tap within the confirm window — commit.
+    // Second tap within the confirm window — commit. Reset every
+    // piece of canvas state we own so the user lands back in the
+    // initial-plugin-open UI: empty tree behind the "Central idea"
+    // modal. The tree dispatch resets the topology; selectedId is
+    // dropped (no node to select); the pending modal is rearmed for
+    // the new unlabeled root, exactly mirroring initialPendingForTree
+    // on first mount. Bumping clearTick changes the surface View's
+    // React key so the entire stage subtree unmounts and remounts —
+    // belt-and-suspenders against e-ink partial-refresh ghosts that
+    // would otherwise leave the previous tree's icon chevrons visible
+    // even though their Views are gone from the React tree.
     dispatch({type: 'CLEAR'});
     setSelectedId(null);
     setClearArmed(false);
+    setPending({kind: 'root', nodeId: 0 as NodeId});
+    setClearTick(t => t + 1);
   }, [clearArmed, flow.isInserting]);
 
   return (
@@ -417,6 +573,12 @@ export default function MindmapCanvas({
          * pattern.
          */}
         <View
+          // Keying on clearTick forces a clean unmount/remount of the
+          // entire stage subtree on every Clear commit — see the
+          // comment on `clearTick` above for the e-ink ghost-pixel
+          // rationale. clearTick is a plain integer that only ever
+          // increments, so each value yields a unique key.
+          key={`stage-${clearTick}`}
           accessibilityLabel="mindmap-fit-wrapper"
           style={[styles.stageWrapper, {transform: [{scale: fitScale}]}]}>
           <Stage
@@ -432,6 +594,144 @@ export default function MindmapCanvas({
           />
         </View>
       </Pressable>
+      <LabelModal
+        pending={pending}
+        tree={tree}
+        onCreate={handleLabelCreate}
+        onCancel={handleLabelCancel}
+      />
+    </View>
+  );
+}
+
+/**
+ * Modal pop-up that captures a node's label. Behavior:
+ *
+ *   - Visible whenever `pending !== null`.
+ *   - Title text reflects the mode: "Central idea" for root, "Add
+ *     child", "Add sibling", or "Edit label" for an existing node.
+ *   - The TextInput auto-focuses on mount; the host's stylus +
+ *     keyboard / handwriting recognition both feed it natively, no
+ *     bridge work required.
+ *   - The Create button is disabled until the input has at least one
+ *     non-whitespace character — empty labels are explicitly
+ *     rejected (the user can always Cancel out instead).
+ *   - Cancel: from the root mode the only sensible action is to
+ *     close the plugin (there's nothing to author yet); from every
+ *     other mode it just dismisses.
+ *
+ * The current input value is reset on every `pending` change so that
+ * opening the modal again starts with the right seed (the existing
+ * label for `edit` mode, empty for everything else).
+ */
+function LabelModal({
+  pending,
+  tree,
+  onCreate,
+  onCancel,
+}: {
+  pending: PendingMode | null;
+  tree: Tree;
+  onCreate: (label: string) => void;
+  onCancel: () => void;
+}): React.JSX.Element {
+  const seed = useMemo(() => {
+    if (!pending) {
+      return '';
+    }
+    if (pending.kind === 'edit' || pending.kind === 'root') {
+      const node = tree.nodesById.get(pending.nodeId);
+      return node?.label ?? '';
+    }
+    return '';
+  }, [pending, tree]);
+
+  const [draft, setDraft] = useState(seed);
+  // Reset draft when the modal opens with a different seed (e.g. the
+  // user opens edit on node A, cancels, then opens edit on node B).
+  useEffect(() => {
+    setDraft(seed);
+  }, [seed]);
+
+  const visible = pending !== null;
+  const title =
+    pending?.kind === 'root'
+      ? 'Central idea'
+      : pending?.kind === 'child'
+        ? 'Add child'
+        : pending?.kind === 'sibling'
+          ? 'Add sibling'
+          : 'Edit label';
+  const trimmed = draft.trim();
+  const canCreate = trimmed.length > 0;
+
+  // Render nothing when no modal is requested. Bailing here (instead
+  // of rendering with `visible={false}`) keeps the entire dialog out
+  // of the React tree when it's not needed — no leftover focused
+  // TextInput keeping the on-screen keyboard ghosted in place after
+  // dismiss, no stray modal pixels for the e-ink driver to chase.
+  if (!visible) {
+    return <></>;
+  }
+  return (
+    <View
+      style={styles.modalOverlay}
+      pointerEvents="box-none"
+      accessibilityViewIsModal>
+      <View
+        style={styles.modalBackdrop}
+        accessibilityLabel="label-modal-backdrop"
+      />
+      <View
+        accessibilityLabel="label-modal"
+        accessibilityRole="alert"
+        style={styles.modalCard}>
+        <Text style={styles.modalTitle}>{title}</Text>
+        <TextInput
+          accessibilityLabel="label-input"
+          style={styles.modalInput}
+          value={draft}
+          onChangeText={setDraft}
+          autoFocus
+          placeholder="Type or write a label"
+          multiline
+          textAlignVertical="top"
+        />
+        <View style={styles.modalRow}>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="label-cancel"
+            onPress={onCancel}
+            style={({pressed}) => [
+              styles.modalBtn,
+              styles.modalBtnSecondary,
+              pressed && styles.modalBtnPressed,
+            ]}>
+            <Text style={styles.modalBtnText}>Cancel</Text>
+          </Pressable>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="label-create"
+            accessibilityState={{disabled: !canCreate}}
+            disabled={!canCreate}
+            onPress={() => onCreate(trimmed)}
+            style={({pressed}) => [
+              styles.modalBtn,
+              styles.modalBtnPrimary,
+              pressed && canCreate && styles.modalBtnPressed,
+              !canCreate && styles.modalBtnDisabled,
+            ]}>
+            <Text
+              style={[
+                styles.modalBtnText,
+                styles.modalBtnTextOnPrimary,
+                !canCreate && styles.modalBtnTextDisabled,
+              ]}>
+              Create
+            </Text>
+          </Pressable>
+        </View>
+      </View>
     </View>
   );
 }
@@ -683,6 +983,15 @@ function NodeFrame({
 }): React.JSX.Element {
   const penWidth = penWidthForShape(node.shape);
   const borderWidth = penWidthToPx(penWidth) * (isSelected ? 2 : 1);
+  const skewTransform = transformForShape(node.shape);
+  // PARALLELOGRAM nodes need their CONTENTS un-skewed so the label
+  // text reads upright while the outline is slanted. Composing
+  // `skewX(-12deg)` (parent) with `skewX(12deg)` (child) cancels the
+  // shear on the Text View — same trick CSS skew layouts use.
+  const labelTransform =
+    node.shape === ShapeKind.PARALLELOGRAM
+      ? [{skewX: '12deg'}]
+      : undefined;
   return (
     <Pressable
       accessibilityLabel={`node-${node.id}`}
@@ -697,8 +1006,21 @@ function NodeFrame({
           borderWidth,
           borderRadius: borderRadiusForShape(node.shape, bbox),
         },
-      ]}
-    />
+        skewTransform ? {transform: skewTransform} : null,
+      ]}>
+      {node.label !== undefined && node.label.length > 0 && (
+        <Text
+          accessibilityLabel={`node-${node.id}-label`}
+          numberOfLines={2}
+          ellipsizeMode="tail"
+          style={[
+            styles.nodeLabel,
+            labelTransform ? {transform: labelTransform} : null,
+          ]}>
+          {node.label}
+        </Text>
+      )}
+    </Pressable>
   );
 }
 
@@ -781,36 +1103,47 @@ function NodeActions({
   return (
     <React.Fragment>
       {/*
-       * Add Child — chevron "›" to the right, thicker stroke (the
-       * "primary" action per §F-AC-5).
+       * Add Child — filled pill carrying the `↳` glyph (git-branch
+       * idiom: drop down one level, then over). Filled (primary)
+       * variant signals this as the dominant authoring gesture. The
+       * pill's vertical centre lines up with the node's vertical
+       * centre and sits a fixed ICON_GAP to the right of the bbox.
        */}
       <Pressable
         accessibilityLabel={`add-child-${node.id}`}
         onPress={() => onAddChild(node.id)}
         style={[
-          styles.iconButton,
-          styles.iconButtonPrimary,
+          styles.addPill,
+          styles.addPillPrimary,
           {
             left: stageLeft + bbox.w + ICON_GAP,
-            top: stageTop + bbox.h / 2 - ICON_SIZE / 2,
+            top: stageTop + bbox.h / 2 - ADD_PILL_HEIGHT / 2,
           },
         ]}>
-        <Text style={[styles.iconGlyph, styles.iconGlyphPrimary]}>{'\u203A'}</Text>
+        <Text style={[styles.addPillGlyph, styles.addPillGlyphPrimary]}>
+          {CHILD_GLYPH}
+        </Text>
       </Pressable>
 
-      {/* Add Sibling — chevron "⌄" below, thinner stroke. Hidden on the root. */}
+      {/*
+       * Add Sibling — outlined pill carrying the `→` glyph ("next at
+       * this level"). Hidden on the root (siblings of the root would
+       * mean a forest, not a tree). The pill is horizontally centred
+       * on the node's centreline and sits a fixed ICON_GAP below the
+       * bbox.
+       */}
       {!isRoot && (
         <Pressable
           accessibilityLabel={`add-sibling-${node.id}`}
           onPress={() => onAddSibling(node.id)}
           style={[
-            styles.iconButton,
+            styles.addPill,
             {
-              left: stageLeft + bbox.w / 2 - ICON_SIZE / 2,
+              left: stageLeft + bbox.w / 2 - ADD_PILL_WIDTH / 2,
               top: stageTop + bbox.h + ICON_GAP,
             },
           ]}>
-          <Text style={styles.iconGlyph}>{'\u02C5'}</Text>
+          <Text style={styles.addPillGlyph}>{SIBLING_GLYPH}</Text>
         </Pressable>
       )}
 
@@ -888,6 +1221,7 @@ function penWidthForShape(shape: ShapeKind): number {
       return ROOT_PEN_WIDTH;
     case ShapeKind.RECTANGLE:
     case ShapeKind.ROUNDED_RECTANGLE:
+    case ShapeKind.PARALLELOGRAM:
       return STANDARD_PEN_WIDTH;
     default:
       // Exhaustiveness guard — the ShapeKind union is closed, so
@@ -901,13 +1235,16 @@ function penWidthForShape(shape: ShapeKind): number {
 /**
  * Border-radius value for an RN `<View>` outlining the given shape.
  * OVAL reads its radius from the bbox (so non-square bboxes still
- * render as stadiums), the others are constants.
+ * render as stadiums), the others are constants. PARALLELOGRAM is
+ * drawn as a sharp-cornered rectangle and its slant is composed in
+ * via a transform skewX at the call site (see `transformForShape`).
  */
 function borderRadiusForShape(shape: ShapeKind, bbox: Rect): number {
   switch (shape) {
     case ShapeKind.OVAL:
       return bbox.h / 2;
     case ShapeKind.RECTANGLE:
+    case ShapeKind.PARALLELOGRAM:
       return 0;
     case ShapeKind.ROUNDED_RECTANGLE:
       return SIBLING_CORNER_RADIUS;
@@ -916,6 +1253,22 @@ function borderRadiusForShape(shape: ShapeKind, bbox: Rect): number {
         `MindmapCanvas.borderRadiusForShape: unknown shape kind ${shape as number}`,
       );
   }
+}
+
+/**
+ * Per-shape transform array applied to the NodeFrame's outline View.
+ * Only PARALLELOGRAM uses a non-identity transform — skewX shears the
+ * rectangle horizontally so its top edge sits to the right of its
+ * bottom edge, matching the inscribed-skew polygon emitted by
+ * parallelogramPoints. The skew angle (12°) is tuned so a 220×96
+ * bbox produces a ~20 px horizontal offset, the same value as
+ * PARALLELOGRAM_SKEW_PX in nodeFrame.ts (atan(20/96) ≈ 11.8°).
+ */
+function transformForShape(shape: ShapeKind): {skewX: string}[] | undefined {
+  if (shape === ShapeKind.PARALLELOGRAM) {
+    return [{skewX: '-12deg'}];
+  }
+  return undefined;
 }
 
 const styles = StyleSheet.create({
@@ -995,6 +1348,100 @@ const styles = StyleSheet.create({
     position: 'absolute',
     borderColor: '#000',
     backgroundColor: '#fff',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 8,
+  },
+  nodeLabel: {
+    color: '#000',
+    fontSize: 14,
+    textAlign: 'center',
+  },
+  // Label-edit modal — overlay wrapper, dimmed backdrop, centred
+  // card. modalOverlay is a fullscreen positioned layer that holds
+  // both the backdrop (blocks interaction with the canvas behind)
+  // and the card. The wrapper's pointerEvents="box-none" lets the
+  // backdrop catch every tap that misses the card, but the wrapper
+  // itself doesn't intercept anything outside its child views.
+  modalOverlay: {
+    position: 'absolute',
+    left: 0,
+    top: 0,
+    right: 0,
+    bottom: 0,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 24,
+  },
+  modalBackdrop: {
+    position: 'absolute',
+    left: 0,
+    top: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(0, 0, 0, 0.35)',
+  },
+  modalCard: {
+    width: '100%',
+    maxWidth: 480,
+    backgroundColor: '#fff',
+    borderRadius: 12,
+    paddingVertical: 20,
+    paddingHorizontal: 20,
+    borderWidth: 1,
+    borderColor: '#000',
+  },
+  modalTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: '#000',
+    marginBottom: 12,
+  },
+  modalInput: {
+    minHeight: 96,
+    borderWidth: 1,
+    borderColor: '#000',
+    borderRadius: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    fontSize: 16,
+    color: '#000',
+    marginBottom: 16,
+  },
+  modalRow: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+  },
+  modalBtn: {
+    paddingVertical: 10,
+    paddingHorizontal: 18,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#000',
+    marginLeft: 12,
+  },
+  modalBtnPrimary: {
+    backgroundColor: '#000',
+  },
+  modalBtnSecondary: {
+    backgroundColor: '#fff',
+  },
+  modalBtnPressed: {
+    opacity: 0.7,
+  },
+  modalBtnDisabled: {
+    backgroundColor: '#ddd',
+    borderColor: '#888',
+  },
+  modalBtnText: {
+    fontSize: 16,
+    color: '#000',
+  },
+  modalBtnTextOnPrimary: {
+    color: '#fff',
+  },
+  modalBtnTextDisabled: {
+    color: '#888',
   },
   connector: {
     position: 'absolute',
@@ -1023,6 +1470,43 @@ const styles = StyleSheet.create({
     lineHeight: 18,
   },
   iconGlyphPrimary: {
+    fontWeight: '700',
+  },
+  // Add Child / Add Sibling pill buttons — small pills carrying a
+  // single directional glyph (`↳` for child, `→` for sibling). Same
+  // absolute positioning convention as iconButton (caller composes
+  // left/top). The glyph approach replaces the v1.0 "+ Child" /
+  // "+ Sibling" word labels: shorter, language-agnostic, and easier
+  // to read at small sizes on e-ink.
+  addPill: {
+    position: 'absolute',
+    width: ADD_PILL_WIDTH,
+    height: ADD_PILL_HEIGHT,
+    borderWidth: 1,
+    borderColor: '#000',
+    borderRadius: ADD_PILL_HEIGHT / 2,
+    backgroundColor: '#fff',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  addPillPrimary: {
+    backgroundColor: '#000',
+    borderWidth: 2,
+  },
+  addPillGlyph: {
+    // Glyph slightly larger than the topBarBtn body text so the
+    // single-character label still reads clearly at the pill's modest
+    // 36×28 footprint. Bumped lineHeight keeps `→` and `↳` vertically
+    // centred on Android, where Text baselines drift toward the
+    // descender by default.
+    fontSize: 18,
+    fontWeight: '600',
+    color: '#000',
+    lineHeight: 22,
+    textAlign: 'center',
+  },
+  addPillGlyphPrimary: {
+    color: '#fff',
     fontWeight: '700',
   },
   collapseButton: {

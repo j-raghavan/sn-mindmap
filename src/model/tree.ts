@@ -26,16 +26,69 @@
 export type NodeId = number;
 
 /**
- * Shape of a node's outline — also the wire byte stored in the marker
- * record (§6.3).  Do NOT renumber: the decoder depends on these exact values.
+ * Shape of a node's outline. Drives both the on-canvas rendering and
+ * the polygon points emitted on Insert.
+ *
+ * v1.0 assigns shape by tree DEPTH rather than by the gesture used
+ * to create the node — siblings now match their layer instead of
+ * always being a rounded rectangle. The depth → shape table:
+ *
+ *   depth 0 (central idea)        OVAL
+ *   depth 1 (first-level child)   ROUNDED_RECTANGLE
+ *   depth 2 (second-level child)  RECTANGLE
+ *   depth ≥ 3                     PARALLELOGRAM
+ *
+ * The numeric values stay stable across releases — earlier marker /
+ * decoder code relied on them and even though the marker pipeline is
+ * gone today, keeping the values fixed lets us re-introduce a decoder
+ * later without renumbering. Do NOT change these numbers.
  */
 export enum ShapeKind {
-  /** Root node.  Oval / ellipse outline. (§F-AC-2) */
+  /** Central idea (root). Oval / stadium outline. */
   OVAL = 0x00,
-  /** Child node added via "Add Child".  Rectangle outline. (§F-AC-3) */
+  /** Second-level (depth 2) child. Rectangle outline. */
   RECTANGLE = 0x01,
-  /** Sibling node added via "Add Sibling".  Rounded-rectangle. (§F-AC-3) */
+  /** First-level (depth 1) child. Rounded-rectangle outline. */
   ROUNDED_RECTANGLE = 0x02,
+  /** Third-level (depth ≥ 3) descendant. Parallelogram outline. */
+  PARALLELOGRAM = 0x03,
+}
+
+/**
+ * v1.0 shape-by-depth table (see ShapeKind doc). Pure helper —
+ * hand back the right ShapeKind for the depth the new node will
+ * sit at. Depths beyond 3 fall through to PARALLELOGRAM so deep
+ * sub-trees stay visually consistent.
+ */
+export function shapeForDepth(depth: number): ShapeKind {
+  switch (depth) {
+    case 0:
+      return ShapeKind.OVAL;
+    case 1:
+      return ShapeKind.ROUNDED_RECTANGLE;
+    case 2:
+      return ShapeKind.RECTANGLE;
+    default:
+      return ShapeKind.PARALLELOGRAM;
+  }
+}
+
+/**
+ * Walk parent links from `nodeId` up to the root; return how many
+ * hops it took. Root → 0, root's children → 1, grandchildren → 2,
+ * etc. Used by addChild / addSibling to pick the new node's shape
+ * via shapeForDepth.
+ *
+ * @throws if `nodeId` doesn't exist.
+ */
+export function nodeDepth(tree: Tree, nodeId: NodeId): number {
+  let depth = 0;
+  let current: MindmapNode | undefined = getNode(tree, nodeId, 'nodeDepth');
+  while (current && current.parentId !== null) {
+    depth += 1;
+    current = tree.nodesById.get(current.parentId);
+  }
+  return depth;
 }
 
 /** A single node in the mindmap. */
@@ -46,6 +99,13 @@ export interface MindmapNode {
   shape: ShapeKind;
   /** True when the subtree below this node is hidden in the authoring canvas. */
   collapsed: boolean;
+  /**
+   * Optional label rendered inside the node's outline and emitted as a
+   * TYPE_TEXT element on Insert. Undefined / empty means an unlabeled
+   * node — the authoring canvas still renders its outline so the user
+   * can navigate the tree, but no text appears inside it.
+   */
+  label?: string;
 }
 
 /**
@@ -79,14 +139,18 @@ function getNode(tree: Tree, id: NodeId, context: string): MindmapNode {
 
 /**
  * Create a fresh tree containing only the root Oval node (§F-AC-2).
+ * The optional `label` argument seeds the root's text; omit it to
+ * create an unlabeled root (the authoring canvas opens the label
+ * modal automatically when the root is unlabeled).
  */
-export function createTree(): Tree {
+export function createTree(label?: string): Tree {
   const root: MindmapNode = {
     id: 0,
     parentId: null,
     childIds: [],
     shape: ShapeKind.OVAL,
     collapsed: false,
+    label,
   };
   return {
     rootId: 0,
@@ -96,20 +160,29 @@ export function createTree(): Tree {
 }
 
 /**
- * Add a Rectangle child under `parentId` and return the new node's id.
- * Appends to the end of the parent's childIds list (§F-AC-3).
+ * Add a child under `parentId` and return the new node's id.
+ * Appends to the end of the parent's childIds list. The optional
+ * `label` argument seeds the child's text. The new child's shape
+ * is picked from shapeForDepth(parentDepth + 1) — ROUNDED_RECTANGLE
+ * for the root's direct children, RECTANGLE for grand-children,
+ * PARALLELOGRAM for everything deeper.
  *
  * @throws if `parentId` does not exist in the tree.
  */
-export function addChild(tree: Tree, parentId: NodeId): NodeId {
+export function addChild(
+  tree: Tree,
+  parentId: NodeId,
+  label?: string,
+): NodeId {
   const parent = getNode(tree, parentId, 'addChild');
   const id = tree.nextId++;
   const child: MindmapNode = {
     id,
     parentId,
     childIds: [],
-    shape: ShapeKind.RECTANGLE,
+    shape: shapeForDepth(nodeDepth(tree, parentId) + 1),
     collapsed: false,
+    label,
   };
   tree.nodesById.set(id, child);
   parent.childIds.push(id);
@@ -117,12 +190,19 @@ export function addChild(tree: Tree, parentId: NodeId): NodeId {
 }
 
 /**
- * Add a Rounded-Rectangle sibling immediately after `nodeId` in the
- * parent's childIds list and return the new node's id (§F-AC-3).
+ * Add a sibling immediately after `nodeId` in the parent's childIds
+ * list and return the new node's id. The optional `label` argument
+ * seeds the sibling's text. Siblings sit at the same depth as the
+ * tapped node, so the new sibling's shape matches `nodeId`'s shape
+ * via shapeForDepth(nodeDepth(nodeId)).
  *
  * @throws if `nodeId` is the root (no parent) or does not exist.
  */
-export function addSibling(tree: Tree, nodeId: NodeId): NodeId {
+export function addSibling(
+  tree: Tree,
+  nodeId: NodeId,
+  label?: string,
+): NodeId {
   const node = getNode(tree, nodeId, 'addSibling');
   if (node.parentId === null) {
     throw new Error('[tree] cannot add a sibling to the root');
@@ -133,13 +213,31 @@ export function addSibling(tree: Tree, nodeId: NodeId): NodeId {
     id,
     parentId: node.parentId,
     childIds: [],
-    shape: ShapeKind.ROUNDED_RECTANGLE,
+    shape: shapeForDepth(nodeDepth(tree, nodeId)),
     collapsed: false,
+    label,
   };
   tree.nodesById.set(id, sibling);
   const idx = parent.childIds.indexOf(nodeId);
   parent.childIds.splice(idx + 1, 0, id);
   return id;
+}
+
+/**
+ * Set or update the label of `nodeId`. Empty / undefined labels are
+ * stored as undefined (the authoring canvas treats an empty string
+ * the same as no label).
+ *
+ * @throws if `nodeId` does not exist.
+ */
+export function setLabel(
+  tree: Tree,
+  nodeId: NodeId,
+  label: string | undefined,
+): void {
+  const node = getNode(tree, nodeId, 'setLabel');
+  const trimmed = label?.trim();
+  node.label = trimmed && trimmed.length > 0 ? trimmed : undefined;
 }
 
 /**

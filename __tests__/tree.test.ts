@@ -58,14 +58,15 @@ describe('tree', () => {
   });
 
   describe('addChild', () => {
-    it('appends a RECTANGLE child with a fresh id (§F-AC-3)', () => {
+    it('appends a depth-1 ROUNDED_RECTANGLE child with a fresh id', () => {
+      // v1.0 shape-by-depth: depth 1 → ROUNDED_RECTANGLE.
       const tree = createTree();
       const childId = addChild(tree, 0);
       expect(childId).toBe(1);
       expect(tree.nextId).toBe(2);
       const child = tree.nodesById.get(childId);
       expect(child?.parentId).toBe(0);
-      expect(child?.shape).toBe(ShapeKind.RECTANGLE);
+      expect(child?.shape).toBe(ShapeKind.ROUNDED_RECTANGLE);
       expect(child?.childIds).toEqual([]);
       expect(child?.collapsed).toBe(false);
       const root = tree.nodesById.get(0);
@@ -81,13 +82,35 @@ describe('tree', () => {
       expect(tree.nodesById.get(0)?.childIds).toEqual([1, 2, 3]);
     });
 
-    it('supports nesting (child of a child)', () => {
+    it('depth-2 grandchild renders as RECTANGLE (shape-by-depth)', () => {
+      // depth-2 sits one level below the rounded rectangles, with
+      // sharp-corner rectangle outlines.
       const tree = createTree();
       const a = addChild(tree, 0);
       const b = addChild(tree, a);
       expect(tree.nodesById.get(a)?.childIds).toEqual([b]);
       expect(tree.nodesById.get(b)?.parentId).toBe(a);
       expect(tree.nodesById.get(b)?.shape).toBe(ShapeKind.RECTANGLE);
+    });
+
+    it('depth-3 great-grandchild renders as PARALLELOGRAM', () => {
+      const tree = createTree();
+      const a = addChild(tree, 0);
+      const b = addChild(tree, a);
+      const c = addChild(tree, b);
+      expect(tree.nodesById.get(c)?.shape).toBe(ShapeKind.PARALLELOGRAM);
+    });
+
+    it('depth-4 and deeper stays PARALLELOGRAM', () => {
+      const tree = createTree();
+      let cursor = 0;
+      for (let depth = 0; depth < 5; depth += 1) {
+        cursor = addChild(tree, cursor);
+      }
+      // cursor is now the depth-5 leaf.
+      expect(tree.nodesById.get(cursor)?.shape).toBe(
+        ShapeKind.PARALLELOGRAM,
+      );
     });
 
     it('throws on unknown parent id', () => {

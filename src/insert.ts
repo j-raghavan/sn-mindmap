@@ -77,11 +77,24 @@ export const DEFAULT_PAGE_HEIGHT = 1872;
 
 /**
  * Margin on each side of the page preserved by the fit-to-page
- * scaler (§F-LY-6). 80 px matches the requirements' default and
- * leaves visible room for handwritten labels that extend slightly
- * past a node's outline.
+ * scaler (§F-LY-6). 200 px (≈ 14% of a 1404 px Nomad portrait page)
+ * leaves comfortable breathing room around the mindmap so the user
+ * can:
+ *   - pen-lasso the whole map (the lasso start point has to be
+ *     OUTSIDE every glyph, so the outermost nodes need to sit a
+ *     full pen-tip-width clear of the page edge);
+ *   - hand-write labels that overshoot a node's outline without
+ *     bumping into a page boundary;
+ *   - eyeball the map vs. the page chrome (toolbar, page number)
+ *     without parts of the layout disappearing under those bands.
+ *
+ * v1.0 used 80 px and a real on-device run produced a near-edge
+ * placement that the user couldn't lasso cleanly. 200 px is the
+ * smallest value that visibly fixes that on a 4-parent / 1-grandchild
+ * tree (the empirical worst case so far) without making small trees
+ * look cramped to the centre of an empty page.
  */
-export const INSERT_MARGIN_PX = 80;
+export const INSERT_MARGIN_PX = 200;
 
 export type InsertInput = {
   tree: Tree;
@@ -176,10 +189,19 @@ export async function insertMindmap(input: InsertInput): Promise<void> {
         'replaceElements requires both',
     );
   }
+  // Collect labeled nodes so their text lands inside their outline as
+  // a TYPE_TEXT element. Unlabeled nodes contribute outline-only.
+  const labeledNodes = collectLabeledNodes(expanded, pageLayout);
+  log('collectLabeledNodes:done', {count: labeledNodes.length});
+
   try {
-    log('buildElements:before', {count: geometries.length});
+    log('buildElements:before', {
+      geometries: geometries.length,
+      labels: labeledNodes.length,
+    });
     const newElements = await buildElementsForInsert(
       geometries,
+      labeledNodes,
       pageCtx.page,
     );
     log('buildElements:done', {built: newElements.length});
@@ -277,31 +299,92 @@ function countByType(geometries: Geometry[]): Record<string, number> {
 }
 
 /**
- * Build one native-backed `Element` per emitted Geometry, ready to
- * hand to `PluginFileAPI.replaceElements`. For each geometry:
+ * Specification for a per-node text label landing on the page as a
+ * TYPE_TEXT element. `bbox` is the node's outline bbox in page
+ * coordinates so the host's text-flow can fit `label` inside the
+ * rectangle when it renders.
+ */
+type LabeledNodeSpec = {
+  label: string;
+  bbox: Rect;
+};
+
+/**
+ * Walk every node in the (auto-expanded) tree and collect those that
+ * carry a non-empty label. Each entry pairs the label string with its
+ * post-fit-to-page bbox so the caller can build a TYPE_TEXT element
+ * whose `textRect` matches the node's outline exactly. Unlabeled
+ * nodes (label undefined or empty) are skipped silently — they emit
+ * outline-only.
+ */
+function collectLabeledNodes(
+  tree: Tree,
+  layout: LayoutResult,
+): LabeledNodeSpec[] {
+  const out: LabeledNodeSpec[] = [];
+  for (const node of tree.nodesById.values()) {
+    const label = node.label?.trim();
+    if (!label) {
+      continue;
+    }
+    const bbox = layout.bboxes.get(node.id);
+    if (!bbox) {
+      continue;
+    }
+    out.push({label, bbox});
+  }
+  return out;
+}
+
+/**
+ * Pixels of inner padding between a node's outline and its label
+ * text rectangle. Keeps the rendered text from kissing the outline
+ * edge, which looks tight on e-ink. 8 px on each side is comfortable
+ * at the firmware's default text-flow margins.
+ */
+const TEXT_PADDING_PX = 8;
+
+/**
+ * Map a node's bbox height to a font size that looks centred and
+ * legible inside the outline. Empirical values: NODE_HEIGHT=96 gives
+ * a comfortable ~28 px font; ~bbox.h × 0.32 with a 20–48 clamp keeps
+ * smaller fit-to-page-scaled nodes readable without blowing past the
+ * outline at large scales.
+ */
+function fontSizeForBbox(bbox: Rect): number {
+  const desired = Math.round(bbox.h * 0.32);
+  return Math.max(20, Math.min(48, desired));
+}
+
+/**
+ * Build one native-backed `Element` per emitted Geometry plus one
+ * `Element.TYPE_TEXT` per labeled node, ready to hand to
+ * `PluginFileAPI.replaceElements`.
  *
+ * Geometry path (mirrors shape-snap):
  *   1. PluginCommAPI.createElement(Element.TYPE_GEO) — the native
  *      side mints a new Element with the `uuid`, `angles` /
  *      `contoursSrc` ElementDataAccessor instances, and the other
  *      internal plumbing the host's validator requires. Our earlier
  *      hand-built `{type:700, uuid, geometry}` objects missed this
- *      plumbing and were rejected with APIError 106 — confirmed on
- *      device by the 08:45 probe run that proved createElement +
- *      replaceElements is the viable batched path.
- *
+ *      plumbing and were rejected with APIError 106.
  *   2. Populate `pageNum` / `layerNum` / `thickness` / `geometry` on
- *      the returned Element — same field shape `shape-snap` uses in
- *      `createGeometryElement`. Points are rounded to integers here
- *      (fractional coords are rejected host-side; see the comment on
- *      `roundGeometryPoints`).
+ *      the returned Element. Points are rounded to integers here
+ *      (fractional coords are rejected host-side).
  *
- * Throws on the first `createElement` failure — this is treated as a
- * terminal error since the batched write can't proceed without a
- * complete Element list, and partial inserts aren't possible with the
- * replaceElements semantics.
+ * Text path (one per labeled node):
+ *   1. PluginCommAPI.createElement(Element.TYPE_TEXT) — same native
+ *      uuid + plumbing.
+ *   2. Populate `pageNum` / `layerNum` / `textBox` with the label
+ *      text, the node's outline bbox shrunk by TEXT_PADDING_PX as
+ *      `textRect`, fontSize derived from bbox height, and centre
+ *      alignment.
+ *
+ * Throws on the first `createElement` failure.
  */
 async function buildElementsForInsert(
   geometries: Geometry[],
+  labeledNodes: LabeledNodeSpec[],
   page: number,
 ): Promise<unknown[]> {
   const out: unknown[] = [];
@@ -312,7 +395,7 @@ async function buildElementsForInsert(
     )) as ApiRes<Record<string, unknown>>;
     if (!res?.success || !res.result) {
       throw new Error(
-        `createElement failed at index ${i}: ${
+        `createElement(geo) failed at index ${i}: ${
           res?.error?.message ?? 'unknown error'
         }`,
       );
@@ -323,6 +406,39 @@ async function buildElementsForInsert(
     element.layerNum = 0;
     element.thickness = rounded.penWidth;
     element.geometry = rounded;
+    out.push(element);
+  }
+  for (let i = 0; i < labeledNodes.length; i += 1) {
+    const {label, bbox} = labeledNodes[i];
+    const res = (await PluginCommAPI.createElement(
+      Element.TYPE_TEXT,
+    )) as ApiRes<Record<string, unknown>>;
+    if (!res?.success || !res.result) {
+      throw new Error(
+        `createElement(text) failed at index ${i}: ${
+          res?.error?.message ?? 'unknown error'
+        }`,
+      );
+    }
+    const element = res.result;
+    element.pageNum = page;
+    element.layerNum = 0;
+    element.textBox = {
+      textContentFull: label,
+      textRect: {
+        left: Math.round(bbox.x + TEXT_PADDING_PX),
+        top: Math.round(bbox.y + TEXT_PADDING_PX),
+        right: Math.round(bbox.x + bbox.w - TEXT_PADDING_PX),
+        bottom: Math.round(bbox.y + bbox.h - TEXT_PADDING_PX),
+      },
+      fontSize: fontSizeForBbox(bbox),
+      textAlign: 1, // centre — matches sn-plugin-lib TextBox.textAlign convention
+      textBold: 0,
+      textItalics: 0,
+      textFrameWidthType: 0,
+      textFrameStyle: 0,
+      textEditable: 0,
+    };
     out.push(element);
   }
   return out;

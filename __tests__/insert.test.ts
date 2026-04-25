@@ -434,25 +434,32 @@ describe('insertMindmap — fit-to-page scaling (§F-LY-6)', () => {
 
     await insertMindmap({tree});
 
-    // The root outline (first emitted geometry) should have been
-    // scaled down from its native 220×96 bbox. We compute the
-    // expected scale factor the same way insert.ts does and assert
-    // the emitted outline matches.
+    // The root outline (a polygon, NOT a 2-point straightLine) should
+    // have been scaled down from its native 220×96 bbox. Find it by
+    // looking for the polygon with the most points — the root oval
+    // is sampled densely on its rounded edges, while child rectangles
+    // are 5-point closed polygons.
     const expectedScale = Math.min(
       1,
       available / baseLayout.unionBbox.w,
       (DEFAULT_PAGE_HEIGHT - 2 * INSERT_MARGIN_PX) / baseLayout.unionBbox.h,
     );
-    const [firstGeom] = getInsertedGeometries()[0];
-    const xs = (firstGeom.points ?? []).map((p: {x: number}) => p.x);
-    const ys = (firstGeom.points ?? []).map((p: {y: number}) => p.y);
+    const insertCalls = getInsertedGeometries();
+    const polygons = insertCalls.filter(
+      ([g]) => g.type === 'GEO_polygon',
+    );
+    const rootPoly = polygons.reduce((acc, cur) =>
+      (cur[0].points?.length ?? 0) > (acc[0].points?.length ?? 0) ? cur : acc,
+    );
+    const xs = (rootPoly[0].points ?? []).map((p: {x: number}) => p.x);
+    const ys = (rootPoly[0].points ?? []).map((p: {y: number}) => p.y);
     const width = Math.max(...xs) - Math.min(...xs);
     const height = Math.max(...ys) - Math.min(...ys);
     // Tolerance widened to ±1 to accommodate integer rounding at the
-    // insertElements boundary (wrapGeometryAsElement rounds every
+    // replaceElements boundary (roundGeometryPoints rounds every
     // point.x/y to integers — the native firmware rejects fractional
-    // coords, see roundGeometryPoints). The max-min of rounded coords
-    // can drift by up to ±1 from the pre-rounding float value.
+    // coords). The max-min of rounded coords can drift by up to ±1
+    // from the pre-rounding float value.
     expect(Math.abs(width - 220 * expectedScale)).toBeLessThanOrEqual(1);
     expect(Math.abs(height - 96 * expectedScale)).toBeLessThanOrEqual(1);
   });
@@ -523,7 +530,7 @@ describe('insertMindmap — error + cleanup (§F-IN-5)', () => {
 
     const tree = buildSmallTree();
     await expect(insertMindmap({tree})).rejects.toThrow(
-      /createElement failed at index 1/,
+      /createElement\(geo\) failed at index 1/,
     );
     expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
     expect(PluginManager.closePluginView).not.toHaveBeenCalled();
@@ -586,7 +593,7 @@ describe('insertMindmap — error + cleanup (§F-IN-5)', () => {
 
     const tree = buildSmallTree();
     await expect(insertMindmap({tree})).rejects.toThrow(
-      /createElement failed at index 0: unknown error/,
+      /createElement\(geo\) failed at index 0: unknown error/,
     );
     expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
   });

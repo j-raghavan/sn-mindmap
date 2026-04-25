@@ -150,15 +150,18 @@ describe('emitGeometries — shape-kind dispatch (§F-IN-2 step 1)', () => {
     const childPoly = polygons[1];
     const siblingPoly = polygons[2];
 
-    // Root node is OVAL with ROOT_PEN_WIDTH.
+    // Root (depth 0) is OVAL with ROOT_PEN_WIDTH.
     expect(tree.nodesById.get(rootId)?.shape).toBe(ShapeKind.OVAL);
     expect(rootPoly.penWidth).toBe(ROOT_PEN_WIDTH);
 
-    // Child is RECTANGLE with STANDARD_PEN_WIDTH.
-    expect(tree.nodesById.get(childId)?.shape).toBe(ShapeKind.RECTANGLE);
+    // Direct children of the root sit at depth 1, which the v1.0
+    // shape-by-depth table maps to ROUNDED_RECTANGLE — same shape
+    // for both the child and the sibling, both at STANDARD_PEN_WIDTH.
+    expect(tree.nodesById.get(childId)?.shape).toBe(
+      ShapeKind.ROUNDED_RECTANGLE,
+    );
     expect(childPoly.penWidth).toBe(STANDARD_PEN_WIDTH);
 
-    // Sibling is ROUNDED_RECTANGLE with STANDARD_PEN_WIDTH.
     expect(tree.nodesById.get(siblingId)?.shape).toBe(
       ShapeKind.ROUNDED_RECTANGLE,
     );
@@ -206,19 +209,24 @@ describe('emitGeometries — connectors (§F-IN-2 step 2)', () => {
     ).toBe(true);
   });
 
-  it('order: connectors follow all outlines, never interleaved', () => {
+  it('order: every connector is emitted before any node outline', () => {
+    // Strokes paint in emit order on Supernote, so connectors emit
+    // FIRST — node outlines come after and visually mask the
+    // connector endpoints, keeping the rendered shape edges clean
+    // even where the connector AABB-clip leaves a few pixels inside
+    // a non-rectangular outline (e.g. the root oval).
     const {tree} = threeNodeTree();
     const layout = radialLayout(tree);
     const {geometries} = emitGeometries({tree, layout});
-    // After the last polygon, everything is a connector.
-    let sawLine = false;
+    let sawPolygon = false;
     for (const g of geometries) {
-      if (isLine(g)) {
-        sawLine = true;
-      } else if (isPolygon(g)) {
-        // A polygon appearing after a line would be an interleave
-        // violation.
-        expect(sawLine).toBe(false);
+      if (isPolygon(g)) {
+        sawPolygon = true;
+      } else if (isLine(g)) {
+        // A line appearing after a polygon would be an interleave
+        // violation — connectors must all be emitted before the
+        // first outline so the outlines paint on top.
+        expect(sawPolygon).toBe(false);
       }
     }
   });

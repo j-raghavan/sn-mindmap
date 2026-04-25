@@ -33,7 +33,11 @@ import {
   type Rect,
 } from '../geometry';
 import {ShapeKind} from '../model/tree';
-import {ROOT_PEN_WIDTH, SIBLING_CORNER_RADIUS} from '../layout/constants';
+import {
+  PARALLELOGRAM_SKEW_PX,
+  ROOT_PEN_WIDTH,
+  SIBLING_CORNER_RADIUS,
+} from '../layout/constants';
 
 export type NodeFrameOptions = {
   /**
@@ -77,6 +81,11 @@ export function nodeFrame(
     case ShapeKind.ROUNDED_RECTANGLE:
       return polygon(
         roundedRectPoints(bbox, SIBLING_CORNER_RADIUS),
+        opts.penWidth ?? PEN_DEFAULTS.penWidth,
+      );
+    case ShapeKind.PARALLELOGRAM:
+      return polygon(
+        parallelogramPoints(bbox, PARALLELOGRAM_SKEW_PX),
         opts.penWidth ?? PEN_DEFAULTS.penWidth,
       );
     default:
@@ -146,6 +155,33 @@ export function roundedRectPoints(bbox: Rect, cornerRadius: number): Point[] {
 function ovalPoints(bbox: Rect): Point[] {
   const {halfW, halfH} = halfDims(bbox);
   return roundedRectPoints(bbox, Math.min(halfW, halfH));
+}
+
+/**
+ * Vertices of a parallelogram inscribed in `bbox`, slanted right by
+ * `skew` pixels. Top edge shifts right by `skew`; bottom edge shifts
+ * left by the same amount. The four-point list is open — `polygon()`
+ * closes it by appending the first point.
+ *
+ *   ┌──────────┐         skew →
+ *   │          │      ╱──────────╱
+ *   │   bbox   │     ╱          ╱
+ *   │          │    ╱          ╱
+ *   └──────────┘   ╱──────────╱
+ *
+ * `skew` is clamped to `bbox.w / 2` so the shape never collapses to
+ * a line for narrow rectangles. Output points walk clockwise from
+ * the top-left vertex of the slanted shape.
+ */
+export function parallelogramPoints(bbox: Rect, skew: number): Point[] {
+  const {x, y, w, h} = bbox;
+  const s = Math.max(0, Math.min(skew, w / 2));
+  return [
+    {x: x + s, y},
+    {x: x + w, y},
+    {x: x + w - s, y: y + h},
+    {x, y: y + h},
+  ];
 }
 
 /**

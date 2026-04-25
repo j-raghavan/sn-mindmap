@@ -82,22 +82,20 @@ export function emitGeometries(input: EmitInput): EmitOutput {
   const nodes = flattenForEmit(tree);
 
   // -----------------------------------------------------------------
-  // 1. Node outlines (pre-order).
+  // 1. Connectors (emitted FIRST so node outlines paint over them).
   // -----------------------------------------------------------------
-  for (const node of nodes) {
-    const bbox = bboxOrThrow(layout, node.id);
-    geometries.push(withNoAutoLasso(nodeFrame(bbox, node.shape)));
-  }
-
-  // -----------------------------------------------------------------
-  // 2. Connectors.
-  // -----------------------------------------------------------------
-  // One straightLine per parent/child pair, in the same pre-order
-  // visit. Endpoints are clipped to each node's bounding box so the
-  // line visibly starts at the parent's outline and ends at the
-  // child's (§F-IN-2 step 2). If the two rects overlap (shouldn't
-  // happen with sane layouts but guarded for fuzz-testing) we fall
-  // back to center-to-center to avoid NaN endpoints.
+  // Strokes paint in emit order on Supernote — later strokes land on
+  // top of earlier ones. We want the user to see clean node outlines
+  // with no connector line bleeding through them, so connectors emit
+  // first and are then visually masked by the node outline at each
+  // endpoint. The clipping logic still trims connector endpoints to
+  // each node's AABB, but for non-rectangular nodes (the root oval)
+  // the AABB is larger than the visible shape — paint order is what
+  // produces a clean visual on the curved edge.
+  //
+  // Endpoints are clipped to each node's bounding box. If the two
+  // rects overlap (shouldn't happen with sane layouts but guarded for
+  // fuzz-testing) we fall back to center-to-center to avoid NaN.
   for (const node of nodes) {
     if (node.parentId === null) {
       continue;
@@ -122,6 +120,15 @@ export function emitGeometries(input: EmitInput): EmitOutput {
       showLassoAfterInsert: false,
     };
     geometries.push(line);
+  }
+
+  // -----------------------------------------------------------------
+  // 2. Node outlines (pre-order, paint LAST so they cover their
+  //    own connector endpoints).
+  // -----------------------------------------------------------------
+  for (const node of nodes) {
+    const bbox = bboxOrThrow(layout, node.id);
+    geometries.push(withNoAutoLasso(nodeFrame(bbox, node.shape)));
   }
 
   return {

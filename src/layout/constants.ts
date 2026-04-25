@@ -43,7 +43,7 @@ export const ROOT_PEN_WIDTH = 500;
 export const STANDARD_PEN_WIDTH = 400;
 
 /**
- * Corner radius (logical px) for Rounded-Rectangle (sibling) nodes (§F-AC-3).
+ * Corner radius (logical px) for Rounded-Rectangle nodes.
  */
 export const CORNER_RADIUS = 15;
 
@@ -52,3 +52,13 @@ export const CORNER_RADIUS = 15;
  * descriptive name (nodeFrame, roundedRectPoints).
  */
 export const SIBLING_CORNER_RADIUS = CORNER_RADIUS;
+
+/**
+ * Horizontal skew (logical px) of parallelogram-shaped nodes
+ * (depth ≥ 3 in the v1.0 shape-by-depth table). The top edge shifts
+ * right by this amount, the bottom edge shifts left by the same
+ * amount, so the bounding box stays unchanged. 20 px on a default
+ * NODE_WIDTH = 220 produces a visible slant without crowding the
+ * label inside.
+ */
+export const PARALLELOGRAM_SKEW_PX = 20;
