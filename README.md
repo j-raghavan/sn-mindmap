@@ -8,6 +8,13 @@
 
 A Supernote plugin that brings first-class mindmap authoring into the Notes system. Open a note, tap **Mindmap**, build a tree of labelled, connected nodes, and tap **Insert** — the plugin drops the whole map onto your current page as native ink and text elements, ready for you to annotate, lasso, move, and write around with your Supernote pen.
 
+## Demo 
+### v1.0.1 
+
+<video src="https://github.com/user-attachments/assets/040b0329-11b3-4feb-a37f-24ad2feca86f" controls muted playsinline widh="720"></video>
+
+
+
 ## Features
 
 - **Label-first authoring.** A modal pops up the moment you open the plugin asking for the central idea. Type it in or hand-write it with the pen — the host's recognition feeds the same `TextInput`. Add Child / Add Sibling open the same modal; tap any existing node to edit its label.
