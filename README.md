@@ -1,6 +1,7 @@
 # Mindmap Plugin for Supernote
 
-![Tests](https://img.shields.io/badge/tests-160%20passed-brightgreen)
+![Tests](https://img.shields.io/badge/tests-180%20passed-brightgreen)
+![Coverage](https://img.shields.io/badge/coverage-96%25-brightgreen)
 ![Lint](https://img.shields.io/badge/lint-passing-brightgreen)
 ![Platform](https://img.shields.io/badge/platform-Supernote-blue)
 ![License](https://img.shields.io/badge/license-MIT-blue)
@@ -76,7 +77,13 @@ Use the Supernote Partner App to copy `build/outputs/SnMindmap.snplg` to the `My
 npm test
 ```
 
-Covers 160 unit tests across 7 suites: tree mutators and shape-by-depth assignment, radial layout, node-frame geometry (including parallelogram polygon emission), connector + outline emit ordering, the insert pipeline (page-context resolution, fit-to-page scaler, `createElement` + `replaceElements` happy path and error surfaces), and the canvas component (label modal, action pills, top-bar buttons, two-tap clear, key-based remount on Clear).
+Covers 180 unit tests across 7 suites: tree mutators and shape-by-depth assignment, radial layout, node-frame geometry (including parallelogram polygon emission), connector + outline emit ordering, the insert pipeline (page-context resolution, fit-to-page scaler, `createElement` + `replaceElements` happy path and error surfaces), and the canvas component (label modal, action pills, top-bar buttons, two-tap clear, key-based remount on Clear). Line coverage is 96% across `src/`, with per-file thresholds (configured in `jest.config.js`) ranging from 91% to 100% depending on each module's defensive-guard density.
+
+To regenerate the coverage report:
+
+```sh
+npm test -- --coverage
+```
 
 ## Linting
 
