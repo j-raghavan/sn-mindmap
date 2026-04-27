@@ -1,6 +1,6 @@
 {
   "name": "SnMindmap",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Build mindmaps directly in your Supernote notes. Tap to add and connect nodes, then label them with your native pen. Re-edit later by lassoing.",
   "private": true,
   "scripts": {
