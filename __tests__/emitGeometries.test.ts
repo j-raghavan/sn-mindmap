@@ -468,4 +468,25 @@ describe('emitGeometries — connector clipping edge cases', () => {
       expect(Number.isFinite(p.y)).toBe(true);
     }
   });
+
+  it('falls back to center pair when parent and child rects overlap on the connector line', () => {
+    // Distinct centres but bboxes that intersect — the line from the
+    // parent centre exits the parent rect AFTER it has already entered
+    // the child rect, so tExitParent >= tEnterChild and the clipper
+    // bails to the unclipped centre pair. Reproduces the geometry that
+    // existed before R1 was widened past NODE_WIDTH; without this the
+    // tExitParent >= tEnterChild branch is unreachable through the
+    // real radialLayout (root↔child bboxes are now always disjoint).
+    const {tree, layout} = oneChildLayout(
+      {x: 0, y: 0},
+      {x: -110, y: -48, w: 220, h: 96},
+      {x: 200, y: 0},
+      {x: 90, y: -48, w: 220, h: 96},
+    );
+    const {geometries} = emitGeometries({tree, layout});
+    const lines = geometries.filter(isLine);
+    expect(lines).toHaveLength(1);
+    expect(lines[0].points[0]).toEqual({x: 0, y: 0});
+    expect(lines[0].points[1]).toEqual({x: 200, y: 0});
+  });
 });
