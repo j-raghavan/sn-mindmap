@@ -133,6 +133,33 @@ describe('radial layout', () => {
       expect(Math.abs(angles[2] - angles[1])).toBeCloseTo(step, 6);
       expect(Math.abs(angles[3] - angles[2])).toBeCloseTo(step, 6);
     });
+
+    it('first-level child bboxes never overlap the root bbox', () => {
+      // Regression for the Reddit "Family overlaps Mother" report:
+      // with R1 < NODE_WIDTH the middle child of a three-child
+      // full-ring (placed at θ = 0°) intersected the root oval.
+      // Sweep child counts that exercise both fan mode and full-ring
+      // angles (including 0° and 180°), confirm bboxes are AABB-
+      // disjoint from the root for every layout.
+      for (const childCount of [1, 2, 3, 4, 6]) {
+        const tree = createTree();
+        for (let i = 0; i < childCount; i += 1) {
+          addChild(tree, 0);
+        }
+        const result = radialLayout(tree);
+        const root = result.bboxes.get(0)!;
+        for (const [id, bbox] of result.bboxes) {
+          if (id === 0) {
+            continue;
+          }
+          const overlapX =
+            bbox.x < root.x + root.w && bbox.x + bbox.w > root.x;
+          const overlapY =
+            bbox.y < root.y + root.h && bbox.y + bbox.h > root.y;
+          expect(overlapX && overlapY).toBe(false);
+        }
+      }
+    });
   });
 
   describe('§F-LY-3 deeper levels and leaf-count slices', () => {

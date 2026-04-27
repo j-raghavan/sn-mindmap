@@ -81,6 +81,7 @@ import {
 } from './model/tree';
 import {radialLayout, type LayoutResult} from './layout/radial';
 import {
+  PARALLELOGRAM_SKEW_DEG,
   ROOT_PEN_WIDTH,
   SIBLING_CORNER_RADIUS,
   STANDARD_PEN_WIDTH,
@@ -990,7 +991,7 @@ function NodeFrame({
   // shear on the Text View — same trick CSS skew layouts use.
   const labelTransform =
     node.shape === ShapeKind.PARALLELOGRAM
-      ? [{skewX: '12deg'}]
+      ? [{skewX: `${PARALLELOGRAM_SKEW_DEG}deg`}]
       : undefined;
   return (
     <Pressable
@@ -1260,13 +1261,14 @@ function borderRadiusForShape(shape: ShapeKind, bbox: Rect): number {
  * Only PARALLELOGRAM uses a non-identity transform — skewX shears the
  * rectangle horizontally so its top edge sits to the right of its
  * bottom edge, matching the inscribed-skew polygon emitted by
- * parallelogramPoints. The skew angle (12°) is tuned so a 220×96
- * bbox produces a ~20 px horizontal offset, the same value as
- * PARALLELOGRAM_SKEW_PX in nodeFrame.ts (atan(20/96) ≈ 11.8°).
+ * parallelogramPoints. The skew angle is shared with the polygon
+ * emit via PARALLELOGRAM_SKEW_DEG, so resizing NODE_HEIGHT keeps the
+ * authored slant in lockstep with PARALLELOGRAM_SKEW_PX = NODE_HEIGHT
+ * × tan(angle).
  */
 function transformForShape(shape: ShapeKind): {skewX: string}[] | undefined {
   if (shape === ShapeKind.PARALLELOGRAM) {
-    return [{skewX: '-12deg'}];
+    return [{skewX: `${-PARALLELOGRAM_SKEW_DEG}deg`}];
   }
   return undefined;
 }
