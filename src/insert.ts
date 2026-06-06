@@ -2,10 +2,10 @@
  * High-level insert flow (§5.3, §F-IN-1..F-IN-5).
  *
  *   1. resolvePageContext() — getCurrentFilePath → getCurrentPageNum →
- *      PluginFileAPI.getPageSize. Required for the batched
- *      replaceElements write; falling back to default dimensions when
+ *      PluginFileAPI.getPageSize. Required for the additive
+ *      insertElements write; falling back to default dimensions when
  *      the chain fails rejects the insert with a clear error (the
- *      batched path can't operate without a concrete notePath/page).
+ *      additive path can't operate without a concrete notePath/page).
  *   2. Auto-expand every subtree so no node is hidden at emit time.
  *   3. radialLayout() in mindmap-local coords, root at origin.
  *   4. Fit-to-page scale if wider than the page (§F-LY-6), then
@@ -15,10 +15,13 @@
  *      re-edit is out of scope for v0.1.
  *   6. For each emitted geometry: PluginCommAPI.createElement(TYPE_GEO)
  *      to mint a native-backed Element, populate pageNum / layerNum /
- *      thickness / geometry. Then ONE PluginFileAPI.replaceElements
- *      call with [existing..., newElements]. Confirmed on device to
- *      cost one host-side fsync (vs. one per insertGeometry), which
- *      is what makes the insert finish in ~1 s instead of ~80 s.
+ *      thickness / geometry. Then ONE additive
+ *      PluginFileAPI.insertElements call with just newElements. The
+ *      page's pre-existing elements are neither read nor sent — the
+ *      insert ADDS the mindmap and leaves existing content untouched
+ *      (I-NDI-1/I-NDI-2). Confirmed on device to cost one host-side
+ *      fsync (vs. one per insertGeometry), which is what makes the
+ *      insert finish in ~1 s instead of ~80 s (I-NDI-3).
  *   7. setLassoBoxState(2) → reloadFile() (mirrors shape-snap's
  *      executeFastPath tail). This clears any residual lasso state
  *      and refreshes the view so the user's pen immediately returns
@@ -27,9 +30,12 @@
  *      selection first.
  *   8. PluginManager.closePluginView() to dismiss.
  *
- * Error handling: replaceElements is all-or-nothing on the host, so
- * there is never a partial-insert state to clean up. On failure the
- * page is untouched; we throw and let the UI surface the banner.
+ * Error handling: the user's existing content is never at risk because
+ * it is never read or sent — only the new mindmap elements are passed
+ * to insertElements. A partial NEW-element insert (some geometries
+ * applied, then a mid-list failure) is theoretically possible and is a
+ * documented follow-up (RA-3); it is NOT inherited atomicity. On
+ * failure we throw and let the UI surface the banner.
  */
 import {
   Element,
@@ -164,29 +170,35 @@ export async function insertMindmap(input: InsertInput): Promise<void> {
   log('emitGeometries:done', {
     total: geometries.length,
     byType: countByType(geometries),
+    edgeCount: expanded.crossEdges.length,
     unionRect,
   });
 
-  // §F-IN-3 — batched write. Build one native-backed Element per
+  // §F-IN-3 — additive write. Build one native-backed Element per
   // emitted geometry (createElement returns an Element whose native
   // side carries the uuid / angles / contoursSrc accessors the host
   // validator expects; our old hand-built {type:700,…} object missed
   // that plumbing and got rejected with APIError 106), then call
-  // replaceElements(notePath, page, [existing..., newElements]) ONCE.
+  // insertElements(notePath, page, newElements) ONCE.
   //
-  // Performance: single replaceElements = one host-side fsync instead
+  // Performance: single insertElements = one host-side fsync instead
   // of one per geometry, cutting insert wall-time from ~80 s (309
   // geometries × ~260 ms/fsync observed on the 08:45 probe run) to
-  // ~1–2 s. replaceElements itself is the only disk-touching step;
-  // every createElement is bridge-only.
+  // ~1–2 s (I-NDI-3). insertElements itself is the only disk-touching
+  // step; every createElement is bridge-only. Dropping the prior
+  // whole-page getElements read also removes a large bridge marshal on
+  // pages that already hold many elements.
   //
-  // Atomicity: replaceElements is all-or-nothing on the host. If it
-  // fails, the page is untouched, so there's nothing to clean up —
-  // we just re-raise and let the UI layer surface the error banner.
+  // Safety: insertElements is ADDITIVE — the page's existing elements
+  // are never read or sent, so they cannot be corrupted (I-NDI-2). We
+  // do NOT assume the new-element list is applied transactionally; a
+  // partial NEW-element insert is a documented follow-up (RA-3), not
+  // inherited atomicity. On failure we re-raise and let the UI layer
+  // surface the error banner.
   if (pageCtx.notePath === null || pageCtx.page === null) {
     throw new Error(
       'insertMindmap: resolvePageContext returned null notePath/page; ' +
-        'replaceElements requires both',
+        'insertElements requires both',
     );
   }
   // Collect labeled nodes so their text lands inside their outline as
@@ -206,41 +218,19 @@ export async function insertMindmap(input: InsertInput): Promise<void> {
     );
     log('buildElements:done', {built: newElements.length});
 
-    log('getElements:before');
-    const getRes = (await PluginFileAPI.getElements(
-      pageCtx.page,
-      pageCtx.notePath,
-    )) as ApiRes<unknown[]>;
-    log('getElements:after', {
-      success: getRes?.success,
-      errorMessage: getRes?.error?.message,
-      existingCount: Array.isArray(getRes?.result)
-        ? (getRes?.result as unknown[]).length
-        : null,
-    });
-    if (!getRes?.success || !Array.isArray(getRes.result)) {
-      throw new Error(getRes?.error?.message ?? 'getElements failed');
-    }
-    const existing = getRes.result as unknown[];
-
-    const combined = [...existing, ...newElements];
-    log('replaceElements:before', {
-      existingCount: existing.length,
-      addedCount: newElements.length,
-      totalCount: combined.length,
-    });
-    const replaceRes = (await PluginFileAPI.replaceElements(
+    log('insertElements:before', {addedCount: newElements.length});
+    const insertRes = (await PluginFileAPI.insertElements(
       pageCtx.notePath,
       pageCtx.page,
-      combined as object[],
+      newElements as object[],
     )) as ApiRes<boolean>;
-    log('replaceElements:after', {
-      success: replaceRes?.success,
-      errorCode: (replaceRes?.error as {code?: number} | undefined)?.code,
-      errorMessage: replaceRes?.error?.message,
+    log('insertElements:after', {
+      success: insertRes?.success,
+      errorCode: (insertRes?.error as {code?: number} | undefined)?.code,
+      errorMessage: insertRes?.error?.message,
     });
-    if (!replaceRes?.success) {
-      throw new Error(replaceRes?.error?.message ?? 'replaceElements failed');
+    if (!insertRes?.success) {
+      throw new Error(insertRes?.error?.message ?? 'insertElements failed');
     }
 
     // Force the host to repaint the page with the newly-inserted
@@ -277,8 +267,9 @@ export async function insertMindmap(input: InsertInput): Promise<void> {
       message: err instanceof Error ? err.message : String(err),
       stack: err instanceof Error ? err.stack : undefined,
     });
-    // replaceElements is atomic, so there is never a partial insert
-    // to clean up. The error re-raises unchanged.
+    // Existing content is never sent, so it cannot be corrupted; a
+    // partial NEW-element set is a documented follow-up (RA-3), not
+    // silently inherited atomicity. The error re-raises unchanged.
     throw err;
   }
 }
@@ -359,7 +350,7 @@ function fontSizeForBbox(bbox: Rect): number {
 /**
  * Build one native-backed `Element` per emitted Geometry plus one
  * `Element.TYPE_TEXT` per labeled node, ready to hand to
- * `PluginFileAPI.replaceElements`.
+ * `PluginFileAPI.insertElements`.
  *
  * Geometry path (mirrors shape-snap):
  *   1. PluginCommAPI.createElement(Element.TYPE_GEO) — the native
@@ -489,7 +480,7 @@ function roundGeometryPoints(geometry: Geometry): Geometry {
 /**
  * Resolve everything the insert pipeline needs from the host about
  * the current page: page dimensions (for fit-to-page scale), plus
- * notePath + page index used by the replaceElements probe (§F-IN-1).
+ * notePath + page index used by the insertElements call (§F-IN-1).
  * Mirrors the three-step fall-through from sn-shapes:
  * PluginCommAPI.getCurrentFilePath -> getCurrentPageNum ->
  * PluginFileAPI.getPageSize. Any null-ish / failure result at any

@@ -14,8 +14,9 @@
  *                     no-ops.
  *
  * Error routing: any insertMindmap rejection shows the transient
- * 2 s error banner. insertMindmap handles its own cleanup internally
- * (replaceElements is atomic), so there is nothing to undo here.
+ * 2 s error banner. insertMindmap is additive — the page's existing
+ * content is never read or sent, so it is never at risk and there is
+ * nothing to undo here.
  *
  * v0.1 is insert-only. The Save / re-insert / capacity modal / out-
  * of-map dialog paths were removed along with the edit/decode

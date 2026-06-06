@@ -6,15 +6,21 @@
  * Covers:
  *   - §F-IN-1 page-size fall-through at every step
  *   - §F-IN-2 / §8.6 auto-expansion of collapsed subtrees
- *   - §F-IN-3 order-of-calls: createElement × N → getElements →
- *     replaceElements → lassoElements → closePluginView. Batched
- *     replaceElements is the viable batched path on this firmware
- *     (confirmed on-device 04-24 08:45 probe run); the older
- *     per-geometry insertGeometry loop was ~80 seconds and is gone.
+ *   - F-NDI-1 order-of-calls: createElement × N → insertElements →
+ *     reloadFile → closePluginView. The insert is ADDITIVE — a single
+ *     PluginFileAPI.insertElements call adds only the plugin's new
+ *     elements; the page's pre-existing content is neither read nor
+ *     sent (the old getElements read + replaceElements whole-page
+ *     rewrite are gone). insertElements is one host-side fsync, same
+ *     batched-call win the prior replaceElements had.
+ *   - F-NDI-1-AC3 zero getElements / zero replaceElements calls
+ *   - F-NDI-3 non-empty-page regression: pre-existing elements never
+ *     enter the insertElements payload (the gap that hid the
+ *     "moved my writing to the left" bug)
  *   - §F-IN-4 plugin-view dismissal
- *   - §F-IN-5 atomic failure semantics (replaceElements is
- *     all-or-nothing, so there is no partial-insert cleanup to do —
- *     a failed replaceElements throws and the page stays untouched)
+ *   - F-NDI-2 failure semantics without whole-page risk: existing
+ *     content is never read or sent, so it cannot be corrupted; an
+ *     insertElements failure throws and the UI surfaces the banner
  *   - §F-LY-6 fit-to-page scaling + page-centering of the union rect
  *
  * We intentionally don't re-test emitGeometries' internals here —
@@ -27,7 +33,7 @@ jest.mock('sn-plugin-lib', () => {
   // returned by PluginCommAPI.createElement on device — pageNum,
   // layerNum, thickness, geometry are populated by insertMindmap
   // after createElement returns. `uuid` is unique per call so tests
-  // can verify N distinct Elements landed in replaceElements.
+  // can verify N distinct Elements landed in insertElements.
   let uuidCounter = 0;
   const mintElement = () => ({
     uuid: `test-uuid-${uuidCounter++}`,
@@ -60,8 +66,14 @@ jest.mock('sn-plugin-lib', () => {
         success: true,
         result: {width: 1404, height: 1872},
       }),
+      // The additive insert path calls insertElements ONLY. getElements
+      // and replaceElements are deliberately mocked so the suite can
+      // assert they are NEVER invoked (F-NDI-1-AC3) — their presence on
+      // the mock object would otherwise let a regression call a
+      // jest-undefined and throw an opaque error.
       getElements: jest.fn().mockResolvedValue({success: true, result: []}),
       replaceElements: jest.fn().mockResolvedValue({success: true}),
+      insertElements: jest.fn().mockResolvedValue({success: true}),
     },
     PluginManager: {
       closePluginView: jest.fn().mockResolvedValue(true),
@@ -122,27 +134,27 @@ type InsertedGeometry = {
 
 /**
  * View over the emitted geometries. insertMindmap now calls
- * PluginFileAPI.replaceElements once with an array of Elements
- * (each Element carries its geometry in `.geometry`). This helper
- * walks the most recent replaceElements call, skips any pre-existing
- * elements the mock returned from getElements, and yields a
+ * PluginFileAPI.insertElements once with an array of Elements (each
+ * Element carries its geometry in `.geometry`). This helper walks the
+ * most recent insertElements call's payload and yields a
  * `[InsertedGeometry][]` shape that matches the legacy insertGeometry
  * mock.calls shape so assertions elsewhere don't need to change.
+ *
+ * The additive path sends ONLY the plugin's newly-minted elements —
+ * the page's pre-existing content is never read or sent (I-NDI-1) — so
+ * unlike the old replaceElements helper there is no "skip leading
+ * existing elements" step. We still filter on a truthy `.geometry` to
+ * drop TYPE_TEXT label elements (their `.geometry` stays null), which
+ * is exactly what the geometry-shaped assertions want.
  */
 function getInsertedGeometries(): Array<[InsertedGeometry]> {
-  const calls = asMock(PluginFileAPI.replaceElements).mock.calls;
+  const calls = asMock(PluginFileAPI.insertElements).mock.calls;
   if (calls.length === 0) {
     return [];
   }
   const latest = calls[calls.length - 1];
-  const combined = latest[2] as Array<{geometry?: InsertedGeometry}>;
-  // Existing page elements fed in by the getElements mock land at the
-  // front of `combined`; our newly-minted elements sit at the tail.
-  // We drop any leading element whose `.geometry` is falsy — the
-  // mintElement factory initialises `.geometry` to null and
-  // insertMindmap overwrites it with the emitted Geometry, so every
-  // real insert has a truthy `.geometry`.
-  return combined
+  const payload = latest[2] as Array<{geometry?: InsertedGeometry}>;
+  return payload
     .filter(el => el?.geometry !== null && el?.geometry !== undefined)
     .map(el => [el.geometry as InsertedGeometry]);
 }
@@ -150,7 +162,7 @@ function getInsertedGeometries(): Array<[InsertedGeometry]> {
 function resetMocks() {
   // createElement mints a fresh native-like Element per call. Tests
   // that want to observe all N elements should read
-  // replaceElements.mock.calls; this factory guarantees each Element
+  // insertElements.mock.calls; this factory guarantees each Element
   // carries a unique uuid so duplicate-detection assertions work.
   let uuidCounter = 0;
   asMock(PluginCommAPI.createElement).mockReset();
@@ -192,6 +204,8 @@ function resetMocks() {
   asMock(PluginFileAPI.getElements).mockResolvedValue({success: true, result: []});
   asMock(PluginFileAPI.replaceElements).mockClear();
   asMock(PluginFileAPI.replaceElements).mockResolvedValue({success: true});
+  asMock(PluginFileAPI.insertElements).mockClear();
+  asMock(PluginFileAPI.insertElements).mockResolvedValue({success: true});
   asMock(PluginCommAPI.setLassoBoxState).mockClear();
   asMock(PluginCommAPI.setLassoBoxState).mockResolvedValue({success: true});
   asMock(PluginCommAPI.reloadFile).mockClear();
@@ -228,7 +242,7 @@ describe('insertMindmap — happy path (§F-IN-1..F-IN-4)', () => {
     );
   });
 
-  it('replaceElements fires once with every emitted geometry, then reloads, then closes', async () => {
+  it('insertElements fires once with every emitted geometry, then reloads, then closes (F-NDI-1)', async () => {
     const tree = buildSmallTree();
     await insertMindmap({tree});
 
@@ -237,7 +251,13 @@ describe('insertMindmap — happy path (§F-IN-1..F-IN-4)', () => {
     // removed along with edit-mode.
     const insertCalls = getInsertedGeometries();
     expect(insertCalls.length).toBe(7);
-    expect(PluginFileAPI.replaceElements).toHaveBeenCalledTimes(1);
+    expect(PluginFileAPI.insertElements).toHaveBeenCalledTimes(1);
+    // F-NDI-1-AC3 / I-NDI-1: the additive path NEVER reads the page
+    // back (getElements) nor rewrites the whole page (replaceElements).
+    // These are the two calls the buggy v1.0.2 path made; their
+    // absence is the headline behavioural change.
+    expect(PluginFileAPI.getElements).not.toHaveBeenCalled();
+    expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
     // setLassoBoxState(2) is only meaningful after an explicit lasso,
     // which our flow never does — confirmed on device by APIError 904
     // "No lasso action has been performed". The call is skipped.
@@ -245,15 +265,42 @@ describe('insertMindmap — happy path (§F-IN-1..F-IN-4)', () => {
     expect(PluginCommAPI.reloadFile).toHaveBeenCalledTimes(1);
     expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
 
-    // Order: replaceElements → reloadFile → close.
-    const replaceOrder = asMock(PluginFileAPI.replaceElements).mock
+    // Order: createElement × N → insertElements → reloadFile → close.
+    const lastCreateOrder = Math.max(
+      ...asMock(PluginCommAPI.createElement).mock.invocationCallOrder,
+    );
+    const insertOrder = asMock(PluginFileAPI.insertElements).mock
       .invocationCallOrder[0];
     const reloadOrder = asMock(PluginCommAPI.reloadFile).mock
       .invocationCallOrder[0];
     const closeOrder = asMock(PluginManager.closePluginView).mock
       .invocationCallOrder[0];
-    expect(reloadOrder).toBeGreaterThan(replaceOrder);
+    expect(insertOrder).toBeGreaterThan(lastCreateOrder);
+    expect(reloadOrder).toBeGreaterThan(insertOrder);
     expect(closeOrder).toBeGreaterThan(reloadOrder);
+  });
+
+  it('passes (notePath, page, elements) to insertElements in that order (F-NDI-1-FR4)', async () => {
+    // Arg-order pin. getElements is the only host API with the
+    // REVERSED (page, notePath) order; a copy-paste of that signature
+    // into the write call would silently swap notePath and page. Lock
+    // the order so that regression fails loudly here.
+    asMock(PluginCommAPI.getCurrentFilePath).mockResolvedValueOnce({
+      success: true,
+      result: '/note/argorder.note',
+    });
+    asMock(PluginCommAPI.getCurrentPageNum).mockResolvedValueOnce({
+      success: true,
+      result: 7,
+    });
+
+    const tree = buildSmallTree();
+    await insertMindmap({tree});
+
+    const call = asMock(PluginFileAPI.insertElements).mock.calls[0];
+    expect(call[0]).toBe('/note/argorder.note'); // notePath first
+    expect(call[1]).toBe(7); // page index second (a number)
+    expect(Array.isArray(call[2])).toBe(true); // elements array third
   });
 
   it('passes showLassoAfterInsert:false through to every inserted geometry (§F-IN-3)', async () => {
@@ -293,6 +340,115 @@ describe('insertMindmap — happy path (§F-IN-1..F-IN-4)', () => {
   });
 });
 
+describe('insertMindmap — non-destructive insert (F-NDI-1..F-NDI-3)', () => {
+  it('sends ONLY the plugin\'s new elements; pre-existing page content is never in the payload (F-NDI-3-AC1)', async () => {
+    // THE regression that hid the shipped bug. Every prior insert test
+    // mocked an empty page (getElements → result:[]), and the on-device
+    // trace was captured with existingCount:0, so nothing ever proved
+    // the existing content stayed out of the write. Here we stand the
+    // page up with pre-existing elements and prove the additive path
+    // sends NONE of them.
+    //
+    // We make getElements return a page that ALREADY holds two
+    // elements carrying a sentinel field. If the old read-then-rewrite
+    // path were still alive, these would be concatenated into the write
+    // payload. The additive path never reads getElements, so they must
+    // be absent from insertElements' payload.
+    const preExisting = [
+      {uuid: 'native-existing-1', __preExisting: true, geometry: {type: 'native-stroke'}},
+      {uuid: 'native-existing-2', __preExisting: true, geometry: {type: 'native-stroke'}},
+    ];
+    asMock(PluginFileAPI.getElements).mockResolvedValue({
+      success: true,
+      result: preExisting,
+    });
+
+    const tree = buildSmallTree();
+    await insertMindmap({tree});
+
+    // Exactly one additive call.
+    expect(PluginFileAPI.insertElements).toHaveBeenCalledTimes(1);
+    // The page was NEVER read back, and NEVER whole-page-rewritten.
+    expect(PluginFileAPI.getElements).not.toHaveBeenCalled();
+    expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
+
+    const payload = asMock(PluginFileAPI.insertElements).mock
+      .calls[0][2] as Array<Record<string, unknown>>;
+    // Payload length == ONLY the plugin's new elements (7 geometries +
+    // 0 labels for the small tree) — not 7 + 2 existing.
+    expect(payload).toHaveLength(7);
+    // No pre-existing element leaked into the payload — neither by the
+    // sentinel field nor by uuid.
+    for (const el of payload) {
+      expect(el.__preExisting).toBeUndefined();
+      expect(el.uuid).not.toBe('native-existing-1');
+      expect(el.uuid).not.toBe('native-existing-2');
+    }
+  });
+
+  it('non-empty page: payload length is geometries + labels only, with labels present (F-NDI-3-FR2)', async () => {
+    // Same non-empty page, but now with two labeled nodes so the
+    // payload is geometries + labels. Still: only the plugin's new
+    // elements, never the existing page content.
+    asMock(PluginFileAPI.getElements).mockResolvedValue({
+      success: true,
+      result: [{uuid: 'native-existing-1', __preExisting: true}],
+    });
+
+    const tree = createTree();
+    setLabel(tree, 0, 'Root idea');
+    addChild(tree, 0, 'Child A');
+    addChild(tree, 0); // unlabeled
+    addChild(tree, 0); // unlabeled
+
+    await insertMindmap({tree});
+
+    const payload = asMock(PluginFileAPI.insertElements).mock
+      .calls[0][2] as Array<Record<string, unknown>>;
+    // 4 outlines + 3 connectors = 7 geometries; 2 labels = 2 TYPE_TEXT.
+    expect(payload).toHaveLength(9);
+    for (const el of payload) {
+      expect(el.__preExisting).toBeUndefined();
+    }
+  });
+
+  it('empty page: insert still lands the full geometry set page-centered (F-NDI-1-AC2 — no regression)', async () => {
+    // The working case must stay working. On an empty page the additive
+    // insert sends the full geometry+label set, identical to v1.0.2
+    // minus the (now removed) whole-page read.
+    asMock(PluginFileAPI.getElements).mockResolvedValue({
+      success: true,
+      result: [],
+    });
+
+    const tree = buildSmallTree();
+    await insertMindmap({tree});
+
+    expect(PluginFileAPI.insertElements).toHaveBeenCalledTimes(1);
+    const payload = asMock(PluginFileAPI.insertElements).mock
+      .calls[0][2] as unknown[];
+    // 7 geometries, no labels.
+    expect(payload).toHaveLength(7);
+
+    // Page-centered, exactly as the empty-page fit-to-page tests assert.
+    const insertCalls = getInsertedGeometries();
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const [geometry] of insertCalls) {
+      for (const p of geometry.points ?? []) {
+        minX = Math.min(minX, p.x);
+        minY = Math.min(minY, p.y);
+        maxX = Math.max(maxX, p.x);
+        maxY = Math.max(maxY, p.y);
+      }
+    }
+    expect((minX + maxX) / 2).toBeCloseTo(DEFAULT_PAGE_WIDTH / 2, 0);
+    expect((minY + maxY) / 2).toBeCloseTo(DEFAULT_PAGE_HEIGHT / 2, 0);
+  });
+});
+
 describe('insertMindmap — labeled nodes (TYPE_TEXT path)', () => {
   it('emits one TYPE_TEXT element per labeled node alongside the geometry elements', async () => {
     // Build a tree where root + one child carry labels; the other
@@ -300,10 +456,9 @@ describe('insertMindmap — labeled nodes (TYPE_TEXT path)', () => {
     // elements (collectLabeledNodes filters them by trim() emptiness).
     const tree = createTree();
     setLabel(tree, 0, 'Root idea');
-    const a = addChild(tree, 0, 'Child A');
+    addChild(tree, 0, 'Child A');
     addChild(tree, 0); // unlabeled
     addChild(tree, 0); // unlabeled
-    void a;
 
     await insertMindmap({tree});
 
@@ -321,8 +476,8 @@ describe('insertMindmap — labeled nodes (TYPE_TEXT path)', () => {
 
     await insertMindmap({tree});
 
-    const replaceCall = asMock(PluginFileAPI.replaceElements).mock.calls[0];
-    const combined = replaceCall[2] as Array<{
+    const insertCall = asMock(PluginFileAPI.insertElements).mock.calls[0];
+    const payload = insertCall[2] as Array<{
       textBox?: {
         textContentFull?: string;
         textRect?: {left: number; top: number; right: number; bottom: number};
@@ -330,7 +485,7 @@ describe('insertMindmap — labeled nodes (TYPE_TEXT path)', () => {
         textAlign?: number;
       };
     }>;
-    const textElements = combined.filter(el => el?.textBox !== undefined);
+    const textElements = payload.filter(el => el?.textBox !== undefined);
     expect(textElements).toHaveLength(1);
     const tb = textElements[0].textBox!;
     // setLabel already trimmed the stored label.
@@ -382,32 +537,33 @@ describe('insertMindmap — auto-expansion (§F-IN-2 / §8.6)', () => {
 });
 
 describe('insertMindmap — page-size fall-through (§F-IN-1)', () => {
-  it('throws when getCurrentFilePath rejects (notePath required for replaceElements)', async () => {
-    // replaceElements needs an explicit notePath + page index; there is
+  it('throws when getCurrentFilePath rejects (notePath required for insertElements) (F-NDI-1-FR5)', async () => {
+    // insertElements needs an explicit notePath + page index; there is
     // no implicit "current page" fallback. A note-context resolution
-    // failure is therefore terminal in the batched path — the UI layer
-    // surfaces the error banner and the user retries.
+    // failure is therefore terminal — the UI layer surfaces the error
+    // banner and the user retries. The guard message names
+    // insertElements (NOT the removed replaceElements).
     asMock(PluginCommAPI.getCurrentFilePath).mockRejectedValueOnce(
       new Error('native bridge unavailable'),
     );
 
     const tree = createTree();
     await expect(insertMindmap({tree})).rejects.toThrow(
-      /notePath\/page/,
+      /insertElements requires both/,
     );
     expect(PluginFileAPI.getPageSize).not.toHaveBeenCalled();
-    expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
+    expect(PluginFileAPI.insertElements).not.toHaveBeenCalled();
   });
 
-  it('throws when getPageSize returns success:false (notePath required)', async () => {
+  it('throws when getPageSize returns success:false (notePath required) (F-NDI-1-FR5)', async () => {
     asMock(PluginFileAPI.getPageSize).mockResolvedValueOnce({success: false});
 
     const tree = createTree();
     await expect(insertMindmap({tree})).rejects.toThrow(
-      /notePath\/page/,
+      /insertElements requires both/,
     );
     expect(PluginFileAPI.getPageSize).toHaveBeenCalledTimes(1);
-    expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
+    expect(PluginFileAPI.insertElements).not.toHaveBeenCalled();
   });
 
   it('uses the returned page size when every step succeeds', async () => {
@@ -510,7 +666,7 @@ describe('insertMindmap — fit-to-page scaling (§F-LY-6)', () => {
     const width = Math.max(...xs) - Math.min(...xs);
     const height = Math.max(...ys) - Math.min(...ys);
     // Tolerance widened to ±1 to accommodate integer rounding at the
-    // replaceElements boundary (roundGeometryPoints rounds every
+    // insertElements boundary (roundGeometryPoints rounds every
     // point.x/y to integers — the native firmware rejects fractional
     // coords). The max-min of rounded coords can drift by up to ±1
     // from the pre-rounding float value.
@@ -558,7 +714,7 @@ describe('insertMindmap — fit-to-page scaling (§F-LY-6)', () => {
 
 describe('insertMindmap — error + cleanup (§F-IN-5)', () => {
   it('re-raises a createElement failure and does not touch the page', async () => {
-    // createElement failing mid-build aborts before replaceElements —
+    // createElement failing mid-build aborts before insertElements —
     // no geometries land on the page, so no cleanup is needed.
     let callCount = 0;
     asMock(PluginCommAPI.createElement).mockImplementation(async () => {
@@ -586,40 +742,36 @@ describe('insertMindmap — error + cleanup (§F-IN-5)', () => {
     await expect(insertMindmap({tree})).rejects.toThrow(
       /createElement\(geo\) failed at index 1/,
     );
-    expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
+    expect(PluginFileAPI.insertElements).not.toHaveBeenCalled();
     expect(PluginManager.closePluginView).not.toHaveBeenCalled();
   });
 
-  it('re-raises a getElements failure and does not touch the page', async () => {
-    asMock(PluginFileAPI.getElements).mockResolvedValueOnce({
+  // F-NDI-3-FR3: the old getElements-failure tests are GONE. The
+  // additive path never calls getElements, so a getElements failure
+  // cannot abort the insert — there is no code path to exercise. The
+  // "never reads the page" property is pinned positively in the
+  // happy-path test (getElements .not.toHaveBeenCalled) and in the
+  // non-empty-page regression below.
+
+  it('re-raises an insertElements failure and leaves the existing page untouched (F-NDI-2-AC1)', async () => {
+    // insertElements rejecting throws the host message. The user's
+    // existing content is provably untouched: it was never read
+    // (getElements) nor rewritten (replaceElements), so no destructive
+    // call was ever issued. closePluginView is skipped so the UI stays
+    // open and shows the error banner.
+    asMock(PluginFileAPI.insertElements).mockResolvedValueOnce({
       success: false,
-      error: {message: 'simulated: getElements refused'},
+      error: {message: 'simulated: insertElements rejected'},
     });
 
     const tree = buildSmallTree();
     await expect(insertMindmap({tree})).rejects.toThrow(
-      /getElements refused/,
+      /insertElements rejected/,
     );
+    expect(PluginManager.closePluginView).not.toHaveBeenCalled();
+    // No destructive call was ever issued — existing content is safe.
+    expect(PluginFileAPI.getElements).not.toHaveBeenCalled();
     expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
-    expect(PluginManager.closePluginView).not.toHaveBeenCalled();
-  });
-
-  it('re-raises a replaceElements failure atomically (no partial-insert cleanup needed)', async () => {
-    // replaceElements is all-or-nothing on the host side. On failure
-    // the page is unchanged — there is no partial-insert state to
-    // clean up, so lassoElements / deleteLassoElements are never
-    // called. closePluginView is skipped so the UI stays open and
-    // shows the error banner.
-    asMock(PluginFileAPI.replaceElements).mockResolvedValueOnce({
-      success: false,
-      error: {message: 'simulated: replaceElements rejected'},
-    });
-
-    const tree = buildSmallTree();
-    await expect(insertMindmap({tree})).rejects.toThrow(
-      /replaceElements rejected/,
-    );
-    expect(PluginManager.closePluginView).not.toHaveBeenCalled();
     expect(PluginCommAPI.lassoElements).not.toHaveBeenCalled();
     expect(PluginCommAPI.deleteLassoElements).not.toHaveBeenCalled();
   });
@@ -635,7 +787,7 @@ describe('insertMindmap — error + cleanup (§F-IN-5)', () => {
 
     const tree = buildSmallTree();
     await expect(insertMindmap({tree})).resolves.toBeUndefined();
-    expect(PluginFileAPI.replaceElements).toHaveBeenCalledTimes(1);
+    expect(PluginFileAPI.insertElements).toHaveBeenCalledTimes(1);
     expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
     expect(PluginCommAPI.deleteLassoElements).not.toHaveBeenCalled();
   });
@@ -649,37 +801,16 @@ describe('insertMindmap — error + cleanup (§F-IN-5)', () => {
     await expect(insertMindmap({tree})).rejects.toThrow(
       /createElement\(geo\) failed at index 0: unknown error/,
     );
-    expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
+    expect(PluginFileAPI.insertElements).not.toHaveBeenCalled();
   });
 
-  it('falls back to "getElements failed" when error.message is missing', async () => {
-    asMock(PluginFileAPI.getElements).mockResolvedValueOnce({success: false});
+  it('falls back to "insertElements failed" when error.message is missing', async () => {
+    // The `?? 'insertElements failed'` nullish-coalesce branch fires
+    // when the host rejects insertElements without an error.message.
+    asMock(PluginFileAPI.insertElements).mockResolvedValueOnce({success: false});
 
     const tree = buildSmallTree();
-    await expect(insertMindmap({tree})).rejects.toThrow(/getElements failed/);
-    expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
-  });
-
-  it('rejects when getElements returns success:true but a non-array result', async () => {
-    // Second half of the getElements guard: `!Array.isArray(getRes.result)`.
-    // Host contract guarantees an array, so the only way to hit this
-    // branch is a malformed mock — same error message as the
-    // success:false path, because the fallback string is shared.
-    asMock(PluginFileAPI.getElements).mockResolvedValueOnce({
-      success: true,
-      result: {notAnArray: true},
-    });
-
-    const tree = buildSmallTree();
-    await expect(insertMindmap({tree})).rejects.toThrow(/getElements failed/);
-    expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
-  });
-
-  it('falls back to "replaceElements failed" when error.message is missing', async () => {
-    asMock(PluginFileAPI.replaceElements).mockResolvedValueOnce({success: false});
-
-    const tree = buildSmallTree();
-    await expect(insertMindmap({tree})).rejects.toThrow(/replaceElements failed/);
+    await expect(insertMindmap({tree})).rejects.toThrow(/insertElements failed/);
   });
 
   it('stringifies non-serialisable log details via the String(detail) fallback', async () => {
@@ -695,7 +826,7 @@ describe('insertMindmap — error + cleanup (§F-IN-5)', () => {
 
     const tree = buildSmallTree();
     await expect(insertMindmap({tree})).resolves.toBeUndefined();
-    expect(PluginFileAPI.replaceElements).toHaveBeenCalledTimes(1);
+    expect(PluginFileAPI.insertElements).toHaveBeenCalledTimes(1);
   });
 
   it('re-raises a non-Error thrown value via the String(err) branch of the outer catch', async () => {
@@ -710,13 +841,13 @@ describe('insertMindmap — error + cleanup (§F-IN-5)', () => {
 
     const tree = buildSmallTree();
     await expect(insertMindmap({tree})).rejects.toBe('plain string failure');
-    expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
+    expect(PluginFileAPI.insertElements).not.toHaveBeenCalled();
   });
 
   it('re-raises a createElement(text) failure for labeled nodes', async () => {
     // First N createElement calls (TYPE_GEO) succeed, then the
     // TYPE_TEXT createElement for the labeled root fails. Pipeline
-    // must abort before replaceElements.
+    // must abort before insertElements.
     let geoCalls = 0;
     asMock(PluginCommAPI.createElement).mockImplementation(
       async (kind: number) => {
@@ -747,7 +878,7 @@ describe('insertMindmap — error + cleanup (§F-IN-5)', () => {
     await expect(insertMindmap({tree})).rejects.toThrow(
       /createElement\(text\) failed at index 0/,
     );
-    expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
+    expect(PluginFileAPI.insertElements).not.toHaveBeenCalled();
   });
 
   it('falls back to "createElement(text)" default message when error.message missing', async () => {
@@ -785,6 +916,27 @@ describe('insertMindmap — error + cleanup (§F-IN-5)', () => {
     // to the caller or trigger an unhandled-rejection warning.
     asMock(PluginManager.closePluginView).mockRejectedValueOnce(
       new Error('bridge closed'),
+    );
+
+    const tree = buildSmallTree();
+    await expect(insertMindmap({tree})).resolves.toBeUndefined();
+    expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
+    // Flush microtasks so the fire-and-forget rejection handler runs
+    // before the test ends (otherwise Jest flags the unhandled rejection).
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  it('logs a NON-Error closePluginView rejection via the String(err) arm', async () => {
+    // Companion to the Error-rejection test above. The fire-and-forget
+    // close handler logs via
+    //   `err instanceof Error ? err.message : String(err)`.
+    // Rejecting with a plain string drives the FALSE arm (String(err)),
+    // which the Error case never exercises. Like its sibling, the
+    // rejection is swallowed — it must not propagate to the caller nor
+    // raise an unhandled-rejection warning.
+    asMock(PluginManager.closePluginView).mockRejectedValueOnce(
+      'bridge closed (string)',
     );
 
     const tree = buildSmallTree();

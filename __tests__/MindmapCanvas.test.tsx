@@ -69,8 +69,13 @@ jest.mock('sn-plugin-lib', () => {
       getPageSize: jest
         .fn()
         .mockResolvedValue({success: true, result: {width: 1404, height: 1872}}),
+      // Phase 2.2's insert now flows through the additive insertElements
+      // (the old getElements read + replaceElements whole-page rewrite
+      // are gone). getElements/replaceElements stay mocked so tests can
+      // assert they are never called (F-NDI-1-AC3).
       getElements: jest.fn().mockResolvedValue({success: true, result: []}),
       replaceElements: jest.fn().mockResolvedValue({success: true}),
+      insertElements: jest.fn().mockResolvedValue({success: true}),
     },
   };
 });
@@ -80,32 +85,31 @@ import {PluginCommAPI, PluginFileAPI, PluginManager} from 'sn-plugin-lib';
 import {addChild, addSibling, createTree} from '../src/model/tree';
 
 /**
- * Collect the geometries that insertMindmap emitted. The current
- * insert path bundles every geometry into a single replaceElements
- * call (one Element per geometry, with the geometry hanging off the
- * `.geometry` field). Walk the most recent replaceElements call, skip
- * any pre-existing page elements fed in by the getElements mock, and
- * yield the geometry list the rest of this file was already written
- * against.
+ * Collect the geometries that insertMindmap emitted. The additive
+ * insert path bundles every geometry into a single insertElements call
+ * (one Element per geometry, with the geometry hanging off the
+ * `.geometry` field) and sends ONLY the plugin's new elements — the
+ * page's pre-existing content is never read or sent. Walk the most
+ * recent insertElements call's payload and yield the geometry list the
+ * rest of this file was already written against.
  */
 function collectInsertedGeometries(): Array<{
   type?: string;
   penColor?: number;
 }> {
-  const calls = (PluginFileAPI.replaceElements as jest.Mock).mock.calls;
+  const calls = (PluginFileAPI.insertElements as jest.Mock).mock.calls;
   if (calls.length === 0) {
     return [];
   }
   const latest = calls[calls.length - 1];
-  const combined = latest[2] as Array<{
+  const payload = latest[2] as Array<{
     geometry?: {type?: string; penColor?: number} | null;
   }>;
-  // Existing page elements land at the front of `combined`; our
-  // newly-minted Elements sit at the tail. mintElement() initialises
-  // `.geometry` to null and insertMindmap overwrites it with the
-  // emitted Geometry, so every real insert has a truthy `.geometry`.
+  // mintElement() initialises `.geometry` to null and insertMindmap
+  // overwrites it with the emitted Geometry, so every geometry Element
+  // has a truthy `.geometry` (TYPE_TEXT label elements keep it null).
   const out: Array<{type?: string; penColor?: number}> = [];
-  for (const el of combined) {
+  for (const el of payload) {
     if (el?.geometry) {
       out.push(el.geometry);
     }
@@ -845,10 +849,15 @@ describe('MindmapCanvas', () => {
   describe('Phase 2.2 — Insert button wires to insertMindmap (§F-IN-*)', () => {
     beforeEach(() => {
       (PluginCommAPI.insertGeometry as jest.Mock).mockClear();
+      (PluginFileAPI.insertElements as jest.Mock).mockClear();
+      (PluginFileAPI.insertElements as jest.Mock).mockResolvedValue({
+        success: true,
+      });
       (PluginFileAPI.replaceElements as jest.Mock).mockClear();
       (PluginFileAPI.replaceElements as jest.Mock).mockResolvedValue({
         success: true,
       });
+      (PluginFileAPI.getElements as jest.Mock).mockClear();
       (PluginCommAPI.createElement as jest.Mock).mockClear();
       (PluginCommAPI.insertGeometry as jest.Mock).mockResolvedValue({
         success: true,
@@ -888,19 +897,23 @@ describe('MindmapCanvas', () => {
         await flushPromises();
       });
 
-      // 2 outlines + 1 connector = 3 geometries, one batched
-      // replaceElements, then setLassoBoxState + reloadFile + close.
-      // (Marker strokes were removed with the edit/decode pipeline.)
+      // 2 outlines + 1 connector = 3 geometries, one additive
+      // insertElements, then reloadFile + close. The additive path
+      // never reads the page (getElements) nor whole-page-rewrites it
+      // (replaceElements). (Marker strokes were removed with the
+      // edit/decode pipeline.)
       expect(nonMarkerInsertCount()).toBe(3);
-      expect(PluginFileAPI.replaceElements).toHaveBeenCalledTimes(1);
+      expect(PluginFileAPI.insertElements).toHaveBeenCalledTimes(1);
+      expect(PluginFileAPI.getElements).not.toHaveBeenCalled();
+      expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
       expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
       unmount();
     });
 
     it('shows an error banner when insert fails and keeps the plugin view open', async () => {
-      // replaceElements rejecting causes insertMindmap to throw
+      // insertElements rejecting causes insertMindmap to throw
       // before closePluginView fires.
-      (PluginFileAPI.replaceElements as jest.Mock).mockResolvedValueOnce({
+      (PluginFileAPI.insertElements as jest.Mock).mockResolvedValueOnce({
         success: false,
         error: {message: 'simulated insert failure'},
       });
@@ -921,7 +934,7 @@ describe('MindmapCanvas', () => {
     });
 
     it('debounces rapid double-taps so only one insert runs at a time', async () => {
-      // Gate replaceElements on a promise we resolve manually so a
+      // Gate insertElements on a promise we resolve manually so a
       // second tap can land while the first insert is still in flight.
       // TS's flow analysis can't see that the Promise executor fires
       // synchronously, so we initialize resolveFirst with a no-op and
@@ -930,7 +943,7 @@ describe('MindmapCanvas', () => {
       const firstPending = new Promise<void>(r => {
         resolveFirst = r;
       });
-      (PluginFileAPI.replaceElements as jest.Mock).mockImplementationOnce(
+      (PluginFileAPI.insertElements as jest.Mock).mockImplementationOnce(
         async () => {
           await firstPending;
           return {success: true};
@@ -950,9 +963,9 @@ describe('MindmapCanvas', () => {
         await flushPromises();
       });
 
-      // replaceElements was called exactly once — the second tap was
+      // insertElements was called exactly once — the second tap was
       // debounced via insertingRef.
-      expect(PluginFileAPI.replaceElements).toHaveBeenCalledTimes(1);
+      expect(PluginFileAPI.insertElements).toHaveBeenCalledTimes(1);
 
       // Let the first insert complete cleanly.
       resolveFirst();
