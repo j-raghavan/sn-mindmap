@@ -26,6 +26,37 @@
 export type NodeId = number;
 
 /**
+ * A directed cross-edge overlaying the tree backbone (F-DAG-1-FR1).
+ * Tree parent→child edges ∪ these cross-edges form the "combined graph"
+ * over which acyclicity is enforced. NOT a layout input — overlay
+ * geometry only (radialLayout walks childIds exclusively; I-DAG-3).
+ */
+export interface Edge {
+  from: NodeId;
+  to: NodeId;
+}
+
+/**
+ * Typed rejection reason for a cross-edge that fails validation
+ * (F-DAG-2-FR1). The UI maps each to a transient banner; order mirrors
+ * the rule order in validateCrossEdge.
+ */
+export type CrossEdgeRejection =
+  | 'self-loop' // from === to (rule 2)
+  | 'tree-edge' // (from,to) is already a parent→child tree edge (rule 3)
+  | 'duplicate' // (from,to) already in crossEdges (rule 4)
+  | 'cycle'; // adding from→to would create a directed cycle (rule 5)
+
+/**
+ * Result of validating a candidate cross-edge (F-DAG-2-FR1). Rule 1
+ * (existence) throws rather than returning a reason — a programmatic
+ * caller passing a bad id is a bug, not a soft reject.
+ */
+export type ValidateCrossEdgeResult =
+  | {ok: true}
+  | {ok: false; reason: CrossEdgeRejection};
+
+/**
  * Shape of a node's outline. Drives both the on-canvas rendering and
  * the polygon points emitted on Insert.
  *
@@ -119,6 +150,14 @@ export interface Tree {
   nodesById: Map<NodeId, MindmapNode>;
   /** Next id to assign.  Starts at 1 (root consumed 0). */
   nextId: number;
+  /**
+   * Directed cross-edge overlay (F-DAG-1-FR1). The backbone above is the
+   * sole layout + shape authority; these edges are additive only.
+   * Validated at the addCrossEdge boundary to keep the combined graph
+   * acyclic (I-DAG-1); deleteSubtree drops edges to a removed node so
+   * none dangles (I-DAG-2).
+   */
+  crossEdges: Edge[];
 }
 
 // ---------------------------------------------------------------------------
@@ -156,6 +195,7 @@ export function createTree(label?: string): Tree {
     rootId: 0,
     nodesById: new Map([[0, root]]),
     nextId: 1,
+    crossEdges: [],
   };
 }
 
@@ -273,6 +313,12 @@ export function deleteSubtree(tree: Tree, nodeId: NodeId): Set<NodeId> {
     tree.nodesById.delete(id);
   }
 
+  // Drop any cross-edge whose endpoint was removed (I-DAG-2 — no
+  // dangling edge: every cross-edge endpoint must reference a live node).
+  tree.crossEdges = tree.crossEdges.filter(
+    e => !removed.has(e.from) && !removed.has(e.to),
+  );
+
   return removed;
 }
 
@@ -335,5 +381,135 @@ export function cloneTree(tree: Tree): Tree {
     rootId: tree.rootId,
     nodesById,
     nextId: tree.nextId,
+    // Deep-copy the overlay so a reducer clone's edge mutations stay
+    // independent of the original (F-DAG-1-FR2 / AC1).
+    crossEdges: tree.crossEdges.map(e => ({...e})),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Cross-edge overlay (DAG support, §F-DAG-1..F-DAG-4)
+// ---------------------------------------------------------------------------
+
+/**
+ * True iff `target` is reachable from `start` over the COMBINED graph
+ * (childIds ∪ outgoing crossEdges). Iterative BFS, O(V+E) over the
+ * ≤ 50-node graph (§6.2). Pure — no mutation. (F-DAG-2-FR2.)
+ */
+function canReach(tree: Tree, start: NodeId, target: NodeId): boolean {
+  // Precondition: the sole caller (validateCrossEdge rule 5) guarantees
+  // start !== target — rule 2 rejects from===to before rule 5 runs
+  // canReach(to, from). A future caller that may pass equal args must
+  // handle start===target itself; this BFS does not short-circuit it
+  // (start is in `seen`, so a self-path returns false).
+  const seen = new Set<NodeId>([start]);
+  const queue: NodeId[] = [start];
+  while (queue.length > 0) {
+    const cur = queue.shift()!;
+    // Non-null: every queued id is live by invariant — start passes
+    // getNode existence (rule 1), and neighbors come from childIds +
+    // validated crossEdges, which deleteSubtree cascades on removal
+    // (I-DAG-2). Same idiom as flattenForEmit / deleteSubtree.
+    const node = tree.nodesById.get(cur)!;
+    const outgoing: NodeId[] = [...node.childIds];
+    for (const e of tree.crossEdges) {
+      if (e.from === cur) {
+        outgoing.push(e.to);
+      }
+    }
+    for (const next of outgoing) {
+      if (next === target) {
+        return true;
+      }
+      if (!seen.has(next)) {
+        seen.add(next);
+        queue.push(next);
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Validate a candidate cross-edge against the five rules, IN ORDER.
+ * Pure (no mutation). Rule 1 (existence) THROWS via getNode — a
+ * programmatic caller (e.g. a future decode/import path) passing a bad
+ * id is a bug, not a soft reject (CLAUDE.md "validate at boundaries").
+ * Rules 2–5 return a typed rejection so the UI can show a reason
+ * (F-DAG-2-FR1/FR3, I-DAG-1/I-DAG-4).
+ */
+export function validateCrossEdge(
+  tree: Tree,
+  from: NodeId,
+  to: NodeId,
+): ValidateCrossEdgeResult {
+  // Rule 1 — existence (HARD: throws, consistent with getNode contract).
+  getNode(tree, from, 'validateCrossEdge/from');
+  const toNode = getNode(tree, to, 'validateCrossEdge/to');
+  // Rule 2 — self-loop.
+  if (from === to) {
+    return {ok: false, reason: 'self-loop'};
+  }
+  // Rule 3 — not a tree edge. Fires ONLY for parent→child
+  // (to.parentId === from): that (from,to) would double-draw the
+  // connector the tree already paints (I-DAG-4). The REVERSE,
+  // child→parent, is NOT a tree-edge dup (the tree draws parent→child,
+  // never the reverse); it correctly falls through to rule 5, where it
+  // is caught as a genuine 'cycle'.
+  if (toNode.parentId === from) {
+    return {ok: false, reason: 'tree-edge'};
+  }
+  // Rule 4 — not a duplicate cross-edge.
+  if (tree.crossEdges.some(e => e.from === from && e.to === to)) {
+    return {ok: false, reason: 'duplicate'};
+  }
+  // Rule 5 — acyclic: reject if `to` can already reach `from`, because
+  // closing from→to would complete a cycle. This also catches
+  // child→parent: the parent already reaches the child via childIds, so
+  // `to` (parent) reaches `from` (child). 'cycle' is the truthful
+  // reason — do NOT add a separate 'reverse-tree-edge' reason; it
+  // overstates the failure (KISS).
+  if (canReach(tree, to, from)) {
+    return {ok: false, reason: 'cycle'};
+  }
+  return {ok: true};
+}
+
+/**
+ * Add a validated directed cross-edge. Returns the created Edge, or
+ * null on any soft-rejection (rules 2–5); existence failures (rule 1)
+ * throw via validateCrossEdge. Mutates tree.crossEdges in place (clone
+ * first if the original must stay unchanged, e.g. in the reducer).
+ * Delegates ALL validation to validateCrossEdge so the model boundary
+ * is the single source of truth — no forked rule logic (F-DAG-2-FR1,
+ * I-DAG-1).
+ */
+export function addCrossEdge(
+  tree: Tree,
+  from: NodeId,
+  to: NodeId,
+): Edge | null {
+  const result = validateCrossEdge(tree, from, to);
+  if (!result.ok) {
+    return null;
+  }
+  const edge: Edge = {from, to};
+  tree.crossEdges.push(edge);
+  return edge;
+}
+
+/**
+ * Remove a matching directed cross-edge. Returns true iff one was
+ * removed. (F-DAG-2-FR4.)
+ */
+export function deleteCrossEdge(
+  tree: Tree,
+  from: NodeId,
+  to: NodeId,
+): boolean {
+  const before = tree.crossEdges.length;
+  tree.crossEdges = tree.crossEdges.filter(
+    e => !(e.from === from && e.to === to),
+  );
+  return tree.crossEdges.length < before;
 }
