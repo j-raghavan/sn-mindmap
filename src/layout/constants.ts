@@ -108,3 +108,22 @@ export const PARALLELOGRAM_SKEW_DEG = 12;
  */
 export const PARALLELOGRAM_SKEW_PX =
   NODE_HEIGHT * Math.tan((PARALLELOGRAM_SKEW_DEG * Math.PI) / 180);
+
+/**
+ * Cross-edge arrowhead barb length, derived once from NODE_HEIGHT
+ * (F-DAG-4-FR4). 0.25 → 24 px at NODE_HEIGHT = 96.
+ *
+ * NOTE: this is a FIXED page-space length — it is applied in
+ * emitGeometries to endpoints that are ALREADY fit-to-page-scaled, and
+ * is NOT itself scaled by the layout transform. So on a downscaled map
+ * the arrowhead is proportionally larger relative to the (shrunk)
+ * nodes. That's an accepted v1 trade for legibility on e-ink; RB-2
+ * release gate: tune the fraction on-device.
+ */
+export const ARROWHEAD_LEN = NODE_HEIGHT * 0.25;
+
+/**
+ * Half-angle (radians) between the edge vector and each arrowhead barb
+ * (F-DAG-4-FR4). ~25° → a ~50° total spread, a clean ">" on e-ink.
+ */
+export const ARROWHEAD_HALF_ANGLE = (25 * Math.PI) / 180;

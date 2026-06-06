@@ -23,6 +23,12 @@
  * 5. Collapsed subtrees are laid out in full — the canvas hides the
  *    hidden nodes visually, but the insert pipeline emits them all (§F-IN-2).
  *
+ * DAG note (§F-DAG-5-FR3): cross-edges (Tree.crossEdges) are overlay
+ * geometry only, NOT layout inputs. radialLayout consumes childIds
+ * exclusively, so its centers/bboxes output is byte-identical with or
+ * without cross-edges — the tree stays the sole placement authority
+ * (I-DAG-3) and the determinism contract below holds unchanged.
+ *
  * References: §F-LY-1, §F-LY-2, §F-LY-3, §F-LY-5, §6.3.
  */
 

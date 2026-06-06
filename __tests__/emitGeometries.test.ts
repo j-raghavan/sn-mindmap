@@ -28,6 +28,7 @@ import {
 } from '../src/rendering/emitGeometries';
 import {
   addChild,
+  addCrossEdge,
   addSibling,
   createTree,
   setCollapsed,
@@ -36,8 +37,14 @@ import {
   type NodeId,
 } from '../src/model/tree';
 import {radialLayout, type LayoutResult} from '../src/layout/radial';
-import {ROOT_PEN_WIDTH, STANDARD_PEN_WIDTH} from '../src/layout/constants';
 import {
+  ARROWHEAD_HALF_ANGLE,
+  ARROWHEAD_LEN,
+  ROOT_PEN_WIDTH,
+  STANDARD_PEN_WIDTH,
+} from '../src/layout/constants';
+import {
+  CROSS_EDGE_PEN,
   PEN_DEFAULTS,
   type CircleGeometry,
   type EllipseGeometry,
@@ -488,5 +495,359 @@ describe('emitGeometries — connector clipping edge cases', () => {
     expect(lines).toHaveLength(1);
     expect(lines[0].points[0]).toEqual({x: 0, y: 0});
     expect(lines[0].points[1]).toEqual({x: 200, y: 0});
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DAG cross-edge emit pass (Part B / F-DAG-4, F-DAG-5)
+// ---------------------------------------------------------------------------
+
+/** A tree-connector line is black (PEN_DEFAULTS.penColor === 0x00). */
+function isTreeConnector(g: Geometry): g is LineGeometry {
+  return isLine(g) && g.penColor === PEN_DEFAULTS.penColor;
+}
+
+/** A cross-edge line (or arrowhead barb) is dark gray (0x9d). */
+function isCrossEdgeLine(g: Geometry): g is LineGeometry {
+  return isLine(g) && g.penColor === CROSS_EDGE_PEN.penColor;
+}
+
+/**
+ * Build root + two sibling children (B, D), wrap a real radialLayout
+ * around it, and add a single B→D cross-edge. B and D are siblings of
+ * the root so B→D is a genuine non-tree cross-edge with no cycle.
+ */
+function twoSiblingsWithCrossEdge(): {
+  tree: Tree;
+  layout: LayoutResult;
+  b: NodeId;
+  d: NodeId;
+} {
+  const tree = createTree();
+  const b = addChild(tree, tree.rootId);
+  const d = addChild(tree, tree.rootId);
+  addCrossEdge(tree, b, d);
+  const layout = radialLayout(tree);
+  return {tree, layout, b, d};
+}
+
+describe('emitGeometries — cross-edge pass ordering (F-DAG-4-FR1/AC1)', () => {
+  it('emits cross-edge lines AFTER every tree connector and BEFORE every node outline', () => {
+    const {tree, layout} = twoSiblingsWithCrossEdge();
+    const {geometries} = emitGeometries({tree, layout});
+
+    // Index of the LAST black tree connector, the FIRST gray cross-edge
+    // line, and the FIRST node outline polygon.
+    const lastTreeConnector = geometries.reduce(
+      (acc, g, i) => (isTreeConnector(g) ? i : acc),
+      -1,
+    );
+    const firstCrossEdge = geometries.findIndex(isCrossEdgeLine);
+    const firstPolygon = geometries.findIndex(isPolygon);
+
+    expect(lastTreeConnector).toBeGreaterThanOrEqual(0);
+    expect(firstCrossEdge).toBeGreaterThanOrEqual(0);
+    expect(firstPolygon).toBeGreaterThanOrEqual(0);
+
+    // Order: tree connectors → cross-edges (+arrowheads) → outlines.
+    expect(lastTreeConnector).toBeLessThan(firstCrossEdge);
+    expect(firstCrossEdge).toBeLessThan(firstPolygon);
+
+    // And no gray line appears after the first outline (the whole
+    // cross-edge group sits strictly before the outline group).
+    const lastCrossEdge = geometries.reduce(
+      (acc, g, i) => (isCrossEdgeLine(g) ? i : acc),
+      -1,
+    );
+    expect(lastCrossEdge).toBeLessThan(firstPolygon);
+  });
+});
+
+describe('emitGeometries — cross-edge geometry + clip reuse (F-DAG-4-FR2/FR3)', () => {
+  it('emits a gray clipped line from B border to D border with CROSS_EDGE_PEN', () => {
+    const {tree, layout, b, d} = twoSiblingsWithCrossEdge();
+    const {geometries} = emitGeometries({tree, layout});
+
+    const bBbox = layout.bboxes.get(b)!;
+    const dBbox = layout.bboxes.get(d)!;
+
+    // The first gray line is the cross-edge connector (its arrowhead
+    // barbs follow it). Distinguish the connector from the barbs: the
+    // connector's endpoints land on the node borders; the barbs both
+    // start at the connector's `end`.
+    const grayLines = geometries.filter(isCrossEdgeLine);
+    // 1 connector + 2 arrowhead barbs = 3 gray lines.
+    expect(grayLines).toHaveLength(3);
+
+    const connector = grayLines[0];
+    // Pen: dark gray 0x9d, Fineliner 10, thinner 200, no auto-lasso.
+    expect(connector.penColor).toBe(0x9d);
+    expect(connector.penType).toBe(10);
+    expect(connector.penWidth).toBe(200);
+    expect(connector.showLassoAfterInsert).toBe(false);
+    expect(connector.points).toHaveLength(2);
+
+    // Endpoints clipped to the two node borders (same clip as tree
+    // connectors — reused verbatim).
+    const [start, end] = connector.points;
+    expect(
+      isOnRectBorder(bBbox, start.x, start.y) ||
+        isOnRectBorder(dBbox, start.x, start.y),
+    ).toBe(true);
+    expect(
+      isOnRectBorder(bBbox, end.x, end.y) ||
+        isOnRectBorder(dBbox, end.x, end.y),
+    ).toBe(true);
+  });
+
+  it('cross-edge lines are visually distinct from the black tree connectors', () => {
+    const {tree, layout} = twoSiblingsWithCrossEdge();
+    const {geometries} = emitGeometries({tree, layout});
+    const tree0 = geometries.filter(isTreeConnector);
+    const gray = geometries.filter(isCrossEdgeLine);
+    // Root → B and Root → D = 2 black connectors; the cross-edge group
+    // is gray. The two pens never share a color.
+    expect(tree0.length).toBe(2);
+    for (const t of tree0) {
+      expect(t.penColor).toBe(0x00);
+    }
+    for (const g of gray) {
+      expect(g.penColor).toBe(0x9d);
+    }
+  });
+});
+
+describe('emitGeometries — arrowhead geometry (F-DAG-4-FR4)', () => {
+  it('emits two barbs at the `to` clipped point, each ARROWHEAD_LEN long, pointing back toward `start`', () => {
+    const {tree, layout} = twoSiblingsWithCrossEdge();
+    const {geometries} = emitGeometries({tree, layout});
+
+    const grayLines = geometries.filter(isCrossEdgeLine);
+    const connector = grayLines[0];
+    const barbs = grayLines.slice(1); // the two arrowhead segments
+    expect(barbs).toHaveLength(2);
+
+    const [start, end] = connector.points;
+
+    for (const barb of barbs) {
+      // Each barb starts AT the connector's `to` endpoint (the head).
+      expect(barb.points[0].x).toBeCloseTo(end.x, 6);
+      expect(barb.points[0].y).toBeCloseTo(end.y, 6);
+      // Each barb is ARROWHEAD_LEN long.
+      const bx = barb.points[1].x - barb.points[0].x;
+      const by = barb.points[1].y - barb.points[0].y;
+      expect(Math.hypot(bx, by)).toBeCloseTo(ARROWHEAD_LEN, 4);
+      // Barb pen matches the cross-edge pen.
+      expect(barb.penColor).toBe(0x9d);
+      expect(barb.penWidth).toBe(200);
+    }
+
+    // The two barbs are symmetric about the reversed edge direction:
+    // the reversed unit vector bisects the angle between them, and the
+    // half-angle from the bisector to each barb equals ARROWHEAD_HALF_ANGLE.
+    const ex = end.x - start.x;
+    const ey = end.y - start.y;
+    const elen = Math.hypot(ex, ey);
+    // Reversed unit edge vector (head → tail direction).
+    const rux = -ex / elen;
+    const ruy = -ey / elen;
+    for (const barb of barbs) {
+      const bx = (barb.points[1].x - barb.points[0].x) / ARROWHEAD_LEN;
+      const by = (barb.points[1].y - barb.points[0].y) / ARROWHEAD_LEN;
+      // Angle between the barb and the reversed edge vector.
+      const dot = bx * rux + by * ruy;
+      const angle = Math.acos(Math.max(-1, Math.min(1, dot)));
+      expect(angle).toBeCloseTo(ARROWHEAD_HALF_ANGLE, 4);
+      // Both barbs point back toward `start` (positive dot with the
+      // reversed/head→tail direction) — i.e. they form a ">", not a "<".
+      expect(dot).toBeGreaterThan(0);
+    }
+  });
+
+  it('tree connectors carry NO arrowhead barbs', () => {
+    // A plain tree (no cross-edges) must emit zero gray lines at all —
+    // arrowheads are exclusive to cross-edges.
+    const {tree} = threeNodeTree();
+    const layout = radialLayout(tree);
+    const {geometries} = emitGeometries({tree, layout});
+    expect(geometries.filter(isCrossEdgeLine)).toHaveLength(0);
+  });
+});
+
+describe('emitGeometries — degenerate arrowhead (len === 0 branch)', () => {
+  it('coincident node centers → cross-edge line emitted, ZERO barbs, no NaN', () => {
+    // Fabricate a layout where B and D share the SAME center and bbox.
+    // clipSegmentBetweenRects falls back to the (coincident) center
+    // pair, so the cross-edge connector is a zero-length [p, p] segment.
+    // arrowheadGeometries sees len === 0 and returns no barbs (its NaN
+    // guard). This is the branch that holds emitGeometries.ts at 100%.
+    const tree = createTree();
+    const b = addChild(tree, tree.rootId);
+    const d = addChild(tree, tree.rootId);
+    addCrossEdge(tree, b, d);
+
+    const sharedCenter = {x: 500, y: 500};
+    const sharedBbox: Rect = {x: 450, y: 450, w: 100, h: 100};
+    const rootBbox = radialLayout(tree).bboxes.get(tree.rootId)!;
+    const rootCenter = radialLayout(tree).centers.get(tree.rootId)!;
+    const layout: LayoutResult = {
+      centers: new Map([
+        [tree.rootId, rootCenter],
+        [b, sharedCenter],
+        [d, sharedCenter],
+      ]),
+      bboxes: new Map([
+        [tree.rootId, rootBbox],
+        [b, sharedBbox],
+        [d, sharedBbox],
+      ]),
+      unionBbox: rootBbox,
+    };
+
+    const {geometries} = emitGeometries({tree, layout});
+    const grayLines = geometries.filter(isCrossEdgeLine);
+    // Exactly ONE gray line (the zero-length cross-edge connector) and
+    // NO arrowhead barbs.
+    expect(grayLines).toHaveLength(1);
+    const connector = grayLines[0];
+    expect(connector.points[0]).toEqual(connector.points[1]); // zero-length
+    // No NaN anywhere in the emitted gray geometry.
+    for (const p of connector.points) {
+      expect(Number.isFinite(p.x)).toBe(true);
+      expect(Number.isFinite(p.y)).toBe(true);
+    }
+  });
+});
+
+describe('emitGeometries — cross-edge clip fallback (F-DAG-4-AC2)', () => {
+  it('overlapping node bboxes on the cross-edge line fall back to center-to-center (no NaN)', () => {
+    // Distinct centers but overlapping bboxes along the line → the
+    // clipper bails to the unclipped center pair, same fallback the
+    // tree-connector overlap test exercises. Cross-edge must produce
+    // finite points and an arrowhead (len > 0 since centers differ).
+    const tree = createTree();
+    const b = addChild(tree, tree.rootId);
+    const d = addChild(tree, tree.rootId);
+    addCrossEdge(tree, b, d);
+    const rootBbox = radialLayout(tree).bboxes.get(tree.rootId)!;
+    const rootCenter = radialLayout(tree).centers.get(tree.rootId)!;
+    const layout: LayoutResult = {
+      centers: new Map([
+        [tree.rootId, rootCenter],
+        [b, {x: 0, y: 0}],
+        [d, {x: 200, y: 0}],
+      ]),
+      bboxes: new Map([
+        [tree.rootId, rootBbox],
+        [b, {x: -110, y: -48, w: 220, h: 96}],
+        [d, {x: 90, y: -48, w: 220, h: 96}], // overlaps B along the line
+      ]),
+      unionBbox: rootBbox,
+    };
+
+    const {geometries} = emitGeometries({tree, layout});
+    const grayLines = geometries.filter(isCrossEdgeLine);
+    // Connector + 2 barbs (centers differ, so len > 0 → arrowhead).
+    expect(grayLines).toHaveLength(3);
+    const connector = grayLines[0];
+    // Center-to-center fallback: endpoints are the raw centers.
+    expect(connector.points[0]).toEqual({x: 0, y: 0});
+    expect(connector.points[1]).toEqual({x: 200, y: 0});
+    for (const g of grayLines) {
+      for (const p of g.points) {
+        expect(Number.isFinite(p.x)).toBe(true);
+        expect(Number.isFinite(p.y)).toBe(true);
+      }
+    }
+  });
+});
+
+describe('emitGeometries — unionRect includes cross-edges + arrowheads (F-DAG-4-FR6)', () => {
+  it('a cross-edge grows the unionRect to cover its line and barb tips', () => {
+    // Same two-sibling tree, emitted WITHOUT then WITH the cross-edge.
+    // The cross-edge + arrowhead live between the two node bboxes (and
+    // its barbs may poke slightly past), so the WITH-edge unionRect
+    // must contain the WITHOUT-edge unionRect and cover every gray point.
+    const treeNoEdge = createTree();
+    addChild(treeNoEdge, treeNoEdge.rootId);
+    addChild(treeNoEdge, treeNoEdge.rootId);
+    const layoutNoEdge = radialLayout(treeNoEdge);
+    const {unionRect: rectNoEdge} = emitGeometries({
+      tree: treeNoEdge,
+      layout: layoutNoEdge,
+    });
+
+    const {tree, layout} = twoSiblingsWithCrossEdge();
+    const {geometries, unionRect: rectWithEdge} = emitGeometries({
+      tree,
+      layout,
+    });
+
+    // Every gray cross-edge / arrowhead point is inside the unionRect.
+    for (const g of geometries.filter(isCrossEdgeLine)) {
+      for (const p of g.points) {
+        expect(rectContains(rectWithEdge, p.x, p.y)).toBe(true);
+      }
+    }
+    // The with-edge rect contains the no-edge rect (cross-edge geometry
+    // sits within the node span here, so the outlines still dominate —
+    // assert containment, not strict growth).
+    expect(rectWithEdge.x).toBeLessThanOrEqual(rectNoEdge.x + EPS);
+    expect(rectWithEdge.y).toBeLessThanOrEqual(rectNoEdge.y + EPS);
+    expect(rectWithEdge.x + rectWithEdge.w).toBeGreaterThanOrEqual(
+      rectNoEdge.x + rectNoEdge.w - EPS,
+    );
+    expect(rectWithEdge.y + rectWithEdge.h).toBeGreaterThanOrEqual(
+      rectNoEdge.y + rectNoEdge.h - EPS,
+    );
+  });
+});
+
+describe('emitGeometries — zero cross-edges baseline (regression)', () => {
+  it('an empty crossEdges array emits exactly the pre-B2 geometry list', () => {
+    // A tree with crossEdges: [] must emit connectors + outlines and
+    // ZERO gray lines — identical to the pre-cross-edge behavior. This
+    // protects every existing emit assertion.
+    const {tree} = threeNodeTree();
+    expect(tree.crossEdges).toEqual([]);
+    const layout = radialLayout(tree);
+    const {geometries} = emitGeometries({tree, layout});
+
+    // 3 outlines + 2 black connectors, no gray lines.
+    expect(geometries.filter(isPolygon)).toHaveLength(3);
+    expect(geometries.filter(isTreeConnector)).toHaveLength(2);
+    expect(geometries.filter(isCrossEdgeLine)).toHaveLength(0);
+  });
+});
+
+describe('radialLayout — determinism with/without cross-edges (F-DAG-5-AC1, I-DAG-3)', () => {
+  it('cross-edges do not perturb centers, bboxes, or unionBbox', () => {
+    // Build two identical trees; populate crossEdges on one. radialLayout
+    // walks childIds only, so its output must be byte-identical.
+    const base = createTree();
+    const a = addChild(base, base.rootId);
+    const b = addChild(base, base.rootId);
+    addChild(base, a);
+    addSibling(base, b);
+
+    const withEdges = createTree();
+    const a2 = addChild(withEdges, withEdges.rootId);
+    const b2 = addChild(withEdges, withEdges.rootId);
+    addChild(withEdges, a2);
+    addSibling(withEdges, b2);
+    addCrossEdge(withEdges, a2, b2); // overlay — must NOT move anything
+
+    const layoutBase = radialLayout(base);
+    const layoutEdges = radialLayout(withEdges);
+
+    // Same node-id sets, same centers/bboxes, same unionBbox.
+    expect([...layoutEdges.centers.keys()].sort()).toEqual(
+      [...layoutBase.centers.keys()].sort(),
+    );
+    for (const id of layoutBase.centers.keys()) {
+      expect(layoutEdges.centers.get(id)).toEqual(layoutBase.centers.get(id));
+      expect(layoutEdges.bboxes.get(id)).toEqual(layoutBase.bboxes.get(id));
+    }
+    expect(layoutEdges.unionBbox).toEqual(layoutBase.unionBbox);
   });
 });
