@@ -258,25 +258,44 @@ describe('insertMindmap — happy path (§F-IN-1..F-IN-4)', () => {
     // absence is the headline behavioural change.
     expect(PluginFileAPI.getElements).not.toHaveBeenCalled();
     expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
-    // setLassoBoxState(2) is only meaningful after an explicit lasso,
-    // which our flow never does — confirmed on device by APIError 904
-    // "No lasso action has been performed". The call is skipped.
+    // We do NOT call setLassoBoxState(2) — that REMOVES the lasso box;
+    // we want the auto-lasso (below) to PERSIST so the user can drag the
+    // inserted map.
     expect(PluginCommAPI.setLassoBoxState).not.toHaveBeenCalled();
     expect(PluginCommAPI.reloadFile).toHaveBeenCalledTimes(1);
     expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
 
-    // Order: createElement × N → insertElements → reloadFile → close.
+    // Auto-lasso the inserted block once, with an integer
+    // {left,top,right,bottom} rect (§F-IN-3) so the map is grab-ready.
+    expect(PluginCommAPI.lassoElements).toHaveBeenCalledTimes(1);
+    const lassoArg = asMock(PluginCommAPI.lassoElements).mock.calls[0][0] as {
+      left: number;
+      top: number;
+      right: number;
+      bottom: number;
+    };
+    for (const v of Object.values(lassoArg)) {
+      expect(Number.isInteger(v)).toBe(true);
+    }
+    expect(lassoArg.left).toBeLessThan(lassoArg.right);
+    expect(lassoArg.top).toBeLessThan(lassoArg.bottom);
+
+    // Order: createElement × N → insertElements → lassoElements →
+    // reloadFile → close.
     const lastCreateOrder = Math.max(
       ...asMock(PluginCommAPI.createElement).mock.invocationCallOrder,
     );
     const insertOrder = asMock(PluginFileAPI.insertElements).mock
+      .invocationCallOrder[0];
+    const lassoOrder = asMock(PluginCommAPI.lassoElements).mock
       .invocationCallOrder[0];
     const reloadOrder = asMock(PluginCommAPI.reloadFile).mock
       .invocationCallOrder[0];
     const closeOrder = asMock(PluginManager.closePluginView).mock
       .invocationCallOrder[0];
     expect(insertOrder).toBeGreaterThan(lastCreateOrder);
-    expect(reloadOrder).toBeGreaterThan(insertOrder);
+    expect(lassoOrder).toBeGreaterThan(insertOrder);
+    expect(reloadOrder).toBeGreaterThan(lassoOrder);
     expect(closeOrder).toBeGreaterThan(reloadOrder);
   });
 
@@ -790,6 +809,23 @@ describe('insertMindmap — error + cleanup (§F-IN-5)', () => {
     expect(PluginFileAPI.insertElements).toHaveBeenCalledTimes(1);
     expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
     expect(PluginCommAPI.deleteLassoElements).not.toHaveBeenCalled();
+  });
+
+  it('completes even if the auto-lasso returns failure (non-fatal)', async () => {
+    // The post-insert auto-lasso is a UX nicety (grab-ready map). The
+    // geometries are already committed by the time it fires, so a lasso
+    // failure must NOT roll back the insert — reloadFile + close still
+    // run and the user sees the inserted map (just not pre-selected).
+    asMock(PluginCommAPI.lassoElements).mockResolvedValueOnce({
+      success: false,
+      error: {code: 904, message: 'simulated: lasso refused'},
+    });
+
+    const tree = buildSmallTree();
+    await expect(insertMindmap({tree})).resolves.toBeUndefined();
+    expect(PluginCommAPI.lassoElements).toHaveBeenCalledTimes(1);
+    expect(PluginCommAPI.reloadFile).toHaveBeenCalledTimes(1);
+    expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
   });
 
   it('falls back to the default "createElement failed" message when the host omits error.message', async () => {

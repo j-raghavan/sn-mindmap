@@ -233,16 +233,36 @@ export async function insertMindmap(input: InsertInput): Promise<void> {
       throw new Error(insertRes?.error?.message ?? 'insertElements failed');
     }
 
+    // Auto-lasso the freshly inserted block so the user can drag the
+    // whole map into place right after insert (§F-IN-3). lassoElements
+    // takes a {left,top,right,bottom} rect; unionRect is in page coords
+    // ({x,y,w,h}), rounded to integers at the firmware boundary like the
+    // geometry points. We deliberately do NOT follow shape-snap's
+    // setLassoBoxState(2) (which REMOVES the lasso box) — we want the
+    // selection to PERSIST so the map is grab-ready. Non-fatal: a lasso
+    // failure is cosmetic, so we log and continue rather than abort an
+    // already-committed insert.
+    const lassoRect = {
+      left: Math.round(unionRect.x),
+      top: Math.round(unionRect.y),
+      right: Math.round(unionRect.x + unionRect.w),
+      bottom: Math.round(unionRect.y + unionRect.h),
+    };
+    log('lassoElements:before', lassoRect);
+    const lassoRes = (await PluginCommAPI.lassoElements(
+      lassoRect,
+    )) as ApiRes<boolean>;
+    log('lassoElements:after', {
+      success: lassoRes?.success,
+      result: lassoRes?.result,
+      errorCode: (lassoRes?.error as {code?: number} | undefined)?.code,
+      errorMessage: lassoRes?.error?.message,
+    });
+
     // Force the host to repaint the page with the newly-inserted
     // geometries. reloadFile is non-fatal: its success is cosmetic
     // (the page would repaint on the next interaction anyway), so
     // we log and continue even on failure.
-    //
-    // NB: shape-snap calls setLassoBoxState(2) before reloadFile,
-    // but it does so AFTER an explicit lassoElements (to clear the
-    // selection that lasso produced). Our flow never lassos, so the
-    // call returns APIError 904 "no lasso action has been performed"
-    // — it's meaningless here. Skipped.
     log('reloadFile:before');
     const reloadRes = (await PluginCommAPI.reloadFile()) as ApiRes<boolean>;
     log('reloadFile:after', reloadRes);
