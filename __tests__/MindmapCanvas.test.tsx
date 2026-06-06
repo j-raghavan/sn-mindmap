@@ -973,4 +973,224 @@ describe('MindmapCanvas', () => {
       unmount();
     });
   });
+
+  describe('Phase B3 — Link mode (DAG cross-edges, §F-DAG-3)', () => {
+    /**
+     * A two-child tree (root → b, root → d). b and d are siblings, so a
+     * b→d link is a genuine, valid cross-edge (no cycle, not a tree
+     * edge). Both nodes carry labels so a node tap that DID open the
+     * label modal would surface a label-input we can assert against.
+     */
+    function linkableTree() {
+      const tree = createTree('root');
+      const b = addChild(tree, tree.rootId, 'b');
+      const d = addChild(tree, tree.rootId, 'd');
+      return {tree, b, d};
+    }
+
+    it('Link button is disabled on a lone-root tree (< 2 nodes, F-DAG-3-FR5)', () => {
+      const {renderer, unmount} = renderCanvas(<MindmapCanvas />);
+      const link = findPressable(renderer, 'Link');
+      expect(link.props.accessibilityState?.disabled).toBe(true);
+      expect(link.props.disabled).toBe(true);
+      unmount();
+    });
+
+    it('Link button becomes enabled once the tree has ≥ 2 nodes', () => {
+      const {tree} = linkableTree();
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      const link = findPressable(renderer, 'Link');
+      expect(link.props.accessibilityState?.disabled).toBe(false);
+      expect(link.props.disabled).toBe(false);
+      unmount();
+    });
+
+    it('arm → tap source → tap target → cross-edge appears and link mode disarms (F-DAG-3-AC1)', () => {
+      const {tree, b, d} = linkableTree();
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      // Arm: label flips to 'Cancel Link'.
+      pressByLabel(renderer, 'Link');
+      expect(findHostByLabel(renderer, 'Cancel Link')).toHaveLength(1);
+      // No cross-edge yet.
+      expect(findHostByLabel(renderer, `cross-edge-${b}-${d}`)).toHaveLength(0);
+
+      // Tap source (b) then target (d).
+      pressByLabel(renderer, `node-${b}`);
+      pressByLabel(renderer, `node-${d}`);
+
+      // Cross-edge overlay appears, and link mode disarmed back to 'Link'.
+      expect(findHostByLabel(renderer, `cross-edge-${b}-${d}`)).toHaveLength(1);
+      expect(findHostByLabel(renderer, 'Link')).toHaveLength(1);
+      expect(findHostByLabel(renderer, 'Cancel Link')).toHaveLength(0);
+      // No reject banner on the happy path.
+      expect(findHostByLabel(renderer, 'link-error')).toHaveLength(0);
+      unmount();
+    });
+
+    it('reject path: a cycling pair shows the reason banner, disarms, adds NO edge (F-DAG-3-AC2)', () => {
+      // Tree root → b. Arm, tap b (source) then root (target): b→root
+      // cycles → reject 'cycle'.
+      const tree = createTree('root');
+      const b = addChild(tree, tree.rootId, 'b');
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      pressByLabel(renderer, 'Link');
+      pressByLabel(renderer, `node-${b}`); // source
+      pressByLabel(renderer, 'node-0'); // target (root) → cycle
+
+      // Reason banner shown with the cycle message.
+      const banner = findHostByLabel(renderer, 'link-error');
+      expect(banner).toHaveLength(1);
+      // Link mode disarmed.
+      expect(findHostByLabel(renderer, 'Link')).toHaveLength(1);
+      expect(findHostByLabel(renderer, 'Cancel Link')).toHaveLength(0);
+      // No cross-edge was added (neither direction).
+      expect(findHostByLabel(renderer, `cross-edge-${b}-0`)).toHaveLength(0);
+      expect(findHostByLabel(renderer, `cross-edge-0-${b}`)).toHaveLength(0);
+      unmount();
+    });
+
+    it('re-tapping the source cancels selection (no edge, no banner, still armed)', () => {
+      const {tree, b} = linkableTree();
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      pressByLabel(renderer, 'Link');
+      pressByLabel(renderer, `node-${b}`); // pick source
+      pressByLabel(renderer, `node-${b}`); // re-tap same node → cancel
+      // Still armed, no banner, no edge.
+      expect(findHostByLabel(renderer, 'Cancel Link')).toHaveLength(1);
+      expect(findHostByLabel(renderer, 'link-error')).toHaveLength(0);
+      unmount();
+    });
+
+    it('tapping a cross-edge while armed deletes it (F-DAG-3-FR4)', () => {
+      const {tree, b, d} = linkableTree();
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      // Create the edge: arm, source b, target d.
+      pressByLabel(renderer, 'Link');
+      pressByLabel(renderer, `node-${b}`);
+      pressByLabel(renderer, `node-${d}`);
+      expect(findHostByLabel(renderer, `cross-edge-${b}-${d}`)).toHaveLength(1);
+
+      // Re-arm (adding the edge disarmed link mode), then tap the
+      // cross-edge to delete it.
+      pressByLabel(renderer, 'Link');
+      pressByLabel(renderer, `cross-edge-${b}-${d}`);
+      expect(findHostByLabel(renderer, `cross-edge-${b}-${d}`)).toHaveLength(0);
+      unmount();
+    });
+
+    it('a node tap while armed routes to link selection, NOT the label modal', () => {
+      const {tree, b} = linkableTree();
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      pressByLabel(renderer, 'Link'); // arm
+      pressByLabel(renderer, `node-${b}`); // armed tap = pick source
+      // The edit-label modal must NOT open.
+      expect(findHostByLabel(renderer, 'label-modal')).toHaveLength(0);
+      expect(findHostByLabel(renderer, 'label-input')).toHaveLength(0);
+      unmount();
+    });
+
+    it('a node tap while IDLE still opens the label modal (existing behavior preserved)', () => {
+      const {tree, b} = linkableTree();
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      // No arming — tap routes to select + edit as before.
+      pressByLabel(renderer, `node-${b}`);
+      expect(findHostByLabel(renderer, 'label-input')).toHaveLength(1);
+      unmount();
+    });
+
+    it('per-node action icons are hidden while armed', () => {
+      const {tree, b} = linkableTree();
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      // Idle: node b shows its Add Child affordance.
+      expect(findHostByLabel(renderer, `add-child-${b}`)).toHaveLength(1);
+      // Armed: action icons are suppressed so taps are link selections.
+      pressByLabel(renderer, 'Link');
+      expect(findHostByLabel(renderer, `add-child-${b}`)).toHaveLength(0);
+      unmount();
+    });
+
+    it('a pre-existing cross-edge renders while IDLE as a NON-deletable overlay (onPress undefined)', () => {
+      // Seed a cross-edge on the initial tree so it renders without ever
+      // arming. While idle, CrossConnector gets onPress=undefined and is
+      // disabled — the overlay is a passive visual, not a tap target.
+      // This covers the idle arm of `onPress={armed ? ... : undefined}`.
+      const tree = createTree('root');
+      const b = addChild(tree, tree.rootId, 'b');
+      const d = addChild(tree, tree.rootId, 'd');
+      tree.crossEdges.push({from: b, to: d});
+
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      // The overlay View exists (host match) even though we never armed.
+      expect(findHostByLabel(renderer, `cross-edge-${b}-${d}`)).toHaveLength(1);
+      // ...but it is NOT an interactive Pressable (no onPress handler) —
+      // findPressable requires a function onPress, so it finds none.
+      expect(() => findPressable(renderer, `cross-edge-${b}-${d}`)).toThrow(
+        /no Pressable/,
+      );
+      unmount();
+    });
+
+    it('a cross-edge to a deep node still renders (overlay keys off the full-tree layout)', () => {
+      // root → a → g (grandchild); root → b. Cross-edge b→g. The Stage
+      // computes radialLayout over the FULL tree, so layout.centers
+      // always has g's center and the overlay renders the cross-edge
+      // regardless of g's depth. (The `if (!fromCenter || !toCenter)`
+      // guard in CrossConnector is defensive against a dangling edge,
+      // which I-DAG-2 prevents — it is not reachable via normal authoring.)
+      const tree = createTree('root');
+      const a = addChild(tree, tree.rootId, 'a');
+      const g = addChild(tree, a, 'g');
+      const b = addChild(tree, tree.rootId, 'b');
+      tree.crossEdges.push({from: b, to: g});
+
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      expect(findHostByLabel(renderer, `cross-edge-${b}-${g}`)).toHaveLength(1);
+      unmount();
+    });
+
+    it('the selected source node is highlighted while armed (isLinkSource doubles its border)', () => {
+      // Arm, tap source b. NodeFrame receives isLinkSource=true for b,
+      // which doubles its border width vs an un-sourced sibling. Compare
+      // b's borderWidth (source) to d's (not source) to assert the
+      // highlight branch fired.
+      const {tree, b, d} = linkableTree();
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      pressByLabel(renderer, 'Link');
+      pressByLabel(renderer, `node-${b}`); // b becomes the link source
+
+      const sourceStyle = flattenStyle(
+        findHostSingle(renderer, `node-${b}`).props.style,
+      );
+      const peerStyle = flattenStyle(
+        findHostSingle(renderer, `node-${d}`).props.style,
+      );
+      // Source node's border is thicker than a non-source sibling's.
+      expect(sourceStyle.borderWidth as number).toBeGreaterThan(
+        peerStyle.borderWidth as number,
+      );
+      unmount();
+    });
+  });
 });
