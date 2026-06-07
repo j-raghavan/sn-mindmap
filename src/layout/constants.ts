@@ -25,9 +25,11 @@ export const NODE_HEIGHT = 96;
  * Visual gap (logical px) preserved between adjacent node outlines.
  * Drives the minimum radial spacing so two NODE_WIDTH × NODE_HEIGHT
  * bboxes never visibly fuse on e-ink, where a 1-pixel rendering jitter
- * across stacked borders reads as a single thicker line.
+ * across stacked borders reads as a single thicker line. Exported so the
+ * force-directed layout's overlap-separation pass uses the SAME margin
+ * the radial R1 derivation does (one source of truth for node spacing).
  */
-const NODE_GAP = 24;
+export const NODE_GAP = 24;
 
 /**
  * Radius (logical px) from root centre to first-level child centres.

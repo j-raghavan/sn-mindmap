@@ -33,6 +33,15 @@
  *     of the canvas, biasing the graph into a top-down hierarchy while
  *     still allowing multi-parent edges to cross levels.
  *
+ * The Coulomb repulsion is a POINT charge — it knows centre distance, not
+ * node SIZE — so two nodes can settle with their NODE_WIDTH × NODE_HEIGHT
+ * boxes overlapping. This is acute for "structural twins" (nodes sharing
+ * all their neighbours, e.g. Father/Mother both parenting the same
+ * children): every spring pulls them to the same point and only the weak
+ * pairwise repulsion separates them. A final box-aware SEPARATION pass
+ * (separateOverlaps) resolves any residual rectangle overlap deterministic-
+ * ally, so the emitted boxes never intersect.
+ *
  * References: §14.5, §F-LY-DAG-1..F-LY-DAG-6.
  */
 
@@ -40,6 +49,7 @@ import type {Point, Rect} from '../geometry';
 import {
   DEFAULT_SEED_SPREAD_HEIGHT,
   DEFAULT_SEED_SPREAD_WIDTH,
+  NODE_GAP,
   NODE_HEIGHT,
   NODE_WIDTH,
   R1,
@@ -79,6 +89,16 @@ export interface ForceOptions {
 const DEFAULT_ITERATIONS = 200;
 const DEFAULT_SPRING_K = 0.05;
 const DEFAULT_ANCHOR_K = 0.08;
+
+/**
+ * Iteration budget for the post-simulation box-overlap separation pass.
+ * Each sweep is O(n²); concept maps are small, and a handful of sweeps
+ * clears even the worst structural-twin tangle, so 200 is comfortably
+ * above what any authorable graph needs. Bounded (not "loop until clean")
+ * so the pass can never spin on a frustrated configuration — a fixed
+ * budget also keeps the whole layout's runtime bounded (§F-LY-DAG-3).
+ */
+const SEPARATION_ITERATIONS = 200;
 
 /**
  * y-coordinate roots are pulled toward (§F-LY-DAG-4). One node-height
@@ -183,6 +203,69 @@ function edgePairs(
     }
   }
   return pairs;
+}
+
+/**
+ * Deterministic box-overlap removal, run once after the force simulation.
+ * The simulation treats nodes as point charges, so their NODE_WIDTH ×
+ * NODE_HEIGHT boxes can still overlap (worst case: structural twins that
+ * share all neighbours collapse onto one point). This pass pushes every
+ * overlapping pair apart along its MINIMUM-translation axis — the shorter
+ * of the horizontal / vertical penetration — until each box clears the
+ * next by NODE_GAP, or the iteration budget is spent.
+ *
+ * Two AABBs centred at the node centres, each NODE_WIDTH × NODE_HEIGHT,
+ * are disjoint-with-margin iff their centres are ≥ (NODE_WIDTH + NODE_GAP)
+ * apart on x OR ≥ (NODE_HEIGHT + NODE_GAP) apart on y. When BOTH
+ * penetrations are positive the boxes overlap; we relieve the smaller one
+ * (an L∞ / minimum-translation resolve), splitting the push evenly between
+ * the two nodes.
+ *
+ * Determinism (§F-LY-DAG-3): pairs are visited in ascending-index order,
+ * displacements apply immediately (Gauss-Seidel), and a zero penetration
+ * delta breaks the tie toward +axis — no Math.random, so the run-twice
+ * byte-identical contract holds. Mutates `nodes` in place.
+ */
+function separateOverlaps(nodes: SimNode[]): void {
+  const minGapX = NODE_WIDTH + NODE_GAP;
+  const minGapY = NODE_HEIGHT + NODE_GAP;
+  const n = nodes.length;
+  for (let iter = 0; iter < SEPARATION_ITERATIONS; iter += 1) {
+    let moved = false;
+    for (let i = 0; i < n; i += 1) {
+      for (let j = i + 1; j < n; j += 1) {
+        const dx = nodes[i].x - nodes[j].x;
+        const dy = nodes[i].y - nodes[j].y;
+        const penX = minGapX - Math.abs(dx);
+        const penY = minGapY - Math.abs(dy);
+        // Disjoint on at least one axis → no overlap, nothing to do.
+        if (penX <= 0 || penY <= 0) {
+          continue;
+        }
+        moved = true;
+        if (penX < penY) {
+          // Relieve the (smaller) horizontal penetration. dx === 0 →
+          // push i toward +x deterministically.
+          const push = penX / 2;
+          const dir = dx >= 0 ? 1 : -1;
+          nodes[i].x += push * dir;
+          nodes[j].x -= push * dir;
+        } else {
+          // Relieve the vertical penetration (also the dx === dy === 0
+          // coincident case, since penY ≤ penX there). dy === 0 → +y.
+          const push = penY / 2;
+          const dir = dy >= 0 ? 1 : -1;
+          nodes[i].y += push * dir;
+          nodes[j].y -= push * dir;
+        }
+      }
+    }
+    // Converged: a full sweep with no overlap left. Bounded anyway by the
+    // budget so a frustrated graph can't spin forever.
+    if (!moved) {
+      break;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -294,6 +377,10 @@ export function forceDirectedLayout(
       nodes[i].y += dyStep;
     }
   }
+
+  // Box-aware overlap removal (the point-charge sim can't guarantee
+  // non-overlapping rectangles — see separateOverlaps / the header note).
+  separateOverlaps(nodes);
 
   // Build the LayoutResult (centres + node-sized bboxes + union rect).
   const centers = new Map<NodeId, Point>();

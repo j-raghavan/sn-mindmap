@@ -25,7 +25,7 @@
  * A's radial/crossEdge terms never appear here.
  */
 import {forceDirectedLayout} from '../src/layout/forceDirected';
-import {NODE_HEIGHT, NODE_WIDTH} from '../src/layout/constants';
+import {NODE_GAP, NODE_HEIGHT, NODE_WIDTH} from '../src/layout/constants';
 import {
   addNodeAsParent,
   addNodeWithParent,
@@ -59,6 +59,37 @@ function meanY(
 ): number {
   const ys = ids.map(id => result.centers.get(id)!.y);
   return ys.reduce((s, y) => s + y, 0) / ys.length;
+}
+
+/**
+ * Assert every pair of node bboxes is not merely non-overlapping but
+ * separated by at least NODE_GAP of visible padding on at least one axis
+ * (the invariant separateOverlaps converges to: |dx| ≥ NODE_WIDTH+GAP OR
+ * |dy| ≥ NODE_HEIGHT+GAP). `gap = -overlap`: positive when the boxes are
+ * apart, negative when they intersect. A sub-px epsilon absorbs float drift.
+ */
+function expectBoxesPadded(
+  result: ReturnType<typeof forceDirectedLayout>,
+): void {
+  const EPS = 1e-6;
+  const boxes = [...result.bboxes.entries()];
+  for (let i = 0; i < boxes.length; i += 1) {
+    for (let j = i + 1; j < boxes.length; j += 1) {
+      const [idA, a] = boxes[i];
+      const [idB, b] = boxes[j];
+      // Edge-to-edge gap on each axis (negative ⇒ the boxes overlap there).
+      const gapX = Math.max(a.x, b.x) - Math.min(a.x + a.w, b.x + b.w);
+      const gapY = Math.max(a.y, b.y) - Math.min(a.y + a.h, b.y + b.h);
+      const padded = gapX >= NODE_GAP - EPS || gapY >= NODE_GAP - EPS;
+      if (!padded) {
+        throw new Error(
+          `nodes ${idA} and ${idB} are under-padded: gapX=${gapX.toFixed(
+            1,
+          )} gapY=${gapY.toFixed(1)} (need ≥ ${NODE_GAP} on one axis)`,
+        );
+      }
+    }
+  }
 }
 
 describe('forceDirectedLayout (concept-map DAG layout, §14.5)', () => {
@@ -155,6 +186,78 @@ describe('forceDirectedLayout (concept-map DAG layout, §14.5)', () => {
       }
       expect(u.w).toBeGreaterThan(0);
       expect(u.h).toBeGreaterThan(0);
+    });
+  });
+
+  describe('box separation (no overlapping node boxes, §F-LY-DAG-2)', () => {
+    it('the genealogy K2,2 (Father/Mother × Son/daughter) lays out with no overlaps', () => {
+      // THE reported case: Center → Father, Mother; Father AND Mother each
+      // parent BOTH Son and daughter. Father/Mother are structural twins
+      // (identical neighbours) so the point-charge sim collapses their
+      // boxes together; the separation pass must pull them apart.
+      const graph = createGraph(); // 0 = Center
+      const father = addNodeWithParent(graph, 0); // 1
+      const mother = addNodeWithParent(graph, 0); // 2
+      const son = addNodeWithParent(graph, father); // 3
+      addParentEdge(graph, son, mother); // Son also under Mother
+      const daughter = addNodeWithParent(graph, father); // 4
+      addParentEdge(graph, daughter, mother); // daughter also under Mother
+
+      const result = forceDirectedLayout(graph);
+      expect(result.centers.size).toBe(5);
+      expectBoxesPadded(result);
+      // Still deterministic with the separation pass in the pipeline.
+      expectBoxesPadded(forceDirectedLayout(graph));
+    });
+
+    it('separates a fully-coincident seed cluster into disjoint boxes', () => {
+      // Collapse the seed region to 1×1 so every node seeds at (0,0); after
+      // the sim + separation pass no two boxes may overlap.
+      const graph = createGraph();
+      addNodeWithParent(graph, 0);
+      addNodeWithParent(graph, 0);
+      addNodeWithParent(graph, 0);
+      const result = forceDirectedLayout(graph, {
+        canvasWidth: 1,
+        canvasHeight: 1,
+      });
+      expectBoxesPadded(result);
+    });
+
+    it('resolves vertically when the sim is skipped and seeds are coincident', () => {
+      // iterations:0 skips the force spread, and a 1×1 seed region collapses
+      // every node onto (0,0). With centres coincident the vertical
+      // penetration (NODE_HEIGHT) is the smaller one, so the separation pass
+      // relieves it along y — and must still leave the boxes disjoint.
+      const graph = createGraph();
+      addNodeWithParent(graph, 0);
+      addNodeWithParent(graph, 0);
+      const result = forceDirectedLayout(graph, {
+        iterations: 0,
+        canvasWidth: 1,
+        canvasHeight: 1,
+      });
+      expectBoxesPadded(result);
+      // Determinism survives the sim-skipped path too.
+      expect(
+        forceDirectedLayout(graph, {
+          iterations: 0,
+          canvasWidth: 1,
+          canvasHeight: 1,
+        }).centers,
+      ).toEqual(result.centers);
+    });
+
+    it('leaves a dense multi-parent graph free of box overlaps', () => {
+      const graph = createGraph();
+      const a = addNodeWithParent(graph, 0);
+      const b = addNodeWithParent(graph, 0);
+      const c = addNodeWithParent(graph, a);
+      addParentEdge(graph, c, b);
+      const d = addNodeWithParent(graph, c);
+      addParentEdge(graph, d, 0);
+      addParentEdge(graph, d, a);
+      expectBoxesPadded(forceDirectedLayout(graph));
     });
   });
 
