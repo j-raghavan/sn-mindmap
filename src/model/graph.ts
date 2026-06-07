@@ -17,6 +17,13 @@
  *     shape; mutators never touch a shape field. A node's shape therefore
  *     "flips" OVAL↔RECTANGLE the instant its parent count crosses zero —
  *     intended and deterministic.
+ *     DELIBERATE DEVIATION FROM §14.3: the §14.3 ConceptNode example lists
+ *     `shape: ShapeKind`, but the architect formally amended the brief to
+ *     DROP that field — a kept-exact cache is the stale-state bug class
+ *     §14.5 ("recompute") rules against, and dropping it makes that bug
+ *     unrepresentable. The binding invariant is "rendered/emitted shape ==
+ *     conceptShape(node)", not a stored field. Do NOT re-add `shape` to the
+ *     interface to "match" §14.3 — that would reintroduce the cache.
  *   - A concept node has 0..N parents and 0..N children — a DAG, not a
  *     tree. childIds is a structural MIRROR of parentIds across the graph:
  *     every mutator keeps `parent.childIds ∋ child  ⟺  child.parentIds ∋
