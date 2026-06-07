@@ -127,3 +127,20 @@ export const ARROWHEAD_LEN = NODE_HEIGHT * 0.25;
  * (F-DAG-4-FR4). ~25° → a ~50° total spread, a clean ">" on e-ink.
  */
 export const ARROWHEAD_HALF_ANGLE = (25 * Math.PI) / 180;
+
+/**
+ * Seed/spread region (logical px) for the concept-map force-directed
+ * layout's INITIAL node placement (§F-LY-DAG-3). These match the Nomad
+ * portrait page (1404 × 1872) but are deliberately SEED-only: they bound
+ * the deterministic FNV-hash seed positions and the root-anchor band, NOT
+ * the final on-device size. The real page size is applied later by the
+ * insert pipeline's fit-to-page transform, so the laid-out graph scales
+ * to whatever the device reports regardless of these values.
+ *
+ * They live here (not in insert.ts) so the layout module never imports
+ * the insert pipeline — insert.ts imports forceDirected.ts, so the
+ * reverse import would be a dependency cycle. constants.ts is the
+ * established, import-free home for layout constants (R1, NODE_*, …).
+ */
+export const DEFAULT_SEED_SPREAD_WIDTH = 1404;
+export const DEFAULT_SEED_SPREAD_HEIGHT = 1872;

@@ -88,6 +88,7 @@ import {
   DEFAULT_PAGE_HEIGHT,
   DEFAULT_PAGE_WIDTH,
   INSERT_MARGIN_PX,
+  insertConceptMap,
   insertMindmap,
 } from '../src/insert';
 import {radialLayout} from '../src/layout/radial';
@@ -98,6 +99,12 @@ import {
   setLabel,
   type Tree,
 } from '../src/model/tree';
+import {
+  addNodeAsParent,
+  addNodeWithParent,
+  createGraph,
+  setLabel as setGraphLabel,
+} from '../src/model/graph';
 
 /**
  * Count-helper identity. The emit today is just outlines + connectors
@@ -1097,5 +1104,151 @@ describe('insertMindmap — error + cleanup (§F-IN-5)', () => {
     // before the test ends (otherwise Jest flags the unhandled rejection).
     await Promise.resolve();
     await Promise.resolve();
+  });
+});
+
+// ===========================================================================
+// insertConceptMap — concept-map (DAG) insert flow (§14.6 / §F-IN-DAG-1/2).
+// Sibling to insertMindmap; shares the mode-agnostic finalizeInsert tail
+// (placement / fit-to-page / additive write / lasso / close), so those
+// branches are already exercised by the mindmap suite above. These tests
+// cover the concept-SPECIFIC orchestration: forceDirectedLayout (not
+// radial), NO auto-expand, emitConceptGeometries (one connector per parent
+// edge), and graph-label collection. §14 vocabulary only.
+// ===========================================================================
+
+/** A small concept graph: root + two children of root, fully on-page. */
+function buildSmallGraph(): ReturnType<typeof createGraph> {
+  const graph = createGraph();
+  addNodeWithParent(graph, 0);
+  addNodeWithParent(graph, 0);
+  return graph;
+}
+
+describe('insertConceptMap — happy path (§F-IN-DAG-1)', () => {
+  it('exposes insertConceptMap', () => {
+    expect(typeof insertConceptMap).toBe('function');
+  });
+
+  it('resolves page size via the three-step chain', async () => {
+    await insertConceptMap({graph: buildSmallGraph()});
+    expect(PluginCommAPI.getCurrentFilePath).toHaveBeenCalledTimes(1);
+    expect(PluginCommAPI.getCurrentPageNum).toHaveBeenCalledTimes(1);
+    expect(PluginFileAPI.getPageSize).toHaveBeenCalledTimes(1);
+  });
+
+  it('fires ONE additive insertElements with every geometry, then reloads, lassos, closes', async () => {
+    // root + 2 children: 3 outlines + 2 connectors (one per parent edge) = 5.
+    await insertConceptMap({graph: buildSmallGraph()});
+
+    const insertCalls = getInsertedGeometries();
+    expect(insertCalls.length).toBe(5);
+    expect(PluginFileAPI.insertElements).toHaveBeenCalledTimes(1);
+    // Additive: never the whole-page replace path.
+    expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
+    expect(PluginCommAPI.reloadFile).toHaveBeenCalledTimes(1);
+    expect(PluginCommAPI.lassoElements).toHaveBeenCalledTimes(1);
+    expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
+
+    // Order: createElement × N → insertElements → reloadFile → lasso → close.
+    const lastCreateOrder = Math.max(
+      ...asMock(PluginCommAPI.createElement).mock.invocationCallOrder,
+    );
+    const insertOrder = asMock(PluginFileAPI.insertElements).mock
+      .invocationCallOrder[0];
+    const reloadOrder = asMock(PluginCommAPI.reloadFile).mock
+      .invocationCallOrder[0];
+    const lassoOrder = asMock(PluginCommAPI.lassoElements).mock
+      .invocationCallOrder[0];
+    const closeOrder = asMock(PluginManager.closePluginView).mock
+      .invocationCallOrder[0];
+    expect(insertOrder).toBeGreaterThan(lastCreateOrder);
+    expect(reloadOrder).toBeGreaterThan(insertOrder);
+    expect(lassoOrder).toBeGreaterThan(reloadOrder);
+    expect(closeOrder).toBeGreaterThan(lassoOrder);
+  });
+
+  it('emits one connector per parent edge — a two-parent node inserts both', async () => {
+    // Genealogy: son(0) + Father + Mother. son has 2 parentIds, so the
+    // insert payload carries 2 connectors + 3 outlines = 5 geometries.
+    const graph = createGraph('son');
+    addNodeAsParent(graph, 0, 'Father');
+    addNodeAsParent(graph, 0, 'Mother');
+    await insertConceptMap({graph});
+    const geos = getInsertedGeometries();
+    const connectors = geos.filter(([g]) => g.type === 'straightLine');
+    const outlines = geos.filter(([g]) => g.type === 'GEO_polygon');
+    expect(connectors.length).toBe(2); // one per parent edge of son
+    expect(outlines.length).toBe(3); // one per node
+  });
+
+  it('every inserted geometry carries showLassoAfterInsert:false (§F-IN-3)', async () => {
+    await insertConceptMap({graph: buildSmallGraph()});
+    for (const [g] of getInsertedGeometries()) {
+      expect(g.showLassoAfterInsert).toBe(false);
+    }
+  });
+});
+
+describe('insertConceptMap — labeled nodes (TYPE_TEXT path)', () => {
+  it('emits one TYPE_TEXT element per labeled concept node', async () => {
+    // root labeled, one child labeled, one child unlabeled.
+    const graph = createGraph('Central');
+    const a = addNodeWithParent(graph, 0);
+    setGraphLabel(graph, a, 'Child A');
+    addNodeWithParent(graph, 0); // unlabeled
+
+    await insertConceptMap({graph});
+
+    const createCalls = asMock(PluginCommAPI.createElement).mock.calls;
+    const geoCount = createCalls.filter(([k]) => k === 700).length;
+    const textCount = createCalls.filter(([k]) => k === 600).length;
+    // 3 outlines + 2 connectors = 5 TYPE_GEO; 2 labels = 2 TYPE_TEXT.
+    expect(geoCount).toBe(5);
+    expect(textCount).toBe(2);
+  });
+});
+
+describe('insertConceptMap — failure semantics (§F-IN-1 / F-NDI-2)', () => {
+  it('throws when getCurrentFilePath rejects (notePath required)', async () => {
+    asMock(PluginCommAPI.getCurrentFilePath).mockRejectedValueOnce(
+      new Error('bridge down'),
+    );
+    await expect(
+      insertConceptMap({graph: buildSmallGraph()}),
+    ).rejects.toThrow();
+    // No additive write happened.
+    expect(PluginFileAPI.insertElements).not.toHaveBeenCalled();
+  });
+
+  it('throws when getPageSize returns success:false', async () => {
+    asMock(PluginFileAPI.getPageSize).mockResolvedValueOnce({success: false});
+    await expect(
+      insertConceptMap({graph: buildSmallGraph()}),
+    ).rejects.toThrow();
+  });
+
+  it('throws when insertElements fails (existing content never at risk)', async () => {
+    asMock(PluginFileAPI.insertElements).mockResolvedValueOnce({
+      success: false,
+    });
+    await expect(
+      insertConceptMap({graph: buildSmallGraph()}),
+    ).rejects.toThrow();
+    // Additive path: existing content is never read-and-rewritten.
+    expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
+  });
+});
+
+describe('insertConceptMap — concept-specific layout (§F-IN-DAG-2)', () => {
+  it('lands a single-root graph page-centered on an empty page (force layout)', async () => {
+    // A lone root concept graph still inserts its one outline; the
+    // force-directed layout + finalizeInsert place it without throwing.
+    const graph = createGraph('only');
+    await expect(insertConceptMap({graph})).resolves.toBeUndefined();
+    // One outline geometry (no connectors — no parent edges).
+    const geos = getInsertedGeometries();
+    expect(geos.length).toBe(1);
+    expect(geos[0][0].type).toBe('GEO_polygon');
   });
 });

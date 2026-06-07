@@ -1,41 +1,59 @@
 /**
- * High-level insert flow (§5.3, §F-IN-1..F-IN-5).
+ * High-level insert flow (§5.3, §F-IN-1..F-IN-5; concept-map branch
+ * §14.6 / §F-IN-DAG-1..2).
  *
+ * Two public entry points share one mode-agnostic tail (finalizeInsert):
+ *   - insertMindmap({tree})    — auto-expands the tree, radialLayout.
+ *   - insertConceptMap({graph}) — NO auto-expand (a DAG has no collapse
+ *                                 state, §F-IN-DAG-2), forceDirectedLayout.
+ * Each builds a base (mode-local) layout, then hands finalizeInsert an
+ * `emit` callback (emitGeometries vs emitConceptGeometries) and a
+ * `collectLabels` callback so the shared tail never branches on mode.
+ *
+ * Per-entry steps:
  *   1. resolvePageContext() — getCurrentFilePath → getCurrentPageNum →
  *      PluginFileAPI.getPageSize. Required for the additive
- *      insertElements write; falling back to default dimensions when
- *      the chain fails rejects the insert with a clear error (the
- *      additive path can't operate without a concrete notePath/page).
- *   2. Auto-expand every subtree so no node is hidden at emit time.
- *   3. radialLayout() in mindmap-local coords, root at origin.
- *   4. Fit-to-page scale if wider than the page (§F-LY-6), then
- *      translate so the unionBbox sits centered on the page.
- *   5. emitGeometries() → outlines (pre-order) + connectors clipped
- *      to each node's bbox. No marker, no preserved label strokes —
- *      re-edit is out of scope for v0.1.
- *   6. For each emitted geometry: PluginCommAPI.createElement(TYPE_GEO)
- *      to mint a native-backed Element, populate pageNum / layerNum /
- *      thickness / geometry. Then ONE additive
- *      PluginFileAPI.insertElements call with just newElements. The
+ *      insertElements write; any failure in the chain returns null
+ *      notePath/page, which finalizeInsert rejects with a clear error
+ *      (the additive path can't operate without a concrete notePath/page).
+ *   2. Build the base layout (radial for mindmap; force-directed for
+ *      concept), in mode-local coords.
+ *
+ * Shared tail (finalizeInsert):
+ *   3. Overlap-aware placement (§F-IN-3 / RA-2). Read existing content's
+ *      extent (Element maxX/maxY, read-only) and choose a placement
+ *      region: the empty band BELOW existing content, else to the RIGHT,
+ *      else the whole page. This keeps the auto-lasso (step 7) from
+ *      grabbing the user's existing ink.
+ *   4. Fit-to-page scale (≤ 1) to the chosen region minus
+ *      INSERT_MARGIN_PX, then translate so the map is centered WITHIN
+ *      that region (§F-LY-6).
+ *   5. emit (via the caller's callback) → connectors + node outlines.
+ *      Mindmap: tree connectors (+ the gray DAG cross-edge overlay).
+ *      Concept: one black connector per parent edge, no arrowheads
+ *      (§F-LY-DAG-5). No marker / preserved strokes — insert-only.
+ *   6. For each emitted geometry + each labeled node:
+ *      PluginCommAPI.createElement(TYPE_GEO / TYPE_TEXT) to mint a
+ *      native-backed Element, then ONE additive
+ *      PluginFileAPI.insertElements call with just the new elements. The
  *      page's pre-existing elements are neither read nor sent — the
- *      insert ADDS the mindmap and leaves existing content untouched
- *      (I-NDI-1/I-NDI-2). Confirmed on device to cost one host-side
- *      fsync (vs. one per insertGeometry), which is what makes the
- *      insert finish in ~1 s instead of ~80 s (I-NDI-3).
- *   7. setLassoBoxState(2) → reloadFile() (mirrors shape-snap's
- *      executeFastPath tail). This clears any residual lasso state
- *      and refreshes the view so the user's pen immediately returns
- *      to handwriting mode — the user can write labels on the
- *      inserted rectangles right away without tapping out of a lasso
- *      selection first.
- *   8. PluginManager.closePluginView() to dismiss.
+ *      insert ADDS the map and leaves existing content untouched
+ *      (I-NDI-1/I-NDI-2). One host-side fsync (vs. one per geometry) is
+ *      what makes the insert finish in ~1 s instead of ~80 s (I-NDI-3).
+ *   7. reloadFile() THEN lassoElements(unionRect + LASSO_HALO_PX). Order
+ *      matters: insertElements commits the elements but the rendered page
+ *      doesn't include them until reloadFile re-reads it, so a lasso
+ *      before reload matches nothing (and a reload after a lasso would
+ *      clear the selection). The lasso PERSISTS (we do NOT
+ *      setLassoBoxState(2)) so the freshly inserted map is grab-ready.
+ *   8. PluginManager.closePluginView() (fire-and-forget) to dismiss.
  *
  * Error handling: the user's existing content is never at risk because
- * it is never read or sent — only the new mindmap elements are passed
- * to insertElements. A partial NEW-element insert (some geometries
- * applied, then a mid-list failure) is theoretically possible and is a
- * documented follow-up (RA-3); it is NOT inherited atomicity. On
- * failure we throw and let the UI surface the banner.
+ * it is never read or sent — only the new map elements are passed to
+ * insertElements. A partial NEW-element insert (some geometries applied,
+ * then a mid-list failure) is theoretically possible and is a documented
+ * follow-up (RA-3); it is NOT inherited atomicity. On failure we throw
+ * and let the UI surface the banner.
  */
 import {
   Element,
@@ -47,8 +65,13 @@ import {
 import type {Geometry, Rect} from './geometry';
 import type {LayoutResult} from './layout/radial';
 import {radialLayout} from './layout/radial';
+import {forceDirectedLayout} from './layout/forceDirected';
 import {cloneTree, type NodeId, type Tree} from './model/tree';
-import {emitGeometries} from './rendering/emitGeometries';
+import type {Graph} from './model/graph';
+import {
+  emitConceptGeometries,
+  emitGeometries,
+} from './rendering/emitGeometries';
 import type {ApiRes} from './pluginApi';
 
 /**
@@ -145,7 +168,6 @@ export async function insertMindmap(input: InsertInput): Promise<void> {
   log('resolvePageContext:before');
   const pageCtx = await resolvePageContext();
   log('resolvePageContext:after', pageCtx);
-  const {width: pageWidth, height: pageHeight} = pageCtx;
 
   // §F-IN-2 step 0 — auto-expand every subtree so the layout + emit
   // passes see the fully expanded tree. We clone so the caller's
@@ -165,6 +187,114 @@ export async function insertMindmap(input: InsertInput): Promise<void> {
     centers: baseLayout.centers.size,
     bboxes: baseLayout.bboxes.size,
   });
+
+  // Shared placement + write tail. The mindmap path emits via
+  // emitGeometries over the expanded tree and collects labels from it;
+  // the rest (placement, fit-to-page, additive write, lasso, close) is
+  // mode-agnostic (see finalizeInsert).
+  await finalizeInsert({
+    pageCtx,
+    baseLayout,
+    context: 'insertMindmap',
+    emit: pageLayout => {
+      const out = emitGeometries({tree: expanded, layout: pageLayout});
+      log('emitGeometries:done', {
+        total: out.geometries.length,
+        byType: countByType(out.geometries),
+        edgeCount: expanded.crossEdges.length,
+        unionRect: out.unionRect,
+      });
+      return out;
+    },
+    collectLabels: pageLayout => collectLabeledNodes(expanded, pageLayout),
+  });
+}
+
+export type InsertConceptInput = {
+  graph: Graph;
+};
+
+/**
+ * Run the full insert flow for a concept-map (DAG), §14.6. Sibling to
+ * insertMindmap, sharing the mode-agnostic placement + write tail
+ * (finalizeInsert). Two concept-specific differences (§F-IN-DAG-1/2):
+ *   - layout via forceDirectedLayout instead of radialLayout, and
+ *   - NO auto-expand pass (a Graph has no collapse state, §F-IN-DAG-2).
+ * The geometry list comes from emitConceptGeometries (one connector per
+ * parent edge); labels are collected by walking the graph's nodes.
+ *
+ * Resolves when the plugin view has been dismissed by closePluginView().
+ * Rejects on any unrecoverable error.
+ */
+export async function insertConceptMap(
+  input: InsertConceptInput,
+): Promise<void> {
+  log('enter', {
+    nodeCount: input.graph.nodesById.size,
+    rootId: input.graph.rootId,
+  });
+
+  log('resolvePageContext:before');
+  const pageCtx = await resolvePageContext();
+  log('resolvePageContext:after', pageCtx);
+
+  // §F-IN-DAG-2 — NO auto-expand: the concept graph has no collapse
+  // state. Force-directed layout in concept-map-local coords.
+  const baseLayout = forceDirectedLayout(input.graph);
+  log('forceDirectedLayout:done', {
+    unionBbox: baseLayout.unionBbox,
+    centers: baseLayout.centers.size,
+    bboxes: baseLayout.bboxes.size,
+  });
+
+  await finalizeInsert({
+    pageCtx,
+    baseLayout,
+    context: 'insertConceptMap',
+    emit: pageLayout => {
+      const out = emitConceptGeometries({graph: input.graph, layout: pageLayout});
+      log('emitConceptGeometries:done', {
+        total: out.geometries.length,
+        byType: countByType(out.geometries),
+        unionRect: out.unionRect,
+      });
+      return out;
+    },
+    collectLabels: pageLayout =>
+      collectGraphLabeledNodes(input.graph, pageLayout),
+  });
+}
+
+/**
+ * The mode-agnostic insert tail shared by insertMindmap and
+ * insertConceptMap (§F-IN-3 / RA-2). Given a resolved page context and a
+ * base (mindmap- or concept-local) layout, it performs overlap-aware
+ * placement, fit-to-page scaling, the emit (via the caller's `emit`
+ * callback against the transformed layout), the single additive
+ * insertElements write, reload, and the persistent auto-lasso, then
+ * fire-and-forget closes the plugin view.
+ *
+ * `emit` and `collectLabels` are callbacks taking the FINAL page-space
+ * layout so each mode supplies its own geometry + label collection
+ * without duplicating the placement/write/lasso machinery. `context`
+ * names the caller for the null page-context error message.
+ */
+type FinalizeInsertInput = {
+  pageCtx: PageContext;
+  baseLayout: LayoutResult;
+  context: string;
+  emit: (pageLayout: LayoutResult) => {geometries: Geometry[]; unionRect: Rect};
+  collectLabels: (pageLayout: LayoutResult) => LabeledNodeSpec[];
+};
+
+async function finalizeInsert({
+  pageCtx,
+  baseLayout,
+  context,
+  emit,
+  collectLabels,
+}: FinalizeInsertInput): Promise<void> {
+  const {width: pageWidth, height: pageHeight} = pageCtx;
 
   // Overlap-aware placement (§F-IN-3 / RA-2). The firmware lasso is
   // rectangle-only — there is no "select these elements" API — so an
@@ -201,17 +331,9 @@ export async function insertMindmap(input: InsertInput): Promise<void> {
     unionBbox: pageLayout.unionBbox,
   });
 
-  // §F-IN-2 — assemble the geometry list (outlines + connectors).
-  const {geometries, unionRect} = emitGeometries({
-    tree: expanded,
-    layout: pageLayout,
-  });
-  log('emitGeometries:done', {
-    total: geometries.length,
-    byType: countByType(geometries),
-    edgeCount: expanded.crossEdges.length,
-    unionRect,
-  });
+  // §F-IN-2 — assemble the geometry list (outlines + connectors). The
+  // caller's emit closure logs its own per-mode summary.
+  const {geometries, unionRect} = emit(pageLayout);
 
   // §F-IN-3 — additive write. Build one native-backed Element per
   // emitted geometry (createElement returns an Element whose native
@@ -236,13 +358,13 @@ export async function insertMindmap(input: InsertInput): Promise<void> {
   // surface the error banner.
   if (pageCtx.notePath === null || pageCtx.page === null) {
     throw new Error(
-      'insertMindmap: resolvePageContext returned null notePath/page; ' +
+      `${context}: resolvePageContext returned null notePath/page; ` +
         'insertElements requires both',
     );
   }
   // Collect labeled nodes so their text lands inside their outline as
   // a TYPE_TEXT element. Unlabeled nodes contribute outline-only.
-  const labeledNodes = collectLabeledNodes(expanded, pageLayout);
+  const labeledNodes = collectLabels(pageLayout);
   log('collectLabeledNodes:done', {count: labeledNodes.length});
 
   try {
@@ -384,6 +506,32 @@ function collectLabeledNodes(
 ): LabeledNodeSpec[] {
   const out: LabeledNodeSpec[] = [];
   for (const node of tree.nodesById.values()) {
+    const label = node.label?.trim();
+    if (!label) {
+      continue;
+    }
+    const bbox = layout.bboxes.get(node.id);
+    if (!bbox) {
+      continue;
+    }
+    out.push({label, bbox});
+  }
+  return out;
+}
+
+/**
+ * Concept-map sibling of collectLabeledNodes: walk every ConceptNode and
+ * collect those carrying a non-empty label, pairing each with its
+ * post-fit-to-page bbox. Same label/bbox logic as the tree variant; a
+ * parallel fn (rather than generalising collectLabeledNodes) keeps the
+ * mindmap path's call site byte-identical (§14.6).
+ */
+function collectGraphLabeledNodes(
+  graph: Graph,
+  layout: LayoutResult,
+): LabeledNodeSpec[] {
+  const out: LabeledNodeSpec[] = [];
+  for (const node of graph.nodesById.values()) {
     const label = node.label?.trim();
     if (!label) {
       continue;

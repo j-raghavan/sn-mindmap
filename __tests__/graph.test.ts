@@ -82,6 +82,25 @@ describe('graph (concept-map DAG model, §14.3)', () => {
     it('leaves the root label undefined when omitted', () => {
       expect(createGraph().nodesById.get(0)?.label).toBeUndefined();
     });
+
+    it('ConceptNode carries NO stored shape field (architect directive)', () => {
+      // Shape is a PURE compute-on-read via conceptShape(node); the
+      // architect deliberately dropped §14.3's example `shape` field so it
+      // can never disagree with the structure. Lock that deviation: a
+      // future change that re-adds a stored shape field (which could go
+      // stale) trips this guard. Node shape is asserted via conceptShape()
+      // everywhere else in this file (the shapeOf() helper).
+      const graph = createGraph();
+      const a = addNodeWithParent(graph, 0);
+      expect(graph.nodesById.get(0)).not.toHaveProperty('shape');
+      expect(graph.nodesById.get(a)).not.toHaveProperty('shape');
+      // The node's keys carry id + the two mirror edge lists (+ an optional
+      // label slot) — and crucially NO shape key.
+      expect(Object.keys(graph.nodesById.get(a)!)).toEqual(
+        expect.arrayContaining(['id', 'parentIds', 'childIds']),
+      );
+      expect(Object.keys(graph.nodesById.get(a)!)).not.toContain('shape');
+    });
   });
 
   describe('addNodeWithParent (F-AC-DAG-1 Add Child)', () => {

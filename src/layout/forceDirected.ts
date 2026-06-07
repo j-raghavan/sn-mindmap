@@ -37,7 +37,13 @@
  */
 
 import type {Point, Rect} from '../geometry';
-import {NODE_HEIGHT, NODE_WIDTH, R1} from './constants';
+import {
+  DEFAULT_SEED_SPREAD_HEIGHT,
+  DEFAULT_SEED_SPREAD_WIDTH,
+  NODE_HEIGHT,
+  NODE_WIDTH,
+  R1,
+} from './constants';
 import type {Graph} from '../model/graph';
 import type {NodeId} from '../model/tree';
 import type {LayoutResult} from './radial';
@@ -64,28 +70,15 @@ export interface ForceOptions {
   repulsionK?: number;
   /** Vertical pull strength on roots toward the top band (§F-LY-DAG-4). */
   anchorK?: number;
-  /** Seed/spread width — defaults to DEFAULT_SEED_WIDTH (Nomad portrait). */
+  /** Seed/spread width — defaults to DEFAULT_SEED_SPREAD_WIDTH. */
   canvasWidth?: number;
-  /** Seed/spread height — defaults to DEFAULT_SEED_HEIGHT (Nomad portrait). */
+  /** Seed/spread height — defaults to DEFAULT_SEED_SPREAD_HEIGHT. */
   canvasHeight?: number;
 }
 
 const DEFAULT_ITERATIONS = 200;
 const DEFAULT_SPRING_K = 0.05;
 const DEFAULT_ANCHOR_K = 0.08;
-
-/**
- * Default seed/spread region for initial node placement, in layout-local
- * pixels. These match the Nomad portrait page (1404 × 1872) but are kept
- * LOCAL to this layout module on purpose: a `layout/` file must not depend
- * on the insert pipeline (insert.ts imports this module, so importing
- * DEFAULT_PAGE_* back from insert.ts would be a dependency cycle). The
- * values only seed and bound initial positions — the real on-device page
- * size is applied later by the insert pipeline's fit-to-page transform,
- * which scales this layout to whatever the device reports.
- */
-const DEFAULT_SEED_WIDTH = 1404;
-const DEFAULT_SEED_HEIGHT = 1872;
 
 /**
  * y-coordinate roots are pulled toward (§F-LY-DAG-4). One node-height
@@ -214,8 +207,8 @@ export function forceDirectedLayout(
   const springK = opts.springK ?? DEFAULT_SPRING_K;
   const repulsionK = opts.repulsionK ?? R1 * R1;
   const anchorK = opts.anchorK ?? DEFAULT_ANCHOR_K;
-  const width = opts.canvasWidth ?? DEFAULT_SEED_WIDTH;
-  const height = opts.canvasHeight ?? DEFAULT_SEED_HEIGHT;
+  const width = opts.canvasWidth ?? DEFAULT_SEED_SPREAD_WIDTH;
+  const height = opts.canvasHeight ?? DEFAULT_SEED_SPREAD_HEIGHT;
 
   const nodes = seedNodes(graph, width, height);
   const n = nodes.length;

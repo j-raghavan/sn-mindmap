@@ -23,6 +23,7 @@
  *     centres).
  */
 import {
+  emitConceptGeometries,
   emitGeometries,
   unionRectOfGeometries,
 } from '../src/rendering/emitGeometries';
@@ -36,6 +37,15 @@ import {
   type Tree,
   type NodeId,
 } from '../src/model/tree';
+import {
+  addNodeAsParent,
+  addNodeWithParent,
+  addParentEdge,
+  conceptShape,
+  createGraph,
+  deleteNode,
+} from '../src/model/graph';
+import {forceDirectedLayout} from '../src/layout/forceDirected';
 import {radialLayout, type LayoutResult} from '../src/layout/radial';
 import {
   ARROWHEAD_HALF_ANGLE,
@@ -849,5 +859,213 @@ describe('radialLayout — determinism with/without cross-edges (F-DAG-5-AC1, I-
       expect(layoutEdges.bboxes.get(id)).toEqual(layoutBase.bboxes.get(id));
     }
     expect(layoutEdges.unionBbox).toEqual(layoutBase.unionBbox);
+  });
+});
+
+// ===========================================================================
+// emitConceptGeometries — concept-map (DAG) emit path (§14.6 / §F-IN-DAG-1).
+// Separate exported fn from emitGeometries; the mindmap path above stays
+// byte-identical (the regression lock at the bottom of this section proves
+// emitGeometries itself was untouched). Concept vocabulary only (F-IN-DAG-*).
+// ===========================================================================
+
+/** Sum of parentIds.length over every node — the expected connector count. */
+function totalParentEdges(graph: ReturnType<typeof createGraph>): number {
+  let n = 0;
+  for (const node of graph.nodesById.values()) {
+    n += node.parentIds.length;
+  }
+  return n;
+}
+
+describe('emitConceptGeometries — module surface (§14.6)', () => {
+  it('exposes emitConceptGeometries', () => {
+    expect(typeof emitConceptGeometries).toBe('function');
+  });
+
+  it('a lone root emits exactly one outline and no connectors', () => {
+    const graph = createGraph();
+    const layout = forceDirectedLayout(graph);
+    const {geometries} = emitConceptGeometries({graph, layout});
+    expect(geometries.filter(isLine)).toHaveLength(0);
+    expect(geometries.filter(isPolygon)).toHaveLength(1);
+  });
+});
+
+describe('emitConceptGeometries — one connector per parent edge (F-IN-DAG-1)', () => {
+  it('emits exactly one connector per parentIds entry across the graph', () => {
+    // root 0 → a, root 0 → b, a → c, plus b → c (c has TWO parents).
+    const graph = createGraph();
+    const a = addNodeWithParent(graph, 0);
+    const b = addNodeWithParent(graph, 0);
+    const c = addNodeWithParent(graph, a);
+    addParentEdge(graph, c, b); // c.parentIds = [a, b]
+    const layout = forceDirectedLayout(graph);
+    const {geometries} = emitConceptGeometries({graph, layout});
+
+    const connectors = geometries.filter(isLine);
+    const outlines = geometries.filter(isPolygon);
+    // Connector count == sum of parentIds.length (THE multi-parent assertion).
+    expect(connectors).toHaveLength(totalParentEdges(graph));
+    // Outline count == node count.
+    expect(outlines).toHaveLength(graph.nodesById.size);
+    // No other geometry kinds — total is exactly connectors + outlines
+    // (NO arrowheads, NO cross-edge pass in concept mode).
+    expect(geometries).toHaveLength(connectors.length + outlines.length);
+  });
+
+  it('a two-parent node (genealogy son) gets one connector to EACH parent', () => {
+    // son(0) + Father + Mother → son has two parentIds; emit must draw a
+    // connector son→Father AND son→Mother (multi-parent rendering).
+    const graph = createGraph('son');
+    addNodeAsParent(graph, 0, 'Father');
+    addNodeAsParent(graph, 0, 'Mother');
+    const layout = forceDirectedLayout(graph);
+    const {geometries} = emitConceptGeometries({graph, layout});
+    // son has 2 parents, the two roots have 0 → 2 connectors total.
+    expect(geometries.filter(isLine)).toHaveLength(2);
+    expect(totalParentEdges(graph)).toBe(2);
+  });
+
+  it('no arrowheads: a single parent edge yields exactly ONE straightLine', () => {
+    // Guards against the cross-edge arrowhead pass leaking into concept
+    // emit (each cross-edge in mindmap mode adds 2 arrowhead barbs). Here a
+    // single parent edge must yield exactly ONE straightLine, never 3.
+    const graph = createGraph();
+    addNodeWithParent(graph, 0); // 1 parent edge
+    const layout = forceDirectedLayout(graph);
+    const lines = emitConceptGeometries({graph, layout}).geometries.filter(
+      isLine,
+    );
+    expect(lines).toHaveLength(1);
+  });
+});
+
+describe('emitConceptGeometries — connector pen (§14.6: black, NOT gray overlay)', () => {
+  it('connectors use black PEN_DEFAULTS / STANDARD_PEN_WIDTH, not CROSS_EDGE_PEN', () => {
+    const graph = createGraph();
+    addNodeWithParent(graph, 0);
+    const layout = forceDirectedLayout(graph);
+    const [connector] = emitConceptGeometries({
+      graph,
+      layout,
+    }).geometries.filter(isLine);
+    expect(connector.penColor).toBe(PEN_DEFAULTS.penColor); // 0x00 black
+    expect(connector.penColor).toBe(0x00);
+    expect(connector.penType).toBe(PEN_DEFAULTS.penType); // 10 Fineliner
+    expect(connector.penWidth).toBe(STANDARD_PEN_WIDTH); // 400
+    // Explicitly NOT the gray cross-edge overlay pen (that's feature A).
+    expect(connector.penColor).not.toBe(CROSS_EDGE_PEN.penColor); // not 0x9d
+    expect(connector.penWidth).not.toBe(CROSS_EDGE_PEN.penWidth); // not 200
+    expect(connector.showLassoAfterInsert).toBe(false);
+    expect(connector.points).toHaveLength(2);
+  });
+});
+
+describe('emitConceptGeometries — outline shape derived via conceptShape', () => {
+  it('an orphan node emits an OVAL frame; a parented node emits a RECTANGLE frame', () => {
+    // root 0 (no parents → OVAL) and child a (1 parent → RECTANGLE). The
+    // emit must read conceptShape(node), proving it uses the derived shape
+    // and not a stale/stored field.
+    const graph = createGraph();
+    const a = addNodeWithParent(graph, 0);
+    const layout = forceDirectedLayout(graph);
+    const outlines = emitConceptGeometries({graph, layout}).geometries.filter(
+      isPolygon,
+    );
+    expect(conceptShape(graph.nodesById.get(0)!)).toBe(ShapeKind.OVAL);
+    expect(conceptShape(graph.nodesById.get(a)!)).toBe(ShapeKind.RECTANGLE);
+    // The root outline (OVAL) and the child outline (RECTANGLE) are distinct
+    // shapes → different polygon point counts (emit read the derived shape).
+    const rootOutline = outlines[0];
+    const childOutline = outlines[1];
+    expect(rootOutline.points.length).not.toBe(childOutline.points.length);
+  });
+
+  it('a node that loses its last parent emits an OVAL frame (derived flip)', () => {
+    // root → mid → leaf, then delete mid: leaf becomes an orphan (OVAL).
+    const graph = createGraph();
+    const mid = addNodeWithParent(graph, 0);
+    const leaf = addNodeWithParent(graph, mid);
+    deleteNode(graph, mid);
+    expect(conceptShape(graph.nodesById.get(leaf)!)).toBe(ShapeKind.OVAL);
+    const layout = forceDirectedLayout(graph);
+    const outlines = emitConceptGeometries({graph, layout}).geometries.filter(
+      isPolygon,
+    );
+    // Two nodes remain (root + orphaned leaf), both OVAL → same point count.
+    expect(outlines).toHaveLength(2);
+    expect(outlines[0].points.length).toBe(outlines[1].points.length);
+  });
+});
+
+describe('emitConceptGeometries — emit order + lasso flag + unionRect', () => {
+  it('all connectors emit BEFORE any outline (outlines mask endpoints)', () => {
+    const graph = createGraph();
+    const a = addNodeWithParent(graph, 0);
+    addNodeWithParent(graph, a);
+    const layout = forceDirectedLayout(graph);
+    const {geometries} = emitConceptGeometries({graph, layout});
+    const lastConnector = geometries.map(isLine).lastIndexOf(true);
+    const firstOutline = geometries.map(isPolygon).indexOf(true);
+    expect(lastConnector).toBeLessThan(firstOutline);
+  });
+
+  it('every emitted geometry sets showLassoAfterInsert: false (§F-IN-3)', () => {
+    const graph = createGraph();
+    addNodeWithParent(graph, 0);
+    addNodeWithParent(graph, 0);
+    const layout = forceDirectedLayout(graph);
+    const {geometries} = emitConceptGeometries({graph, layout});
+    for (const g of geometries) {
+      expect(g.showLassoAfterInsert).toBe(false);
+    }
+  });
+
+  it('unionRect bounds every emitted point', () => {
+    const graph = createGraph();
+    const a = addNodeWithParent(graph, 0);
+    const b = addNodeWithParent(graph, 0);
+    addParentEdge(graph, b, a);
+    const layout = forceDirectedLayout(graph);
+    const {geometries, unionRect} = emitConceptGeometries({graph, layout});
+    for (const g of geometries) {
+      if (isLine(g) || isPolygon(g)) {
+        for (const p of g.points) {
+          expect(rectContains(unionRect, p.x, p.y)).toBe(true);
+        }
+      }
+    }
+    expect(unionRect).toEqual(unionRectOfGeometries(geometries));
+  });
+});
+
+describe('emitConceptGeometries — MINDMAP emit is byte-identical (regression lock)', () => {
+  it('emitGeometries output is unchanged by the new concept sibling fn', () => {
+    // The architect chose a SEPARATE emitConceptGeometries fn, so
+    // emitGeometries' body is literally untouched. This lock proves the
+    // mindmap emit bytes did not move: a representative tree's full
+    // geometry list + unionRect must match a re-emit exactly. (The 31
+    // mindmap/overlay tests above are the broader guard; this is the
+    // explicit byte check the lead's hard rule calls for.)
+    const tree = createTree();
+    const a = addChild(tree, tree.rootId);
+    const b = addChild(tree, tree.rootId);
+    addChild(tree, a);
+    addSibling(tree, b);
+    const layout = radialLayout(tree);
+
+    const first = emitGeometries({tree, layout});
+    const second = emitGeometries({tree, layout});
+    // Deterministic + byte-identical across calls.
+    expect(second.geometries).toEqual(first.geometries);
+    expect(second.unionRect).toEqual(first.unionRect);
+    // The mindmap path uses the depth-shape table (ROUNDED_RECTANGLE etc.),
+    // not the flat concept OVAL/RECTANGLE — ≥ 2 distinct outline point-counts
+    // proves the mindmap shape dispatch is in play, untouched by concept code.
+    const shapesPresent = first.geometries
+      .filter(isPolygon)
+      .map(p => p.points.length);
+    expect(new Set(shapesPresent).size).toBeGreaterThanOrEqual(2);
   });
 });

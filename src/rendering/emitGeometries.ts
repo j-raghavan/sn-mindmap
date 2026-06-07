@@ -42,6 +42,11 @@ import {
   type Rect,
 } from '../geometry';
 import {flattenForEmit, type NodeId, type Tree} from '../model/tree';
+import {
+  conceptShape,
+  type ConceptNode,
+  type Graph,
+} from '../model/graph';
 import type {LayoutResult} from '../layout/radial';
 import {
   ARROWHEAD_HALF_ANGLE,
@@ -59,6 +64,17 @@ export type EmitOutput = {
   geometries: Geometry[];
   /** Convenience union-rect for the post-insert lassoElements call. */
   unionRect: Rect;
+};
+
+/**
+ * Input for the concept-map (DAG) emit path. Parallel to EmitInput but
+ * carries a Graph instead of a Tree. Kept a SEPARATE type (not a
+ * discriminated union with EmitInput) so emitGeometries' signature and
+ * body stay byte-identical for the mindmap path (§14.6).
+ */
+export type ConceptEmitInput = {
+  graph: Graph;
+  layout: LayoutResult;
 };
 
 /**
@@ -161,6 +177,86 @@ export function emitGeometries(input: EmitInput): EmitOutput {
     geometries,
     unionRect: unionRectOfGeometries(geometries),
   };
+}
+
+/**
+ * Assemble the emit list for a concept-map (DAG) per §14.6 / §F-IN-DAG-1.
+ * Separate from emitGeometries so the mindmap path stays byte-identical;
+ * this path reuses the same private clip/union/outline helpers but walks
+ * a Graph instead of a Tree.
+ *
+ * Emit sequence (same paint-order rationale as the mindmap path — strokes
+ * paint in emit order on Supernote, so outlines emit LAST to mask every
+ * connector endpoint at each node):
+ *   1. connectors — one straightLine per PARENT EDGE. For every node we
+ *      emit child-border → parent-border for each of its parentIds, so a
+ *      multi-parent node renders one connector to EACH parent (§F-IN-DAG-1).
+ *      Black, STANDARD_PEN_WIDTH (PEN_DEFAULTS) — concept edges are
+ *      first-class structure. No arrowheads in concept v1 (§F-LY-DAG-5:
+ *      straight lines only; parent-above-child direction comes from the
+ *      force layout's root anchoring, not a glyph).
+ *   2. node outlines — one GEO_polygon per node; the shape is DERIVED on
+ *      read via conceptShape(node) (OVAL when parentless, else RECTANGLE),
+ *      never stored. Paint last to cover their own connector endpoints.
+ *
+ * Nodes and each node's parentIds are iterated in ASCENDING id order so
+ * the geometry list is deterministic (matching the layout's determinism
+ * contract). Every emitted geometry sets showLassoAfterInsert: false.
+ */
+export function emitConceptGeometries(input: ConceptEmitInput): EmitOutput {
+  const {graph, layout} = input;
+  const geometries: Geometry[] = [];
+
+  const nodes = conceptNodesInOrder(graph);
+
+  // 1. Connectors — one straightLine per parent edge (child → parent).
+  for (const node of nodes) {
+    const childCenter = centerOrThrow(layout, node.id);
+    const childBbox = bboxOrThrow(layout, node.id);
+    for (const parentId of [...node.parentIds].sort((a, b) => a - b)) {
+      const parentCenter = centerOrThrow(layout, parentId);
+      const parentBbox = bboxOrThrow(layout, parentId);
+
+      const [start, end] = clipSegmentBetweenRects(
+        childCenter,
+        parentCenter,
+        childBbox,
+        parentBbox,
+      );
+
+      const line: LineGeometry = {
+        ...PEN_DEFAULTS,
+        penWidth: STANDARD_PEN_WIDTH,
+        type: 'straightLine',
+        points: [start, end],
+        showLassoAfterInsert: false,
+      };
+      geometries.push(line);
+    }
+  }
+
+  // 2. Node outlines (paint LAST so they mask their connector endpoints).
+  //    Shape is derived from structure via conceptShape — no stored field.
+  for (const node of nodes) {
+    const bbox = bboxOrThrow(layout, node.id);
+    geometries.push(withNoAutoLasso(nodeFrame(bbox, conceptShape(node))));
+  }
+
+  return {
+    geometries,
+    unionRect: unionRectOfGeometries(geometries),
+  };
+}
+
+/**
+ * Concept-graph nodes in ascending-id order — the deterministic iteration
+ * order shared by the layout and this emitter so the geometry list never
+ * wobbles between renders (load-bearing on e-ink).
+ */
+function conceptNodesInOrder(graph: Graph): ConceptNode[] {
+  return [...graph.nodesById.keys()]
+    .sort((a, b) => a - b)
+    .map(id => graph.nodesById.get(id)!);
 }
 
 /**
