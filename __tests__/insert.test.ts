@@ -252,11 +252,12 @@ describe('insertMindmap — happy path (§F-IN-1..F-IN-4)', () => {
     const insertCalls = getInsertedGeometries();
     expect(insertCalls.length).toBe(7);
     expect(PluginFileAPI.insertElements).toHaveBeenCalledTimes(1);
-    // F-NDI-1-AC3 / I-NDI-1: the additive path NEVER reads the page
-    // back (getElements) nor rewrites the whole page (replaceElements).
-    // These are the two calls the buggy v1.0.2 path made; their
-    // absence is the headline behavioural change.
-    expect(PluginFileAPI.getElements).not.toHaveBeenCalled();
+    // I-NDI-1/2: the additive path NEVER rewrites the whole page
+    // (replaceElements) — that was the buggy v1.0.2 displacement path.
+    // getElements IS called now, but READ-ONLY for placement (to find
+    // empty space); existing elements are never sent back (proven by the
+    // non-empty-page regression below), so existing content is never
+    // displaced.
     expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
     // We do NOT call setLassoBoxState(2) — that REMOVES the lasso box;
     // we want the auto-lasso (below) to PERSIST so the user can drag the
@@ -373,8 +374,10 @@ describe('insertMindmap — non-destructive insert (F-NDI-1..F-NDI-3)', () => {
     // We make getElements return a page that ALREADY holds two
     // elements carrying a sentinel field. If the old read-then-rewrite
     // path were still alive, these would be concatenated into the write
-    // payload. The additive path never reads getElements, so they must
-    // be absent from insertElements' payload.
+    // payload. getElements IS read now (for placement), but the additive
+    // path never sends those elements back, so they must be absent from
+    // insertElements' payload. (These have no maxX/maxY, so placement
+    // falls back to page-center — irrelevant to this assertion.)
     const preExisting = [
       {uuid: 'native-existing-1', __preExisting: true, geometry: {type: 'native-stroke'}},
       {uuid: 'native-existing-2', __preExisting: true, geometry: {type: 'native-stroke'}},
@@ -389,8 +392,9 @@ describe('insertMindmap — non-destructive insert (F-NDI-1..F-NDI-3)', () => {
 
     // Exactly one additive call.
     expect(PluginFileAPI.insertElements).toHaveBeenCalledTimes(1);
-    // The page was NEVER read back, and NEVER whole-page-rewritten.
-    expect(PluginFileAPI.getElements).not.toHaveBeenCalled();
+    // The page is NEVER whole-page-rewritten (the displacement bug). The
+    // read (getElements) is placement-only; existing elements never go
+    // back into the payload — that is what keeps existing content in place.
     expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
 
     const payload = asMock(PluginFileAPI.insertElements).mock
@@ -452,6 +456,118 @@ describe('insertMindmap — non-destructive insert (F-NDI-1..F-NDI-3)', () => {
     expect(payload).toHaveLength(7);
 
     // Page-centered, exactly as the empty-page fit-to-page tests assert.
+    const insertCalls = getInsertedGeometries();
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const [geometry] of insertCalls) {
+      for (const p of geometry.points ?? []) {
+        minX = Math.min(minX, p.x);
+        minY = Math.min(minY, p.y);
+        maxX = Math.max(maxX, p.x);
+        maxY = Math.max(maxY, p.y);
+      }
+    }
+    expect((minX + maxX) / 2).toBeCloseTo(DEFAULT_PAGE_WIDTH / 2, 0);
+    expect((minY + maxY) / 2).toBeCloseTo(DEFAULT_PAGE_HEIGHT / 2, 0);
+  });
+
+  it('places the map in the empty band BELOW existing content (RA-2)', async () => {
+    // Existing content occupies the top of the page (bottom edge at
+    // maxY=400). With ~1472px of room below it (1872-400), the map must
+    // land entirely below the content so its auto-lasso rect doesn't
+    // overlap — and thus dragging the map won't drag the user's ink.
+    const contentMaxY = 400;
+    asMock(PluginFileAPI.getElements).mockResolvedValue({
+      success: true,
+      result: [{uuid: 'ink-1', maxX: DEFAULT_PAGE_WIDTH - 50, maxY: contentMaxY}],
+    });
+
+    const tree = buildSmallTree();
+    await insertMindmap({tree});
+
+    const insertCalls = getInsertedGeometries();
+    let minY = Infinity;
+    for (const [geometry] of insertCalls) {
+      for (const p of geometry.points ?? []) {
+        minY = Math.min(minY, p.y);
+      }
+    }
+    // Every emitted point sits below the existing content's bottom edge.
+    expect(minY).toBeGreaterThanOrEqual(contentMaxY);
+  });
+
+  it('falls back to page-center when the page is too full for an empty band (RA-2)', async () => {
+    // Content extends nearly to both the bottom and right edges, so
+    // neither the below-band nor the right-band meets MIN_PLACEMENT_BAND;
+    // placement falls back to centering on the whole page (overlap
+    // accepted — the firmware lasso can't do better on a full page).
+    asMock(PluginFileAPI.getElements).mockResolvedValue({
+      success: true,
+      result: [
+        {
+          uuid: 'ink-full',
+          maxX: DEFAULT_PAGE_WIDTH - 50,
+          maxY: DEFAULT_PAGE_HEIGHT - 50,
+        },
+      ],
+    });
+
+    const tree = buildSmallTree();
+    await insertMindmap({tree});
+
+    const insertCalls = getInsertedGeometries();
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const [geometry] of insertCalls) {
+      for (const p of geometry.points ?? []) {
+        minX = Math.min(minX, p.x);
+        minY = Math.min(minY, p.y);
+        maxX = Math.max(maxX, p.x);
+        maxY = Math.max(maxY, p.y);
+      }
+    }
+    expect((minX + maxX) / 2).toBeCloseTo(DEFAULT_PAGE_WIDTH / 2, 0);
+    expect((minY + maxY) / 2).toBeCloseTo(DEFAULT_PAGE_HEIGHT / 2, 0);
+  });
+
+  it('places the map to the RIGHT when the below-band is too short (RA-2)', async () => {
+    // Content reaches near the bottom (below-band < MIN_PLACEMENT_BAND)
+    // but only the left portion horizontally, so the right-band has room.
+    asMock(PluginFileAPI.getElements).mockResolvedValue({
+      success: true,
+      result: [{uuid: 'ink-tall', maxX: 400, maxY: DEFAULT_PAGE_HEIGHT - 200}],
+    });
+
+    const tree = buildSmallTree();
+    await insertMindmap({tree});
+
+    const insertCalls = getInsertedGeometries();
+    let minX = Infinity;
+    for (const [geometry] of insertCalls) {
+      for (const p of geometry.points ?? []) {
+        minX = Math.min(minX, p.x);
+      }
+    }
+    // Map sits to the right of the existing content's right edge.
+    expect(minX).toBeGreaterThanOrEqual(400);
+  });
+
+  it('falls back to page-center when the placement read throws (RA-2, non-fatal)', async () => {
+    // resolveContentExtent swallows any getElements error and returns
+    // null, so placement falls back to centering on the whole page — a
+    // read failure must never abort the insert.
+    asMock(PluginFileAPI.getElements).mockRejectedValueOnce(
+      new Error('simulated: getElements threw during placement'),
+    );
+
+    const tree = buildSmallTree();
+    await expect(insertMindmap({tree})).resolves.toBeUndefined();
+    expect(PluginFileAPI.insertElements).toHaveBeenCalledTimes(1);
+
     const insertCalls = getInsertedGeometries();
     let minX = Infinity;
     let minY = Infinity;
@@ -767,18 +883,16 @@ describe('insertMindmap — error + cleanup (§F-IN-5)', () => {
     expect(PluginManager.closePluginView).not.toHaveBeenCalled();
   });
 
-  // F-NDI-3-FR3: the old getElements-failure tests are GONE. The
-  // additive path never calls getElements, so a getElements failure
-  // cannot abort the insert — there is no code path to exercise. The
-  // "never reads the page" property is pinned positively in the
-  // happy-path test (getElements .not.toHaveBeenCalled) and in the
-  // non-empty-page regression below.
+  // F-NDI-3-FR3: the old getElements-failure tests are GONE. getElements
+  // is now called READ-ONLY for placement, and a getElements failure is
+  // swallowed (falls back to page-center) — it cannot abort the insert,
+  // so there is no failure path to exercise.
 
   it('re-raises an insertElements failure and leaves the existing page untouched (F-NDI-2-AC1)', async () => {
     // insertElements rejecting throws the host message. The user's
-    // existing content is provably untouched: it was never read
-    // (getElements) nor rewritten (replaceElements), so no destructive
-    // call was ever issued. closePluginView is skipped so the UI stays
+    // existing content is provably untouched: it is never whole-page
+    // rewritten (replaceElements), and the placement read (getElements)
+    // is non-destructive. closePluginView is skipped so the UI stays
     // open and shows the error banner.
     asMock(PluginFileAPI.insertElements).mockResolvedValueOnce({
       success: false,
@@ -790,8 +904,7 @@ describe('insertMindmap — error + cleanup (§F-IN-5)', () => {
       /insertElements rejected/,
     );
     expect(PluginManager.closePluginView).not.toHaveBeenCalled();
-    // No destructive call was ever issued — existing content is safe.
-    expect(PluginFileAPI.getElements).not.toHaveBeenCalled();
+    // No DESTRUCTIVE call was ever issued — the page is never rewritten.
     expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
     expect(PluginCommAPI.lassoElements).not.toHaveBeenCalled();
     expect(PluginCommAPI.deleteLassoElements).not.toHaveBeenCalled();

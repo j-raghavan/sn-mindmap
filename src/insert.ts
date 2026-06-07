@@ -111,6 +111,23 @@ export const INSERT_MARGIN_PX = 200;
  */
 export const LASSO_HALO_PX = 16;
 
+/**
+ * Gap (px) left between the user's existing content and the inserted
+ * map when placing it in empty space (§F-IN-3 / RA-2). Big enough that
+ * the map's auto-lasso rectangle clears the existing ink so a drag
+ * doesn't grab it.
+ */
+export const CONTENT_GAP_PX = 80;
+
+/**
+ * Minimum usable size (px) an empty band must have (below or to the
+ * right of existing content) for the map to be placed there instead of
+ * page-centered. Below this, the map would be scaled too small to be
+ * legible, so we fall back to centering on the whole page (accepting
+ * possible overlap on a near-full page).
+ */
+export const MIN_PLACEMENT_BAND_PX = 600;
+
 export type InsertInput = {
   tree: Tree;
 };
@@ -149,23 +166,36 @@ export async function insertMindmap(input: InsertInput): Promise<void> {
     bboxes: baseLayout.bboxes.size,
   });
 
-  // §F-LY-6 — scale uniformly to fit if the map is wider than the
-  // page (minus INSERT_MARGIN_PX on each side). Scale is capped at 1
-  // so small maps keep their designed proportions; page-centering is
-  // still applied even at scale=1 so the mindmap lands at the page
-  // center regardless of where the user's viewport happened to be.
+  // Overlap-aware placement (§F-IN-3 / RA-2). The firmware lasso is
+  // rectangle-only — there is no "select these elements" API — so an
+  // auto-lasso of a map placed ON TOP of existing ink would also grab
+  // that ink, and dragging the map would drag the user's notes. To
+  // avoid it we place the map in EMPTY space: read the existing
+  // content's extent (each Element exposes maxX/maxY cheaply) and drop
+  // the map into the band below — or, failing that, to the right of —
+  // all existing content, falling back to the whole page (centered)
+  // when the page is too full to fit a band. This only READS the
+  // existing content's bounds; the insert itself stays additive
+  // (insertElements), so existing strokes are still never rewritten or
+  // displaced (I-NDI-2 holds).
+  const contentExtent = await resolveContentExtent(
+    pageCtx.notePath,
+    pageCtx.page,
+  );
+  const region = choosePlacementRegion(pageWidth, pageHeight, contentExtent);
+  log('choosePlacementRegion:done', {contentExtent, region});
+
+  // §F-LY-6 — scale uniformly to fit the chosen region (minus
+  // INSERT_MARGIN_PX on each side). Scale is capped at 1 so small maps
+  // keep their designed proportions; centering within the region is
+  // applied even at scale=1 so the map lands in the empty band.
   const scale = computeFitScale(
     baseLayout.unionBbox,
-    pageWidth,
-    pageHeight,
+    region.w,
+    region.h,
     INSERT_MARGIN_PX,
   );
-  const pageLayout = transformLayout(
-    baseLayout,
-    scale,
-    pageWidth,
-    pageHeight,
-  );
+  const pageLayout = transformLayout(baseLayout, scale, region);
   log('transformLayout:done', {
     scale,
     unionBbox: pageLayout.unionBbox,
@@ -591,9 +621,90 @@ function autoExpand(tree: Tree): Tree {
 }
 
 /**
+ * Bottom-right extent of all existing content on the page, or null when
+ * the page is empty / unreadable. Used by choosePlacementRegion to drop
+ * the new map into empty space (§F-IN-3 / RA-2).
+ *
+ * Elements expose `maxX`/`maxY` (their far corner) as plain fields, so
+ * we get the rightmost/bottommost extent of all content cheaply WITHOUT
+ * reading any stroke points (those live in lazy native cache). We only
+ * need the far corner: every element's bottom is ≤ max(maxY), so placing
+ * the map below max(maxY) clears all of it. This is READ-ONLY — the
+ * insert stays additive, so existing content is never rewritten.
+ *
+ * Best-effort: any failure (null page context, getElements error, no
+ * elements, no finite bounds) returns null and the caller centers on
+ * the whole page.
+ */
+async function resolveContentExtent(
+  notePath: string | null,
+  page: number | null,
+): Promise<{maxX: number; maxY: number} | null> {
+  if (notePath === null || page === null) {
+    return null;
+  }
+  try {
+    const res = (await PluginFileAPI.getElements(
+      page,
+      notePath,
+    )) as ApiRes<Array<{maxX?: number; maxY?: number}>>;
+    if (!res?.success || !Array.isArray(res.result) || res.result.length === 0) {
+      return null;
+    }
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const el of res.result) {
+      if (typeof el?.maxX === 'number' && el.maxX > maxX) {
+        maxX = el.maxX;
+      }
+      if (typeof el?.maxY === 'number' && el.maxY > maxY) {
+        maxY = el.maxY;
+      }
+    }
+    if (!Number.isFinite(maxX) || !Number.isFinite(maxY)) {
+      return null;
+    }
+    return {maxX, maxY};
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Pick the page sub-rectangle to place the map into (§F-IN-3 / RA-2).
+ * Prefer the band BELOW all existing content; if that band is too short
+ * (page mostly full vertically), prefer the band to the RIGHT; if
+ * neither has MIN_PLACEMENT_BAND_PX of room, fall back to the whole page
+ * (centered, accepting possible overlap). An empty page (`content` null)
+ * always returns the whole page — identical to the prior center-on-page
+ * behavior.
+ */
+function choosePlacementRegion(
+  pageW: number,
+  pageH: number,
+  content: {maxX: number; maxY: number} | null,
+): Rect {
+  const fullPage: Rect = {x: 0, y: 0, w: pageW, h: pageH};
+  if (content === null) {
+    return fullPage;
+  }
+  const belowTop = content.maxY + CONTENT_GAP_PX;
+  const belowH = pageH - belowTop;
+  if (belowH >= MIN_PLACEMENT_BAND_PX) {
+    return {x: 0, y: belowTop, w: pageW, h: belowH};
+  }
+  const rightLeft = content.maxX + CONTENT_GAP_PX;
+  const rightW = pageW - rightLeft;
+  if (rightW >= MIN_PLACEMENT_BAND_PX) {
+    return {x: rightLeft, y: 0, w: rightW, h: pageH};
+  }
+  return fullPage;
+}
+
+/**
  * Uniform fit-to-page scale per §F-LY-6. Always ≤ 1: the requirement
  * scales DOWN only ("if the laid-out map is wider than the note
- * page"). Returns 1 when the map already fits — the page-centering
+ * page"). Returns 1 when the map already fits — the region-centering
  * translation still applies at scale=1 so the map lands centered.
  */
 function computeFitScale(
@@ -610,8 +721,9 @@ function computeFitScale(
 }
 
 /**
- * Scale the layout by `scale` around the origin, then translate so
- * the union bbox sits centered on the page. Returns a fully-populated
+ * Scale the layout by `scale` around the origin, then translate so the
+ * union bbox sits centered within `region` (a sub-rectangle of the page
+ * chosen by choosePlacementRegion). Returns a fully-populated
  * LayoutResult that emitGeometries can consume without any further
  * coordinate math.
  *
@@ -623,8 +735,7 @@ function computeFitScale(
 function transformLayout(
   layout: LayoutResult,
   scale: number,
-  pageW: number,
-  pageH: number,
+  region: Rect,
 ): LayoutResult {
   const scaledU: Rect = {
     x: layout.unionBbox.x * scale,
@@ -632,8 +743,8 @@ function transformLayout(
     w: layout.unionBbox.w * scale,
     h: layout.unionBbox.h * scale,
   };
-  const tx = pageW / 2 - (scaledU.x + scaledU.w / 2);
-  const ty = pageH / 2 - (scaledU.y + scaledU.h / 2);
+  const tx = region.x + region.w / 2 - (scaledU.x + scaledU.w / 2);
+  const ty = region.y + region.h / 2 - (scaledU.y + scaledU.h / 2);
 
   const centers = new Map<NodeId, {x: number; y: number}>();
   for (const [id, c] of layout.centers) {

@@ -899,12 +899,11 @@ describe('MindmapCanvas', () => {
 
       // 2 outlines + 1 connector = 3 geometries, one additive
       // insertElements, then reloadFile + close. The additive path
-      // never reads the page (getElements) nor whole-page-rewrites it
-      // (replaceElements). (Marker strokes were removed with the
+      // never whole-page-rewrites the page (replaceElements); getElements
+      // is read-only for placement. (Marker strokes were removed with the
       // edit/decode pipeline.)
       expect(nonMarkerInsertCount()).toBe(3);
       expect(PluginFileAPI.insertElements).toHaveBeenCalledTimes(1);
-      expect(PluginFileAPI.getElements).not.toHaveBeenCalled();
       expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
       expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
       unmount();
