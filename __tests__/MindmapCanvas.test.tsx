@@ -69,8 +69,13 @@ jest.mock('sn-plugin-lib', () => {
       getPageSize: jest
         .fn()
         .mockResolvedValue({success: true, result: {width: 1404, height: 1872}}),
+      // Phase 2.2's insert now flows through the additive insertElements
+      // (the old getElements read + replaceElements whole-page rewrite
+      // are gone). getElements/replaceElements stay mocked so tests can
+      // assert they are never called (F-NDI-1-AC3).
       getElements: jest.fn().mockResolvedValue({success: true, result: []}),
       replaceElements: jest.fn().mockResolvedValue({success: true}),
+      insertElements: jest.fn().mockResolvedValue({success: true}),
     },
   };
 });
@@ -80,32 +85,31 @@ import {PluginCommAPI, PluginFileAPI, PluginManager} from 'sn-plugin-lib';
 import {addChild, addSibling, createTree} from '../src/model/tree';
 
 /**
- * Collect the geometries that insertMindmap emitted. The current
- * insert path bundles every geometry into a single replaceElements
- * call (one Element per geometry, with the geometry hanging off the
- * `.geometry` field). Walk the most recent replaceElements call, skip
- * any pre-existing page elements fed in by the getElements mock, and
- * yield the geometry list the rest of this file was already written
- * against.
+ * Collect the geometries that insertMindmap emitted. The additive
+ * insert path bundles every geometry into a single insertElements call
+ * (one Element per geometry, with the geometry hanging off the
+ * `.geometry` field) and sends ONLY the plugin's new elements — the
+ * page's pre-existing content is never read or sent. Walk the most
+ * recent insertElements call's payload and yield the geometry list the
+ * rest of this file was already written against.
  */
 function collectInsertedGeometries(): Array<{
   type?: string;
   penColor?: number;
 }> {
-  const calls = (PluginFileAPI.replaceElements as jest.Mock).mock.calls;
+  const calls = (PluginFileAPI.insertElements as jest.Mock).mock.calls;
   if (calls.length === 0) {
     return [];
   }
   const latest = calls[calls.length - 1];
-  const combined = latest[2] as Array<{
+  const payload = latest[2] as Array<{
     geometry?: {type?: string; penColor?: number} | null;
   }>;
-  // Existing page elements land at the front of `combined`; our
-  // newly-minted Elements sit at the tail. mintElement() initialises
-  // `.geometry` to null and insertMindmap overwrites it with the
-  // emitted Geometry, so every real insert has a truthy `.geometry`.
+  // mintElement() initialises `.geometry` to null and insertMindmap
+  // overwrites it with the emitted Geometry, so every geometry Element
+  // has a truthy `.geometry` (TYPE_TEXT label elements keep it null).
   const out: Array<{type?: string; penColor?: number}> = [];
-  for (const el of combined) {
+  for (const el of payload) {
     if (el?.geometry) {
       out.push(el.geometry);
     }
@@ -845,10 +849,15 @@ describe('MindmapCanvas', () => {
   describe('Phase 2.2 — Insert button wires to insertMindmap (§F-IN-*)', () => {
     beforeEach(() => {
       (PluginCommAPI.insertGeometry as jest.Mock).mockClear();
+      (PluginFileAPI.insertElements as jest.Mock).mockClear();
+      (PluginFileAPI.insertElements as jest.Mock).mockResolvedValue({
+        success: true,
+      });
       (PluginFileAPI.replaceElements as jest.Mock).mockClear();
       (PluginFileAPI.replaceElements as jest.Mock).mockResolvedValue({
         success: true,
       });
+      (PluginFileAPI.getElements as jest.Mock).mockClear();
       (PluginCommAPI.createElement as jest.Mock).mockClear();
       (PluginCommAPI.insertGeometry as jest.Mock).mockResolvedValue({
         success: true,
@@ -888,19 +897,22 @@ describe('MindmapCanvas', () => {
         await flushPromises();
       });
 
-      // 2 outlines + 1 connector = 3 geometries, one batched
-      // replaceElements, then setLassoBoxState + reloadFile + close.
-      // (Marker strokes were removed with the edit/decode pipeline.)
+      // 2 outlines + 1 connector = 3 geometries, one additive
+      // insertElements, then reloadFile + close. The additive path
+      // never whole-page-rewrites the page (replaceElements); getElements
+      // is read-only for placement. (Marker strokes were removed with the
+      // edit/decode pipeline.)
       expect(nonMarkerInsertCount()).toBe(3);
-      expect(PluginFileAPI.replaceElements).toHaveBeenCalledTimes(1);
+      expect(PluginFileAPI.insertElements).toHaveBeenCalledTimes(1);
+      expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
       expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
       unmount();
     });
 
     it('shows an error banner when insert fails and keeps the plugin view open', async () => {
-      // replaceElements rejecting causes insertMindmap to throw
+      // insertElements rejecting causes insertMindmap to throw
       // before closePluginView fires.
-      (PluginFileAPI.replaceElements as jest.Mock).mockResolvedValueOnce({
+      (PluginFileAPI.insertElements as jest.Mock).mockResolvedValueOnce({
         success: false,
         error: {message: 'simulated insert failure'},
       });
@@ -921,7 +933,7 @@ describe('MindmapCanvas', () => {
     });
 
     it('debounces rapid double-taps so only one insert runs at a time', async () => {
-      // Gate replaceElements on a promise we resolve manually so a
+      // Gate insertElements on a promise we resolve manually so a
       // second tap can land while the first insert is still in flight.
       // TS's flow analysis can't see that the Promise executor fires
       // synchronously, so we initialize resolveFirst with a no-op and
@@ -930,7 +942,7 @@ describe('MindmapCanvas', () => {
       const firstPending = new Promise<void>(r => {
         resolveFirst = r;
       });
-      (PluginFileAPI.replaceElements as jest.Mock).mockImplementationOnce(
+      (PluginFileAPI.insertElements as jest.Mock).mockImplementationOnce(
         async () => {
           await firstPending;
           return {success: true};
@@ -950,13 +962,233 @@ describe('MindmapCanvas', () => {
         await flushPromises();
       });
 
-      // replaceElements was called exactly once — the second tap was
+      // insertElements was called exactly once — the second tap was
       // debounced via insertingRef.
-      expect(PluginFileAPI.replaceElements).toHaveBeenCalledTimes(1);
+      expect(PluginFileAPI.insertElements).toHaveBeenCalledTimes(1);
 
       // Let the first insert complete cleanly.
       resolveFirst();
       await flushAsync();
+      unmount();
+    });
+  });
+
+  describe('Phase B3 — Link mode (DAG cross-edges, §F-DAG-3)', () => {
+    /**
+     * A two-child tree (root → b, root → d). b and d are siblings, so a
+     * b→d link is a genuine, valid cross-edge (no cycle, not a tree
+     * edge). Both nodes carry labels so a node tap that DID open the
+     * label modal would surface a label-input we can assert against.
+     */
+    function linkableTree() {
+      const tree = createTree('root');
+      const b = addChild(tree, tree.rootId, 'b');
+      const d = addChild(tree, tree.rootId, 'd');
+      return {tree, b, d};
+    }
+
+    it('Link button is disabled on a lone-root tree (< 2 nodes, F-DAG-3-FR5)', () => {
+      const {renderer, unmount} = renderCanvas(<MindmapCanvas />);
+      const link = findPressable(renderer, 'Link');
+      expect(link.props.accessibilityState?.disabled).toBe(true);
+      expect(link.props.disabled).toBe(true);
+      unmount();
+    });
+
+    it('Link button becomes enabled once the tree has ≥ 2 nodes', () => {
+      const {tree} = linkableTree();
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      const link = findPressable(renderer, 'Link');
+      expect(link.props.accessibilityState?.disabled).toBe(false);
+      expect(link.props.disabled).toBe(false);
+      unmount();
+    });
+
+    it('arm → tap source → tap target → cross-edge appears and link mode disarms (F-DAG-3-AC1)', () => {
+      const {tree, b, d} = linkableTree();
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      // Arm: label flips to 'Cancel Link'.
+      pressByLabel(renderer, 'Link');
+      expect(findHostByLabel(renderer, 'Cancel Link')).toHaveLength(1);
+      // No cross-edge yet.
+      expect(findHostByLabel(renderer, `cross-edge-${b}-${d}`)).toHaveLength(0);
+
+      // Tap source (b) then target (d).
+      pressByLabel(renderer, `node-${b}`);
+      pressByLabel(renderer, `node-${d}`);
+
+      // Cross-edge overlay appears, and link mode disarmed back to 'Link'.
+      expect(findHostByLabel(renderer, `cross-edge-${b}-${d}`)).toHaveLength(1);
+      expect(findHostByLabel(renderer, 'Link')).toHaveLength(1);
+      expect(findHostByLabel(renderer, 'Cancel Link')).toHaveLength(0);
+      // No reject banner on the happy path.
+      expect(findHostByLabel(renderer, 'link-error')).toHaveLength(0);
+      unmount();
+    });
+
+    it('reject path: a cycling pair shows the reason banner, disarms, adds NO edge (F-DAG-3-AC2)', () => {
+      // Tree root → b. Arm, tap b (source) then root (target): b→root
+      // cycles → reject 'cycle'.
+      const tree = createTree('root');
+      const b = addChild(tree, tree.rootId, 'b');
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      pressByLabel(renderer, 'Link');
+      pressByLabel(renderer, `node-${b}`); // source
+      pressByLabel(renderer, 'node-0'); // target (root) → cycle
+
+      // Reason banner shown with the cycle message.
+      const banner = findHostByLabel(renderer, 'link-error');
+      expect(banner).toHaveLength(1);
+      // Link mode disarmed.
+      expect(findHostByLabel(renderer, 'Link')).toHaveLength(1);
+      expect(findHostByLabel(renderer, 'Cancel Link')).toHaveLength(0);
+      // No cross-edge was added (neither direction).
+      expect(findHostByLabel(renderer, `cross-edge-${b}-0`)).toHaveLength(0);
+      expect(findHostByLabel(renderer, `cross-edge-0-${b}`)).toHaveLength(0);
+      unmount();
+    });
+
+    it('re-tapping the source cancels selection (no edge, no banner, still armed)', () => {
+      const {tree, b} = linkableTree();
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      pressByLabel(renderer, 'Link');
+      pressByLabel(renderer, `node-${b}`); // pick source
+      pressByLabel(renderer, `node-${b}`); // re-tap same node → cancel
+      // Still armed, no banner, no edge.
+      expect(findHostByLabel(renderer, 'Cancel Link')).toHaveLength(1);
+      expect(findHostByLabel(renderer, 'link-error')).toHaveLength(0);
+      unmount();
+    });
+
+    it('tapping a cross-edge while armed deletes it (F-DAG-3-FR4)', () => {
+      const {tree, b, d} = linkableTree();
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      // Create the edge: arm, source b, target d.
+      pressByLabel(renderer, 'Link');
+      pressByLabel(renderer, `node-${b}`);
+      pressByLabel(renderer, `node-${d}`);
+      expect(findHostByLabel(renderer, `cross-edge-${b}-${d}`)).toHaveLength(1);
+
+      // Re-arm (adding the edge disarmed link mode), then tap the
+      // cross-edge to delete it.
+      pressByLabel(renderer, 'Link');
+      pressByLabel(renderer, `cross-edge-${b}-${d}`);
+      expect(findHostByLabel(renderer, `cross-edge-${b}-${d}`)).toHaveLength(0);
+      unmount();
+    });
+
+    it('a node tap while armed routes to link selection, NOT the label modal', () => {
+      const {tree, b} = linkableTree();
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      pressByLabel(renderer, 'Link'); // arm
+      pressByLabel(renderer, `node-${b}`); // armed tap = pick source
+      // The edit-label modal must NOT open.
+      expect(findHostByLabel(renderer, 'label-modal')).toHaveLength(0);
+      expect(findHostByLabel(renderer, 'label-input')).toHaveLength(0);
+      unmount();
+    });
+
+    it('a node tap while IDLE still opens the label modal (existing behavior preserved)', () => {
+      const {tree, b} = linkableTree();
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      // No arming — tap routes to select + edit as before.
+      pressByLabel(renderer, `node-${b}`);
+      expect(findHostByLabel(renderer, 'label-input')).toHaveLength(1);
+      unmount();
+    });
+
+    it('per-node action icons are hidden while armed', () => {
+      const {tree, b} = linkableTree();
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      // Idle: node b shows its Add Child affordance.
+      expect(findHostByLabel(renderer, `add-child-${b}`)).toHaveLength(1);
+      // Armed: action icons are suppressed so taps are link selections.
+      pressByLabel(renderer, 'Link');
+      expect(findHostByLabel(renderer, `add-child-${b}`)).toHaveLength(0);
+      unmount();
+    });
+
+    it('a pre-existing cross-edge renders while IDLE as a NON-deletable overlay (onPress undefined)', () => {
+      // Seed a cross-edge on the initial tree so it renders without ever
+      // arming. While idle, CrossConnector gets onPress=undefined and is
+      // disabled — the overlay is a passive visual, not a tap target.
+      // This covers the idle arm of `onPress={armed ? ... : undefined}`.
+      const tree = createTree('root');
+      const b = addChild(tree, tree.rootId, 'b');
+      const d = addChild(tree, tree.rootId, 'd');
+      tree.crossEdges.push({from: b, to: d});
+
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      // The overlay View exists (host match) even though we never armed.
+      expect(findHostByLabel(renderer, `cross-edge-${b}-${d}`)).toHaveLength(1);
+      // ...but it is NOT an interactive Pressable (no onPress handler) —
+      // findPressable requires a function onPress, so it finds none.
+      expect(() => findPressable(renderer, `cross-edge-${b}-${d}`)).toThrow(
+        /no Pressable/,
+      );
+      unmount();
+    });
+
+    it('a cross-edge to a deep node still renders (overlay keys off the full-tree layout)', () => {
+      // root → a → g (grandchild); root → b. Cross-edge b→g. The Stage
+      // computes radialLayout over the FULL tree, so layout.centers
+      // always has g's center and the overlay renders the cross-edge
+      // regardless of g's depth. (The `if (!fromCenter || !toCenter)`
+      // guard in CrossConnector is defensive against a dangling edge,
+      // which I-DAG-2 prevents — it is not reachable via normal authoring.)
+      const tree = createTree('root');
+      const a = addChild(tree, tree.rootId, 'a');
+      const g = addChild(tree, a, 'g');
+      const b = addChild(tree, tree.rootId, 'b');
+      tree.crossEdges.push({from: b, to: g});
+
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      expect(findHostByLabel(renderer, `cross-edge-${b}-${g}`)).toHaveLength(1);
+      unmount();
+    });
+
+    it('the selected source node is highlighted while armed (isLinkSource doubles its border)', () => {
+      // Arm, tap source b. NodeFrame receives isLinkSource=true for b,
+      // which doubles its border width vs an un-sourced sibling. Compare
+      // b's borderWidth (source) to d's (not source) to assert the
+      // highlight branch fired.
+      const {tree, b, d} = linkableTree();
+      const {renderer, unmount} = renderCanvas(
+        <MindmapCanvas initialTree={tree} />,
+      );
+      pressByLabel(renderer, 'Link');
+      pressByLabel(renderer, `node-${b}`); // b becomes the link source
+
+      const sourceStyle = flattenStyle(
+        findHostSingle(renderer, `node-${b}`).props.style,
+      );
+      const peerStyle = flattenStyle(
+        findHostSingle(renderer, `node-${d}`).props.style,
+      );
+      // Source node's border is thicker than a non-source sibling's.
+      expect(sourceStyle.borderWidth as number).toBeGreaterThan(
+        peerStyle.borderWidth as number,
+      );
       unmount();
     });
   });

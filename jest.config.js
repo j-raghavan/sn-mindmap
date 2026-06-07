@@ -23,6 +23,22 @@ module.exports = {
     './src/layout/radial.ts': {
       branches: 97, functions: 100, lines: 97, statements: 97,
     },
+    './src/layout/forceDirected.ts': {
+      branches: 97, functions: 100, lines: 97, statements: 97,
+    },
+    './src/useLinkMode.ts': {
+      branches: 97, functions: 100, lines: 97, statements: 97,
+    },
+    './src/useConceptLinkMode.ts': {
+      branches: 97, functions: 100, lines: 97, statements: 97,
+    },
+    // NB: Canvas.tsx / ConceptCanvas.tsx (like MindmapCanvas.tsx) are
+    // stateful RN UI components with legitimately hard-to-cover render
+    // branches; they're held to no per-file gate, consistent with
+    // MindmapCanvas (~92%). The hook (useConceptLinkMode) IS gated.
+    './src/model/graph.ts': {
+      branches: 97, functions: 100, lines: 97, statements: 97,
+    },
     './src/pluginRouter.ts': {
       branches: 97, functions: 100, lines: 97, statements: 97,
     },

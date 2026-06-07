@@ -25,9 +25,11 @@ export const NODE_HEIGHT = 96;
  * Visual gap (logical px) preserved between adjacent node outlines.
  * Drives the minimum radial spacing so two NODE_WIDTH × NODE_HEIGHT
  * bboxes never visibly fuse on e-ink, where a 1-pixel rendering jitter
- * across stacked borders reads as a single thicker line.
+ * across stacked borders reads as a single thicker line. Exported so the
+ * force-directed layout's overlap-separation pass uses the SAME margin
+ * the radial R1 derivation does (one source of truth for node spacing).
  */
-const NODE_GAP = 24;
+export const NODE_GAP = 24;
 
 /**
  * Radius (logical px) from root centre to first-level child centres.
@@ -108,3 +110,39 @@ export const PARALLELOGRAM_SKEW_DEG = 12;
  */
 export const PARALLELOGRAM_SKEW_PX =
   NODE_HEIGHT * Math.tan((PARALLELOGRAM_SKEW_DEG * Math.PI) / 180);
+
+/**
+ * Cross-edge arrowhead barb length, derived once from NODE_HEIGHT
+ * (F-DAG-4-FR4). 0.25 → 24 px at NODE_HEIGHT = 96.
+ *
+ * NOTE: this is a FIXED page-space length — it is applied in
+ * emitGeometries to endpoints that are ALREADY fit-to-page-scaled, and
+ * is NOT itself scaled by the layout transform. So on a downscaled map
+ * the arrowhead is proportionally larger relative to the (shrunk)
+ * nodes. That's an accepted v1 trade for legibility on e-ink; RB-2
+ * release gate: tune the fraction on-device.
+ */
+export const ARROWHEAD_LEN = NODE_HEIGHT * 0.25;
+
+/**
+ * Half-angle (radians) between the edge vector and each arrowhead barb
+ * (F-DAG-4-FR4). ~25° → a ~50° total spread, a clean ">" on e-ink.
+ */
+export const ARROWHEAD_HALF_ANGLE = (25 * Math.PI) / 180;
+
+/**
+ * Seed/spread region (logical px) for the concept-map force-directed
+ * layout's INITIAL node placement (§F-LY-DAG-3). These match the Nomad
+ * portrait page (1404 × 1872) but are deliberately SEED-only: they bound
+ * the deterministic FNV-hash seed positions and the root-anchor band, NOT
+ * the final on-device size. The real page size is applied later by the
+ * insert pipeline's fit-to-page transform, so the laid-out graph scales
+ * to whatever the device reports regardless of these values.
+ *
+ * They live here (not in insert.ts) so the layout module never imports
+ * the insert pipeline — insert.ts imports forceDirected.ts, so the
+ * reverse import would be a dependency cycle. constants.ts is the
+ * established, import-free home for layout constants (R1, NODE_*, …).
+ */
+export const DEFAULT_SEED_SPREAD_WIDTH = 1404;
+export const DEFAULT_SEED_SPREAD_HEIGHT = 1872;

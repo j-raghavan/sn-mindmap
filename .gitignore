@@ -80,3 +80,11 @@ phase*.md
 
 # Claude
 .claude/*
+
+# Agent / local config (not committed)
+CLAUDE.md
+.claude-flow/
+.mcp.json
+
+# Local specs / planning docs (not committed)
+spec/

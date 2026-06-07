@@ -54,6 +54,21 @@ export const PEN_DEFAULTS: PenStyle & {showLassoAfterInsert: false} = {
 };
 
 /**
+ * Pen style for DAG cross-edge connectors and their arrowheads
+ * (F-DAG-4-FR3). Dark gray (0x9D — the value reserved for unobtrusive
+ * strokes, §6.4) and a thinner weight than STANDARD_PEN_WIDTH so the
+ * overlay reads as "extra links" distinct from the black tree
+ * connectors. penType stays 10 (Fineliner) to satisfy the firmware
+ * allow-list {1, 10, 11, 14}.
+ */
+export const CROSS_EDGE_PEN: PenStyle & {showLassoAfterInsert: false} = {
+  penColor: 0x9d, // dark gray (unobtrusive)
+  penType: 10,    // Fineliner
+  penWidth: 200,  // thinner than STANDARD_PEN_WIDTH (400)
+  showLassoAfterInsert: false,
+};
+
+/**
  * Straight two-point line geometry. Used for connectors and marker bit
  * strokes.
  */

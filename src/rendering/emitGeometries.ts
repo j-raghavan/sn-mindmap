@@ -1,40 +1,30 @@
 /**
- * High-level "tree + layout (+ preserved strokes) -> Geometry[]"
- * emitter per §F-IN-2.
+ * High-level "tree + layout -> Geometry[]" emitter per §F-IN-2 (+ the
+ * DAG cross-edge overlay, §F-DAG-4).
  *
- * Output order matters for visual consistency and for the marker
- * decoder's stroke scan: per §6.5 step 1, the decoder considers
- * straightLine geometries with length ≤ 4 px and pen color 0x9D as
- * marker candidates. Emitting marker LAST among the plugin-owned
- * strokes means the marker block sits on top of node outlines and
- * connectors in stroke order, and label strokes (only present on
- * re-insert from edit) come after the marker so the user's most
- * recent writing is on top.
+ * Emit order matters: strokes paint in emit order on Supernote, so
+ * later strokes land on TOP of earlier ones. Outlines are emitted LAST
+ * so they mask every connector / cross-edge endpoint at each node.
  *
- * Emit sequence (§F-IN-2):
- *   1. node outlines  — one per node, shape kind drives the frame
- *      (OVAL with ROOT_PEN_WIDTH for the root, RECTANGLE for
- *      Add-Child nodes, ROUNDED_RECTANGLE for Add-Sibling nodes)
- *   2. connectors      — straightLine parent-border -> child-border,
- *      pen width follows the CHILD's node border (§F-IN-2 step 2)
- *   3. marker          — fixed-position binary grid anchored at the
- *      top-left of the node union-bbox (§6.1). One straightLine per
- *      "1" bit in the 72×72 grid, pen color 0x9D, pen width 100.
- *      The per-node bboxes written into the marker bytes are stored
- *      mindmap-local (origin = marker top-left, per §6.3) — we
- *      translate them here so encodeMarker stays spec-aligned and
- *      oblivious to where the mindmap ended up on the page.
- *   4. preserved label strokes (only on re-insert from edit) — each
- *      node's strokes translated by that node's move delta by the
- *      caller (§F-ED-7) before being handed to this module; we just
- *      pass them through with showLassoAfterInsert overridden to
- *      false.
+ * Emit sequence:
+ *   1. tree connectors — straightLine parent-border -> child-border,
+ *      black, pen width follows the CHILD's node border (§F-IN-2 step 2).
+ *   2. cross-edges (DAG overlay) — one gray clipped straightLine per
+ *      Tree.crossEdge from-border -> to-border plus a ">" arrowhead at
+ *      the `to` node (directed). Distinct pen (CROSS_EDGE_PEN) so it
+ *      reads as "extra links" (§F-DAG-4). Emitted AFTER connectors and
+ *      BEFORE outlines.
+ *   3. node outlines — one GEO_polygon per node (pre-order); shape kind
+ *      drives the frame (OVAL/ROUNDED_RECTANGLE/RECTANGLE/PARALLELOGRAM
+ *      by depth). Paint last to cover their own connector endpoints.
+ *
+ * The marker + preserved-label-strokes passes were removed with the
+ * edit/decode pipeline (v0.1 is insert-only).
  *
  * Every emitted geometry sets showLassoAfterInsert: false (§F-IN-3).
- * The caller (insert.ts) issues the explicit
- * PluginCommAPI.lassoElements(unionRect) AFTER the final insert,
- * and unionRect is returned from this module so the caller does not
- * have to re-walk the geometry list.
+ * unionRect is returned so the caller does not have to re-walk the
+ * geometry list; it already covers cross-edges + arrowheads because
+ * unionRectOfGeometries walks every straightLine's points (§F-DAG-4-FR6).
  *
  * Collapse handling: §F-IN-2 explicitly auto-expands every subtree
  * before emit. We iterate the tree via `flattenForEmit`, which
@@ -44,6 +34,7 @@
  * node anyway (see `radialLayout`'s collapse-agnostic contract).
  */
 import {
+  CROSS_EDGE_PEN,
   PEN_DEFAULTS,
   type Geometry,
   type LineGeometry,
@@ -51,8 +42,17 @@ import {
   type Rect,
 } from '../geometry';
 import {flattenForEmit, type NodeId, type Tree} from '../model/tree';
+import {
+  conceptShape,
+  type ConceptNode,
+  type Graph,
+} from '../model/graph';
 import type {LayoutResult} from '../layout/radial';
-import {STANDARD_PEN_WIDTH} from '../layout/constants';
+import {
+  ARROWHEAD_HALF_ANGLE,
+  ARROWHEAD_LEN,
+  STANDARD_PEN_WIDTH,
+} from '../layout/constants';
 import {nodeFrame} from './nodeFrame';
 
 export type EmitInput = {
@@ -64,6 +64,17 @@ export type EmitOutput = {
   geometries: Geometry[];
   /** Convenience union-rect for the post-insert lassoElements call. */
   unionRect: Rect;
+};
+
+/**
+ * Input for the concept-map (DAG) emit path. Parallel to EmitInput but
+ * carries a Graph instead of a Tree. Kept a SEPARATE type (not a
+ * discriminated union with EmitInput) so emitGeometries' signature and
+ * body stay byte-identical for the mindmap path (§14.6).
+ */
+export type ConceptEmitInput = {
+  graph: Graph;
+  layout: LayoutResult;
 };
 
 /**
@@ -123,8 +134,39 @@ export function emitGeometries(input: EmitInput): EmitOutput {
   }
 
   // -----------------------------------------------------------------
-  // 2. Node outlines (pre-order, paint LAST so they cover their
-  //    own connector endpoints).
+  // 2. Cross-edges (DAG overlay) — emitted AFTER tree connectors and
+  //    BEFORE node outlines, so outlines still mask every endpoint.
+  //    Directed: a gray clipped line + a ">" arrowhead at the `to`
+  //    node. Reuses clipSegmentBetweenRects verbatim — identical
+  //    endpoint geometry to tree connectors (§F-DAG-4-FR1/FR2/FR4).
+  // -----------------------------------------------------------------
+  for (const edge of tree.crossEdges) {
+    const fromCenter = centerOrThrow(layout, edge.from);
+    const toCenter = centerOrThrow(layout, edge.to);
+    const fromBbox = bboxOrThrow(layout, edge.from);
+    const toBbox = bboxOrThrow(layout, edge.to);
+
+    const [start, end] = clipSegmentBetweenRects(
+      fromCenter,
+      toCenter,
+      fromBbox,
+      toBbox,
+    );
+
+    geometries.push({
+      ...CROSS_EDGE_PEN,
+      type: 'straightLine',
+      points: [start, end],
+      showLassoAfterInsert: false,
+    });
+    for (const barb of arrowheadGeometries(start, end)) {
+      geometries.push(barb);
+    }
+  }
+
+  // -----------------------------------------------------------------
+  // 3. Node outlines (pre-order, paint LAST so they cover their
+  //    own connector and cross-edge endpoints).
   // -----------------------------------------------------------------
   for (const node of nodes) {
     const bbox = bboxOrThrow(layout, node.id);
@@ -135,6 +177,86 @@ export function emitGeometries(input: EmitInput): EmitOutput {
     geometries,
     unionRect: unionRectOfGeometries(geometries),
   };
+}
+
+/**
+ * Assemble the emit list for a concept-map (DAG) per §14.6 / §F-IN-DAG-1.
+ * Separate from emitGeometries so the mindmap path stays byte-identical;
+ * this path reuses the same private clip/union/outline helpers but walks
+ * a Graph instead of a Tree.
+ *
+ * Emit sequence (same paint-order rationale as the mindmap path — strokes
+ * paint in emit order on Supernote, so outlines emit LAST to mask every
+ * connector endpoint at each node):
+ *   1. connectors — one straightLine per PARENT EDGE. For every node we
+ *      emit child-border → parent-border for each of its parentIds, so a
+ *      multi-parent node renders one connector to EACH parent (§F-IN-DAG-1).
+ *      Black, STANDARD_PEN_WIDTH (PEN_DEFAULTS) — concept edges are
+ *      first-class structure. No arrowheads in concept v1 (§F-LY-DAG-5:
+ *      straight lines only; parent-above-child direction comes from the
+ *      force layout's root anchoring, not a glyph).
+ *   2. node outlines — one GEO_polygon per node; the shape is DERIVED on
+ *      read via conceptShape(node) (OVAL when parentless, else RECTANGLE),
+ *      never stored. Paint last to cover their own connector endpoints.
+ *
+ * Nodes and each node's parentIds are iterated in ASCENDING id order so
+ * the geometry list is deterministic (matching the layout's determinism
+ * contract). Every emitted geometry sets showLassoAfterInsert: false.
+ */
+export function emitConceptGeometries(input: ConceptEmitInput): EmitOutput {
+  const {graph, layout} = input;
+  const geometries: Geometry[] = [];
+
+  const nodes = conceptNodesInOrder(graph);
+
+  // 1. Connectors — one straightLine per parent edge (child → parent).
+  for (const node of nodes) {
+    const childCenter = centerOrThrow(layout, node.id);
+    const childBbox = bboxOrThrow(layout, node.id);
+    for (const parentId of [...node.parentIds].sort((a, b) => a - b)) {
+      const parentCenter = centerOrThrow(layout, parentId);
+      const parentBbox = bboxOrThrow(layout, parentId);
+
+      const [start, end] = clipSegmentBetweenRects(
+        childCenter,
+        parentCenter,
+        childBbox,
+        parentBbox,
+      );
+
+      const line: LineGeometry = {
+        ...PEN_DEFAULTS,
+        penWidth: STANDARD_PEN_WIDTH,
+        type: 'straightLine',
+        points: [start, end],
+        showLassoAfterInsert: false,
+      };
+      geometries.push(line);
+    }
+  }
+
+  // 2. Node outlines (paint LAST so they mask their connector endpoints).
+  //    Shape is derived from structure via conceptShape — no stored field.
+  for (const node of nodes) {
+    const bbox = bboxOrThrow(layout, node.id);
+    geometries.push(withNoAutoLasso(nodeFrame(bbox, conceptShape(node))));
+  }
+
+  return {
+    geometries,
+    unionRect: unionRectOfGeometries(geometries),
+  };
+}
+
+/**
+ * Concept-graph nodes in ascending-id order — the deterministic iteration
+ * order shared by the layout and this emitter so the geometry list never
+ * wobbles between renders (load-bearing on e-ink).
+ */
+function conceptNodesInOrder(graph: Graph): ConceptNode[] {
+  return [...graph.nodesById.keys()]
+    .sort((a, b) => a - b)
+    .map(id => graph.nodesById.get(id)!);
 }
 
 /**
@@ -162,6 +284,45 @@ function bboxOrThrow(layout: LayoutResult, id: NodeId): Rect {
     throw new Error(`emitGeometries: missing layout bbox for node ${id}`);
   }
   return r;
+}
+
+/**
+ * Two short straightLine barbs forming a ">" at `end`, pointing back
+ * along the edge from `end` toward `start` (the directionality
+ * affordance for a DAG cross-edge, §F-DAG-4-FR4). Each barb is the
+ * REVERSED unit edge vector rotated by ±ARROWHEAD_HALF_ANGLE and scaled
+ * by ARROWHEAD_LEN. A degenerate zero-length edge (start ≈ end) yields
+ * no barbs — guards against NaN from a 0/0 unit vector. Pure helper,
+ * fully unit-testable.
+ */
+function arrowheadGeometries(start: Point, end: Point): LineGeometry[] {
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  const len = Math.hypot(dx, dy);
+  if (len === 0) {
+    return []; // degenerate — no direction to point
+  }
+  const ux = dx / len;
+  const uy = dy / len;
+  // Each barb: rotate the reversed unit vector (-ux, -uy) by ±half-angle
+  // and lay a short segment from the head back along it.
+  const barb = (sign: number): LineGeometry => {
+    const a = sign * ARROWHEAD_HALF_ANGLE;
+    const cos = Math.cos(a);
+    const sin = Math.sin(a);
+    const rx = -ux * cos - -uy * sin;
+    const ry = -ux * sin + -uy * cos;
+    return {
+      ...CROSS_EDGE_PEN,
+      type: 'straightLine',
+      points: [
+        {x: end.x, y: end.y},
+        {x: end.x + rx * ARROWHEAD_LEN, y: end.y + ry * ARROWHEAD_LEN},
+      ],
+      showLassoAfterInsert: false,
+    };
+  };
+  return [barb(1), barb(-1)];
 }
 
 /**

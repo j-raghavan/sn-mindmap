@@ -1,35 +1,59 @@
 /**
- * High-level insert flow (§5.3, §F-IN-1..F-IN-5).
+ * High-level insert flow (§5.3, §F-IN-1..F-IN-5; concept-map branch
+ * §14.6 / §F-IN-DAG-1..2).
  *
+ * Two public entry points share one mode-agnostic tail (finalizeInsert):
+ *   - insertMindmap({tree})    — auto-expands the tree, radialLayout.
+ *   - insertConceptMap({graph}) — NO auto-expand (a DAG has no collapse
+ *                                 state, §F-IN-DAG-2), forceDirectedLayout.
+ * Each builds a base (mode-local) layout, then hands finalizeInsert an
+ * `emit` callback (emitGeometries vs emitConceptGeometries) and a
+ * `collectLabels` callback so the shared tail never branches on mode.
+ *
+ * Per-entry steps:
  *   1. resolvePageContext() — getCurrentFilePath → getCurrentPageNum →
- *      PluginFileAPI.getPageSize. Required for the batched
- *      replaceElements write; falling back to default dimensions when
- *      the chain fails rejects the insert with a clear error (the
- *      batched path can't operate without a concrete notePath/page).
- *   2. Auto-expand every subtree so no node is hidden at emit time.
- *   3. radialLayout() in mindmap-local coords, root at origin.
- *   4. Fit-to-page scale if wider than the page (§F-LY-6), then
- *      translate so the unionBbox sits centered on the page.
- *   5. emitGeometries() → outlines (pre-order) + connectors clipped
- *      to each node's bbox. No marker, no preserved label strokes —
- *      re-edit is out of scope for v0.1.
- *   6. For each emitted geometry: PluginCommAPI.createElement(TYPE_GEO)
- *      to mint a native-backed Element, populate pageNum / layerNum /
- *      thickness / geometry. Then ONE PluginFileAPI.replaceElements
- *      call with [existing..., newElements]. Confirmed on device to
- *      cost one host-side fsync (vs. one per insertGeometry), which
- *      is what makes the insert finish in ~1 s instead of ~80 s.
- *   7. setLassoBoxState(2) → reloadFile() (mirrors shape-snap's
- *      executeFastPath tail). This clears any residual lasso state
- *      and refreshes the view so the user's pen immediately returns
- *      to handwriting mode — the user can write labels on the
- *      inserted rectangles right away without tapping out of a lasso
- *      selection first.
- *   8. PluginManager.closePluginView() to dismiss.
+ *      PluginFileAPI.getPageSize. Required for the additive
+ *      insertElements write; any failure in the chain returns null
+ *      notePath/page, which finalizeInsert rejects with a clear error
+ *      (the additive path can't operate without a concrete notePath/page).
+ *   2. Build the base layout (radial for mindmap; force-directed for
+ *      concept), in mode-local coords.
  *
- * Error handling: replaceElements is all-or-nothing on the host, so
- * there is never a partial-insert state to clean up. On failure the
- * page is untouched; we throw and let the UI surface the banner.
+ * Shared tail (finalizeInsert):
+ *   3. Overlap-aware placement (§F-IN-3 / RA-2). Read existing content's
+ *      extent (Element maxX/maxY, read-only) and choose a placement
+ *      region: the empty band BELOW existing content, else to the RIGHT,
+ *      else the whole page. This keeps the auto-lasso (step 7) from
+ *      grabbing the user's existing ink.
+ *   4. Fit-to-page scale (≤ 1) to the chosen region minus
+ *      INSERT_MARGIN_PX, then translate so the map is centered WITHIN
+ *      that region (§F-LY-6).
+ *   5. emit (via the caller's callback) → connectors + node outlines.
+ *      Mindmap: tree connectors (+ the gray DAG cross-edge overlay).
+ *      Concept: one black connector per parent edge, no arrowheads
+ *      (§F-LY-DAG-5). No marker / preserved strokes — insert-only.
+ *   6. For each emitted geometry + each labeled node:
+ *      PluginCommAPI.createElement(TYPE_GEO / TYPE_TEXT) to mint a
+ *      native-backed Element, then ONE additive
+ *      PluginFileAPI.insertElements call with just the new elements. The
+ *      page's pre-existing elements are neither read nor sent — the
+ *      insert ADDS the map and leaves existing content untouched
+ *      (I-NDI-1/I-NDI-2). One host-side fsync (vs. one per geometry) is
+ *      what makes the insert finish in ~1 s instead of ~80 s (I-NDI-3).
+ *   7. reloadFile() THEN lassoElements(unionRect + LASSO_HALO_PX). Order
+ *      matters: insertElements commits the elements but the rendered page
+ *      doesn't include them until reloadFile re-reads it, so a lasso
+ *      before reload matches nothing (and a reload after a lasso would
+ *      clear the selection). The lasso PERSISTS (we do NOT
+ *      setLassoBoxState(2)) so the freshly inserted map is grab-ready.
+ *   8. PluginManager.closePluginView() (fire-and-forget) to dismiss.
+ *
+ * Error handling: the user's existing content is never at risk because
+ * it is never read or sent — only the new map elements are passed to
+ * insertElements. A partial NEW-element insert (some geometries applied,
+ * then a mid-list failure) is theoretically possible and is a documented
+ * follow-up (RA-3); it is NOT inherited atomicity. On failure we throw
+ * and let the UI surface the banner.
  */
 import {
   Element,
@@ -41,8 +65,13 @@ import {
 import type {Geometry, Rect} from './geometry';
 import type {LayoutResult} from './layout/radial';
 import {radialLayout} from './layout/radial';
+import {forceDirectedLayout} from './layout/forceDirected';
 import {cloneTree, type NodeId, type Tree} from './model/tree';
-import {emitGeometries} from './rendering/emitGeometries';
+import type {Graph} from './model/graph';
+import {
+  emitConceptGeometries,
+  emitGeometries,
+} from './rendering/emitGeometries';
 import type {ApiRes} from './pluginApi';
 
 /**
@@ -96,6 +125,32 @@ export const DEFAULT_PAGE_HEIGHT = 1872;
  */
 export const INSERT_MARGIN_PX = 200;
 
+/**
+ * Halo (px) added on every side of the union rect when auto-lassoing
+ * the inserted block (§F-IN-3). A lasso rect that exactly hugs the
+ * union bounds can miss strokes sitting on the boundary, so we expand
+ * slightly to make sure every emitted geometry is captured. Mirrors the
+ * 16 px halo an earlier on-device probe run used.
+ */
+export const LASSO_HALO_PX = 16;
+
+/**
+ * Gap (px) left between the user's existing content and the inserted
+ * map when placing it in empty space (§F-IN-3 / RA-2). Big enough that
+ * the map's auto-lasso rectangle clears the existing ink so a drag
+ * doesn't grab it.
+ */
+export const CONTENT_GAP_PX = 80;
+
+/**
+ * Minimum usable size (px) an empty band must have (below or to the
+ * right of existing content) for the map to be placed there instead of
+ * page-centered. Below this, the map would be scaled too small to be
+ * legible, so we fall back to centering on the whole page (accepting
+ * possible overlap on a near-full page).
+ */
+export const MIN_PLACEMENT_BAND_PX = 600;
+
 export type InsertInput = {
   tree: Tree;
 };
@@ -113,7 +168,6 @@ export async function insertMindmap(input: InsertInput): Promise<void> {
   log('resolvePageContext:before');
   const pageCtx = await resolvePageContext();
   log('resolvePageContext:after', pageCtx);
-  const {width: pageWidth, height: pageHeight} = pageCtx;
 
   // §F-IN-2 step 0 — auto-expand every subtree so the layout + emit
   // passes see the fully expanded tree. We clone so the caller's
@@ -134,64 +188,188 @@ export async function insertMindmap(input: InsertInput): Promise<void> {
     bboxes: baseLayout.bboxes.size,
   });
 
-  // §F-LY-6 — scale uniformly to fit if the map is wider than the
-  // page (minus INSERT_MARGIN_PX on each side). Scale is capped at 1
-  // so small maps keep their designed proportions; page-centering is
-  // still applied even at scale=1 so the mindmap lands at the page
-  // center regardless of where the user's viewport happened to be.
+  // Shared placement + write tail. The mindmap path emits via
+  // emitGeometries over the expanded tree and collects labels from it;
+  // the rest (placement, fit-to-page, additive write, lasso, close) is
+  // mode-agnostic (see finalizeInsert).
+  await finalizeInsert({
+    pageCtx,
+    baseLayout,
+    context: 'insertMindmap',
+    emit: pageLayout => {
+      const out = emitGeometries({tree: expanded, layout: pageLayout});
+      log('emitGeometries:done', {
+        total: out.geometries.length,
+        byType: countByType(out.geometries),
+        edgeCount: expanded.crossEdges.length,
+        unionRect: out.unionRect,
+      });
+      return out;
+    },
+    collectLabels: pageLayout => collectLabeledNodes(expanded, pageLayout),
+  });
+}
+
+export type InsertConceptInput = {
+  graph: Graph;
+};
+
+/**
+ * Run the full insert flow for a concept-map (DAG), §14.6. Sibling to
+ * insertMindmap, sharing the mode-agnostic placement + write tail
+ * (finalizeInsert). Two concept-specific differences (§F-IN-DAG-1/2):
+ *   - layout via forceDirectedLayout instead of radialLayout, and
+ *   - NO auto-expand pass (a Graph has no collapse state, §F-IN-DAG-2).
+ * The geometry list comes from emitConceptGeometries (one connector per
+ * parent edge); labels are collected by walking the graph's nodes.
+ *
+ * Resolves when the plugin view has been dismissed by closePluginView().
+ * Rejects on any unrecoverable error.
+ */
+export async function insertConceptMap(
+  input: InsertConceptInput,
+): Promise<void> {
+  log('enter', {
+    nodeCount: input.graph.nodesById.size,
+    rootId: input.graph.rootId,
+  });
+
+  log('resolvePageContext:before');
+  const pageCtx = await resolvePageContext();
+  log('resolvePageContext:after', pageCtx);
+
+  // §F-IN-DAG-2 — NO auto-expand: the concept graph has no collapse
+  // state. Force-directed layout in concept-map-local coords.
+  const baseLayout = forceDirectedLayout(input.graph);
+  log('forceDirectedLayout:done', {
+    unionBbox: baseLayout.unionBbox,
+    centers: baseLayout.centers.size,
+    bboxes: baseLayout.bboxes.size,
+  });
+
+  await finalizeInsert({
+    pageCtx,
+    baseLayout,
+    context: 'insertConceptMap',
+    emit: pageLayout => {
+      const out = emitConceptGeometries({graph: input.graph, layout: pageLayout});
+      log('emitConceptGeometries:done', {
+        total: out.geometries.length,
+        byType: countByType(out.geometries),
+        unionRect: out.unionRect,
+      });
+      return out;
+    },
+    collectLabels: pageLayout =>
+      collectGraphLabeledNodes(input.graph, pageLayout),
+  });
+}
+
+/**
+ * The mode-agnostic insert tail shared by insertMindmap and
+ * insertConceptMap (§F-IN-3 / RA-2). Given a resolved page context and a
+ * base (mindmap- or concept-local) layout, it performs overlap-aware
+ * placement, fit-to-page scaling, the emit (via the caller's `emit`
+ * callback against the transformed layout), the single additive
+ * insertElements write, reload, and the persistent auto-lasso, then
+ * fire-and-forget closes the plugin view.
+ *
+ * `emit` and `collectLabels` are callbacks taking the FINAL page-space
+ * layout so each mode supplies its own geometry + label collection
+ * without duplicating the placement/write/lasso machinery. `context`
+ * names the caller for the null page-context error message.
+ */
+type FinalizeInsertInput = {
+  pageCtx: PageContext;
+  baseLayout: LayoutResult;
+  context: string;
+  emit: (pageLayout: LayoutResult) => {geometries: Geometry[]; unionRect: Rect};
+  collectLabels: (pageLayout: LayoutResult) => LabeledNodeSpec[];
+};
+
+async function finalizeInsert({
+  pageCtx,
+  baseLayout,
+  context,
+  emit,
+  collectLabels,
+}: FinalizeInsertInput): Promise<void> {
+  const {width: pageWidth, height: pageHeight} = pageCtx;
+
+  // Overlap-aware placement (§F-IN-3 / RA-2). The firmware lasso is
+  // rectangle-only — there is no "select these elements" API — so an
+  // auto-lasso of a map placed ON TOP of existing ink would also grab
+  // that ink, and dragging the map would drag the user's notes. To
+  // avoid it we place the map in EMPTY space: read the existing
+  // content's extent and drop the map into the band below — or, failing
+  // that, to the right of — all existing content, falling back to the
+  // whole page (centered) when the page is too full to fit a band.
+  //
+  // The extent MUST be in the same page-pixel space as the map we place
+  // and the lasso rect we later send. getElements' maxX/maxY are in the
+  // firmware's NATIVE stroke (EMR) space — ~6-11x the page (an on-device
+  // trace read 21632x16224 against a 1920x2560 page) — so comparing them
+  // to the pixel page made every band compute negative and the map
+  // always landed centered ON TOP of the ink. Instead we let the
+  // firmware do the EMR->pixel conversion for us: lasso the whole page,
+  // read the selection's bounding rect (pixel space, the same Rect the
+  // lasso hit-test uses), then drop the box. READ-ONLY for the user's
+  // ink — selecting then deselecting never rewrites strokes, and the
+  // insert itself stays additive (I-NDI-2 holds).
+  const contentExtent = await resolveContentExtentPx(pageWidth, pageHeight);
+  const region = choosePlacementRegion(pageWidth, pageHeight, contentExtent);
+  log('choosePlacementRegion:done', {contentExtent, region});
+
+  // §F-LY-6 — scale uniformly to fit the chosen region (minus
+  // INSERT_MARGIN_PX on each side). Scale is capped at 1 so small maps
+  // keep their designed proportions; centering within the region is
+  // applied even at scale=1 so the map lands in the empty band.
   const scale = computeFitScale(
     baseLayout.unionBbox,
-    pageWidth,
-    pageHeight,
+    region.w,
+    region.h,
     INSERT_MARGIN_PX,
   );
-  const pageLayout = transformLayout(
-    baseLayout,
-    scale,
-    pageWidth,
-    pageHeight,
-  );
+  const pageLayout = transformLayout(baseLayout, scale, region);
   log('transformLayout:done', {
     scale,
     unionBbox: pageLayout.unionBbox,
   });
 
-  // §F-IN-2 — assemble the geometry list (outlines + connectors).
-  const {geometries, unionRect} = emitGeometries({
-    tree: expanded,
-    layout: pageLayout,
-  });
-  log('emitGeometries:done', {
-    total: geometries.length,
-    byType: countByType(geometries),
-    unionRect,
-  });
+  // §F-IN-2 — assemble the geometry list (outlines + connectors). The
+  // caller's emit closure logs its own per-mode summary.
+  const {geometries, unionRect} = emit(pageLayout);
 
-  // §F-IN-3 — batched write. Build one native-backed Element per
+  // §F-IN-3 — additive write. Build one native-backed Element per
   // emitted geometry (createElement returns an Element whose native
   // side carries the uuid / angles / contoursSrc accessors the host
   // validator expects; our old hand-built {type:700,…} object missed
   // that plumbing and got rejected with APIError 106), then call
-  // replaceElements(notePath, page, [existing..., newElements]) ONCE.
+  // insertElements(notePath, page, newElements) ONCE.
   //
-  // Performance: single replaceElements = one host-side fsync instead
+  // Performance: single insertElements = one host-side fsync instead
   // of one per geometry, cutting insert wall-time from ~80 s (309
   // geometries × ~260 ms/fsync observed on the 08:45 probe run) to
-  // ~1–2 s. replaceElements itself is the only disk-touching step;
-  // every createElement is bridge-only.
+  // ~1–2 s (I-NDI-3). insertElements itself is the only disk-touching
+  // step; every createElement is bridge-only. Dropping the prior
+  // whole-page getElements read also removes a large bridge marshal on
+  // pages that already hold many elements.
   //
-  // Atomicity: replaceElements is all-or-nothing on the host. If it
-  // fails, the page is untouched, so there's nothing to clean up —
-  // we just re-raise and let the UI layer surface the error banner.
+  // Safety: insertElements is ADDITIVE — the page's existing elements
+  // are never read or sent, so they cannot be corrupted (I-NDI-2). We
+  // do NOT assume the new-element list is applied transactionally; a
+  // partial NEW-element insert is a documented follow-up (RA-3), not
+  // inherited atomicity. On failure we re-raise and let the UI layer
+  // surface the error banner.
   if (pageCtx.notePath === null || pageCtx.page === null) {
     throw new Error(
-      'insertMindmap: resolvePageContext returned null notePath/page; ' +
-        'replaceElements requires both',
+      `${context}: resolvePageContext returned null notePath/page; ` +
+        'insertElements requires both',
     );
   }
   // Collect labeled nodes so their text lands inside their outline as
   // a TYPE_TEXT element. Unlabeled nodes contribute outline-only.
-  const labeledNodes = collectLabeledNodes(expanded, pageLayout);
+  const labeledNodes = collectLabels(pageLayout);
   log('collectLabeledNodes:done', {count: labeledNodes.length});
 
   try {
@@ -206,41 +384,19 @@ export async function insertMindmap(input: InsertInput): Promise<void> {
     );
     log('buildElements:done', {built: newElements.length});
 
-    log('getElements:before');
-    const getRes = (await PluginFileAPI.getElements(
-      pageCtx.page,
-      pageCtx.notePath,
-    )) as ApiRes<unknown[]>;
-    log('getElements:after', {
-      success: getRes?.success,
-      errorMessage: getRes?.error?.message,
-      existingCount: Array.isArray(getRes?.result)
-        ? (getRes?.result as unknown[]).length
-        : null,
-    });
-    if (!getRes?.success || !Array.isArray(getRes.result)) {
-      throw new Error(getRes?.error?.message ?? 'getElements failed');
-    }
-    const existing = getRes.result as unknown[];
-
-    const combined = [...existing, ...newElements];
-    log('replaceElements:before', {
-      existingCount: existing.length,
-      addedCount: newElements.length,
-      totalCount: combined.length,
-    });
-    const replaceRes = (await PluginFileAPI.replaceElements(
+    log('insertElements:before', {addedCount: newElements.length});
+    const insertRes = (await PluginFileAPI.insertElements(
       pageCtx.notePath,
       pageCtx.page,
-      combined as object[],
+      newElements as object[],
     )) as ApiRes<boolean>;
-    log('replaceElements:after', {
-      success: replaceRes?.success,
-      errorCode: (replaceRes?.error as {code?: number} | undefined)?.code,
-      errorMessage: replaceRes?.error?.message,
+    log('insertElements:after', {
+      success: insertRes?.success,
+      errorCode: (insertRes?.error as {code?: number} | undefined)?.code,
+      errorMessage: insertRes?.error?.message,
     });
-    if (!replaceRes?.success) {
-      throw new Error(replaceRes?.error?.message ?? 'replaceElements failed');
+    if (!insertRes?.success) {
+      throw new Error(insertRes?.error?.message ?? 'insertElements failed');
     }
 
     // Force the host to repaint the page with the newly-inserted
@@ -248,14 +404,45 @@ export async function insertMindmap(input: InsertInput): Promise<void> {
     // (the page would repaint on the next interaction anyway), so
     // we log and continue even on failure.
     //
-    // NB: shape-snap calls setLassoBoxState(2) before reloadFile,
-    // but it does so AFTER an explicit lassoElements (to clear the
-    // selection that lasso produced). Our flow never lassos, so the
-    // call returns APIError 904 "no lasso action has been performed"
-    // — it's meaningless here. Skipped.
+    // ORDER MATTERS: reloadFile MUST run BEFORE the auto-lasso below.
+    // insertElements commits the elements to the file, but the host's
+    // rendered/current page doesn't include them until reloadFile
+    // re-reads it. An on-device trace showed lassoElements returning
+    // {success:true, result:false} when called pre-reload (it matched
+    // nothing — the elements weren't in the rendered page yet), and a
+    // reload after a lasso would also clear the selection. So: reload
+    // first, then lasso.
     log('reloadFile:before');
     const reloadRes = (await PluginCommAPI.reloadFile()) as ApiRes<boolean>;
     log('reloadFile:after', reloadRes);
+
+    // Auto-lasso the freshly inserted block so the user can drag the
+    // whole map into place right after insert (§F-IN-3). lassoElements
+    // takes a {left,top,right,bottom} rect; unionRect is in page coords
+    // ({x,y,w,h}). We expand by LASSO_HALO_PX on every side so elements
+    // sitting exactly on the union-rect boundary are captured (a tight
+    // rect can miss edge strokes), and round to integers at the firmware
+    // boundary like the geometry points. We deliberately do NOT follow
+    // shape-snap's setLassoBoxState(2) (which REMOVES the lasso box) —
+    // we want the selection to PERSIST so the map is grab-ready.
+    // Non-fatal: a lasso failure is cosmetic, so we log and continue
+    // rather than abort an already-committed insert.
+    const lassoRect = {
+      left: Math.round(unionRect.x - LASSO_HALO_PX),
+      top: Math.round(unionRect.y - LASSO_HALO_PX),
+      right: Math.round(unionRect.x + unionRect.w + LASSO_HALO_PX),
+      bottom: Math.round(unionRect.y + unionRect.h + LASSO_HALO_PX),
+    };
+    log('lassoElements:before', lassoRect);
+    const lassoRes = (await PluginCommAPI.lassoElements(
+      lassoRect,
+    )) as ApiRes<boolean>;
+    log('lassoElements:after', {
+      success: lassoRes?.success,
+      result: lassoRes?.result,
+      errorCode: (lassoRes?.error as {code?: number} | undefined)?.code,
+      errorMessage: lassoRes?.error?.message,
+    });
 
     // Dismiss the plugin. NOT awaited — the host's response to
     // closePluginView can be slow on-device, and we don't want the
@@ -277,8 +464,9 @@ export async function insertMindmap(input: InsertInput): Promise<void> {
       message: err instanceof Error ? err.message : String(err),
       stack: err instanceof Error ? err.stack : undefined,
     });
-    // replaceElements is atomic, so there is never a partial insert
-    // to clean up. The error re-raises unchanged.
+    // Existing content is never sent, so it cannot be corrupted; a
+    // partial NEW-element set is a documented follow-up (RA-3), not
+    // silently inherited atomicity. The error re-raises unchanged.
     throw err;
   }
 }
@@ -337,6 +525,32 @@ function collectLabeledNodes(
 }
 
 /**
+ * Concept-map sibling of collectLabeledNodes: walk every ConceptNode and
+ * collect those carrying a non-empty label, pairing each with its
+ * post-fit-to-page bbox. Same label/bbox logic as the tree variant; a
+ * parallel fn (rather than generalising collectLabeledNodes) keeps the
+ * mindmap path's call site byte-identical (§14.6).
+ */
+function collectGraphLabeledNodes(
+  graph: Graph,
+  layout: LayoutResult,
+): LabeledNodeSpec[] {
+  const out: LabeledNodeSpec[] = [];
+  for (const node of graph.nodesById.values()) {
+    const label = node.label?.trim();
+    if (!label) {
+      continue;
+    }
+    const bbox = layout.bboxes.get(node.id);
+    if (!bbox) {
+      continue;
+    }
+    out.push({label, bbox});
+  }
+  return out;
+}
+
+/**
  * Pixels of inner padding between a node's outline and its label
  * text rectangle. Keeps the rendered text from kissing the outline
  * edge, which looks tight on e-ink. 8 px on each side is comfortable
@@ -345,21 +559,57 @@ function collectLabeledNodes(
 const TEXT_PADDING_PX = 8;
 
 /**
- * Map a node's bbox height to a font size that looks centred and
- * legible inside the outline. Empirical values: NODE_HEIGHT=96 gives
- * a comfortable ~28 px font; ~bbox.h × 0.32 with a 20–48 clamp keeps
- * smaller fit-to-page-scaled nodes readable without blowing past the
- * outline at large scales.
+ * Average glyph advance as a fraction of the font size, used to predict
+ * a label's rendered width (label.length × fontSize × this). Deliberately
+ * generous (the firmware's proportional font averages nearer ~0.5) so the
+ * width-fit ERRS SMALL and the label never spills past the outline. RB:
+ * tune on-device against the real font metrics.
  */
-function fontSizeForBbox(bbox: Rect): number {
-  const desired = Math.round(bbox.h * 0.32);
-  return Math.max(20, Math.min(48, desired));
+const CHAR_ADVANCE_RATIO = 0.6;
+
+/** Hard ceiling so labels in big boxes don't render comically large. */
+const MAX_FONT_PX = 48;
+
+/**
+ * Tiny safety floor — only guards against a degenerate ≤0 size for an
+ * absurdly long label in a sub-pixel box. It is intentionally well BELOW
+ * the old 20 px floor: that floor was the bug — when the map scaled down,
+ * the height-derived size fell under 20, got clamped UP to 20, and the
+ * now-too-big text was clipped by the firmware to the (also shrunk) box
+ * ("Main idea" → "Mai"). Fit must win over a readability floor, because a
+ * clipped label loses information while a small one does not.
+ */
+const MIN_FONT_PX = 6;
+
+/**
+ * Font size that fits the label INSIDE its box on BOTH axes. The firmware
+ * CLIPS overflowing text (it neither wraps nor auto-shrinks), and node
+ * boxes are a fixed NODE_WIDTH regardless of label length, so the size
+ * must be the smaller of:
+ *   - vertical fit: bbox.h × 0.32 (the historical look — governs short
+ *     labels, so their size is unchanged from before), and
+ *   - horizontal fit: the size at which `label.length` glyphs span the
+ *     padded box width (governs long labels / downscaled boxes).
+ * Capped at MAX_FONT_PX, floored only at the degenerate MIN_FONT_PX.
+ *
+ * Because the emit runs on the fit-to-page-SCALED bbox, this scales with
+ * the map: short labels keep bbox.h × 0.32, and downscaling no longer
+ * clips because there is no longer a 20 px floor to overshoot.
+ */
+function fontSizeForLabel(label: string, bbox: Rect): number {
+  const availW = Math.max(1, bbox.w - 2 * TEXT_PADDING_PX);
+  const byHeight = bbox.h * 0.32;
+  const byWidth = availW / (Math.max(1, label.length) * CHAR_ADVANCE_RATIO);
+  const fit = Math.min(byHeight, byWidth);
+  // floor (not round): rounding UP could re-introduce a sub-pixel overflow,
+  // and the whole point is that the label never exceeds the box.
+  return Math.floor(Math.max(MIN_FONT_PX, Math.min(MAX_FONT_PX, fit)));
 }
 
 /**
  * Build one native-backed `Element` per emitted Geometry plus one
  * `Element.TYPE_TEXT` per labeled node, ready to hand to
- * `PluginFileAPI.replaceElements`.
+ * `PluginFileAPI.insertElements`.
  *
  * Geometry path (mirrors shape-snap):
  *   1. PluginCommAPI.createElement(Element.TYPE_GEO) — the native
@@ -377,8 +627,8 @@ function fontSizeForBbox(bbox: Rect): number {
  *      uuid + plumbing.
  *   2. Populate `pageNum` / `layerNum` / `textBox` with the label
  *      text, the node's outline bbox shrunk by TEXT_PADDING_PX as
- *      `textRect`, fontSize derived from bbox height, and centre
- *      alignment.
+ *      `textRect`, fontSize fit to the label AND the box (so it can't
+ *      overflow/clip), and centre alignment.
  *
  * Throws on the first `createElement` failure.
  */
@@ -431,7 +681,7 @@ async function buildElementsForInsert(
         right: Math.round(bbox.x + bbox.w - TEXT_PADDING_PX),
         bottom: Math.round(bbox.y + bbox.h - TEXT_PADDING_PX),
       },
-      fontSize: fontSizeForBbox(bbox),
+      fontSize: fontSizeForLabel(label, bbox),
       textAlign: 1, // centre — matches sn-plugin-lib TextBox.textAlign convention
       textBold: 0,
       textItalics: 0,
@@ -489,16 +739,21 @@ function roundGeometryPoints(geometry: Geometry): Geometry {
 /**
  * Resolve everything the insert pipeline needs from the host about
  * the current page: page dimensions (for fit-to-page scale), plus
- * notePath + page index used by the replaceElements probe (§F-IN-1).
+ * notePath + page index used by the insertElements call (§F-IN-1).
  * Mirrors the three-step fall-through from sn-shapes:
  * PluginCommAPI.getCurrentFilePath -> getCurrentPageNum ->
  * PluginFileAPI.getPageSize. Any null-ish / failure result at any
- * step, or a thrown exception, returns the Nomad portrait defaults
- * (with notePath/page = null, which the probe treats as "don't
- * attempt"). The per-geometry insertGeometry loop doesn't consume
- * notePath or page — it relies on the firmware's implicit
- * "current page" context — so a null pair still lets the slow path
- * run to completion.
+ * step, or a thrown exception, returns the Nomad portrait defaults for
+ * width/height (so fit-to-page still has sane bounds) but leaves
+ * notePath/page = null. The additive insertElements call REQUIRES both,
+ * so finalizeInsert throws on a null notePath/page rather than writing
+ * to the wrong page. NOTE: that null guard sits just before the write,
+ * AFTER the placement probe — the probe operates on the CURRENT page via
+ * lassoElements/getLassoRect (it needs only width/height, not
+ * notePath/page), so on a failed page-context resolution it still runs a
+ * whole-page lasso probe and only then does finalizeInsert throw at the
+ * write guard. (A read-only lasso has no lasting effect, so this is
+ * harmless; the tests assert exactly this ordering.)
  */
 type PageContext = {
   width: number;
@@ -560,9 +815,129 @@ function autoExpand(tree: Tree): Tree {
 }
 
 /**
+ * Bottom-right extent (page-pixel space) of all existing content on the
+ * page, or null when the page is empty / unreadable. Used by
+ * choosePlacementRegion to drop the new map into empty space
+ * (§F-IN-3 / RA-2).
+ *
+ * Why not getElements? Element `maxX`/`maxY` are in the firmware's NATIVE
+ * stroke (EMR) coordinate space, which is ~6-11x the page (an on-device
+ * trace read 21632x16224 against a 1920x2560 page). Placement, the map
+ * geometry, and the auto-lasso rect all work in page-PIXEL space, so an
+ * EMR extent made every empty-band calc go negative and the map always
+ * landed centered on top of the ink.
+ *
+ * Instead we borrow the firmware's own EMR->pixel conversion: lasso the
+ * whole page (left/top/right/bottom in pixel space, the exact space the
+ * lasso hit-test consumes), then read the selection's bounding rect via
+ * getLassoRect — that Rect comes back in pixel space — and immediately
+ * drop the lasso box (setLassoBoxState(2) = "completely remove"; it
+ * deselects only, never deletes strokes). The right/bottom of that rect
+ * is the bottom-right extent of all ink, already in the space we place
+ * into.
+ *
+ * Best-effort and READ-ONLY for the user's ink: an empty page (lasso
+ * matches nothing), a missing/!success rect, or any thrown error returns
+ * null and the caller centers on the whole page.
+ */
+async function resolveContentExtentPx(
+  pageW: number,
+  pageH: number,
+): Promise<{maxX: number; maxY: number} | null> {
+  let selected = false;
+  try {
+    const lassoRes = (await PluginCommAPI.lassoElements({
+      left: 0,
+      top: 0,
+      right: Math.round(pageW),
+      bottom: Math.round(pageH),
+    })) as ApiRes<boolean>;
+    // result === true means at least one element was selected; false (the
+    // empty-page case, or a lasso no-op) means there is nothing to avoid
+    // and nothing to clear.
+    if (!lassoRes?.success || lassoRes.result !== true) {
+      return null;
+    }
+    selected = true;
+    const rectRes = (await PluginCommAPI.getLassoRect()) as ApiRes<{
+      left?: number;
+      top?: number;
+      right?: number;
+      bottom?: number;
+    }>;
+    const rect = rectRes?.result;
+    if (
+      !rectRes?.success ||
+      !rect ||
+      typeof rect.right !== 'number' ||
+      typeof rect.bottom !== 'number' ||
+      !Number.isFinite(rect.right) ||
+      !Number.isFinite(rect.bottom)
+    ) {
+      return null;
+    }
+    log('resolveContentExtentPx:done', {rect});
+    return {maxX: rect.right, maxY: rect.bottom};
+  } catch {
+    return null;
+  } finally {
+    // Clear the probe selection iff we actually made one, so the only
+    // surviving selection at insert-end is the map's own auto-lasso.
+    if (selected) {
+      await clearLassoBox();
+    }
+  }
+}
+
+/**
+ * Drop the lasso box so the whole-page content probe leaves no transient
+ * selection behind. state 2 = "completely remove" the box (deselect) —
+ * it never deletes strokes (that is deleteLassoElements). Best-effort:
+ * a failure here is purely cosmetic, so swallow it.
+ */
+async function clearLassoBox(): Promise<void> {
+  try {
+    await PluginCommAPI.setLassoBoxState(2);
+  } catch {
+    // cosmetic — the plugin closing clears any lingering selection anyway
+  }
+}
+
+/**
+ * Pick the page sub-rectangle to place the map into (§F-IN-3 / RA-2).
+ * Prefer the band BELOW all existing content; if that band is too short
+ * (page mostly full vertically), prefer the band to the RIGHT; if
+ * neither has MIN_PLACEMENT_BAND_PX of room, fall back to the whole page
+ * (centered, accepting possible overlap). An empty page (`content` null)
+ * always returns the whole page — identical to the prior center-on-page
+ * behavior.
+ */
+function choosePlacementRegion(
+  pageW: number,
+  pageH: number,
+  content: {maxX: number; maxY: number} | null,
+): Rect {
+  const fullPage: Rect = {x: 0, y: 0, w: pageW, h: pageH};
+  if (content === null) {
+    return fullPage;
+  }
+  const belowTop = content.maxY + CONTENT_GAP_PX;
+  const belowH = pageH - belowTop;
+  if (belowH >= MIN_PLACEMENT_BAND_PX) {
+    return {x: 0, y: belowTop, w: pageW, h: belowH};
+  }
+  const rightLeft = content.maxX + CONTENT_GAP_PX;
+  const rightW = pageW - rightLeft;
+  if (rightW >= MIN_PLACEMENT_BAND_PX) {
+    return {x: rightLeft, y: 0, w: rightW, h: pageH};
+  }
+  return fullPage;
+}
+
+/**
  * Uniform fit-to-page scale per §F-LY-6. Always ≤ 1: the requirement
  * scales DOWN only ("if the laid-out map is wider than the note
- * page"). Returns 1 when the map already fits — the page-centering
+ * page"). Returns 1 when the map already fits — the region-centering
  * translation still applies at scale=1 so the map lands centered.
  */
 function computeFitScale(
@@ -579,8 +954,9 @@ function computeFitScale(
 }
 
 /**
- * Scale the layout by `scale` around the origin, then translate so
- * the union bbox sits centered on the page. Returns a fully-populated
+ * Scale the layout by `scale` around the origin, then translate so the
+ * union bbox sits centered within `region` (a sub-rectangle of the page
+ * chosen by choosePlacementRegion). Returns a fully-populated
  * LayoutResult that emitGeometries can consume without any further
  * coordinate math.
  *
@@ -592,8 +968,7 @@ function computeFitScale(
 function transformLayout(
   layout: LayoutResult,
   scale: number,
-  pageW: number,
-  pageH: number,
+  region: Rect,
 ): LayoutResult {
   const scaledU: Rect = {
     x: layout.unionBbox.x * scale,
@@ -601,8 +976,8 @@ function transformLayout(
     w: layout.unionBbox.w * scale,
     h: layout.unionBbox.h * scale,
   };
-  const tx = pageW / 2 - (scaledU.x + scaledU.w / 2);
-  const ty = pageH / 2 - (scaledU.y + scaledU.h / 2);
+  const tx = region.x + region.w / 2 - (scaledU.x + scaledU.w / 2);
+  const ty = region.y + region.h / 2 - (scaledU.y + scaledU.h / 2);
 
   const centers = new Map<NodeId, {x: number; y: number}>();
   for (const [id, c] of layout.centers) {

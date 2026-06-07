@@ -68,9 +68,11 @@ import {
 import {PluginManager} from 'sn-plugin-lib';
 import {
   addChild,
+  addCrossEdge,
   addSibling,
   cloneTree,
   createTree,
+  deleteCrossEdge,
   deleteSubtree,
   setCollapsed,
   setLabel,
@@ -88,6 +90,7 @@ import {
 } from './layout/constants';
 import type {Point, Rect} from './geometry';
 import {useInsertFlow} from './useInsertFlow';
+import {useLinkMode} from './useLinkMode';
 
 /**
  * Firmware pen-width (μm) → on-screen pixels. Matches sn-shapes'
@@ -182,6 +185,8 @@ type Action =
   | {type: 'SET_LABEL'; nodeId: NodeId; label: string}
   | {type: 'DELETE_SUBTREE'; nodeId: NodeId}
   | {type: 'TOGGLE_COLLAPSE'; nodeId: NodeId}
+  | {type: 'ADD_LINK'; from: NodeId; to: NodeId}
+  | {type: 'DELETE_LINK'; from: NodeId; to: NodeId}
   | {type: 'CLEAR'};
 
 /**
@@ -253,6 +258,17 @@ function treeReducer(state: Tree, action: Action): Tree {
       return next;
     case 'DELETE_SUBTREE':
       deleteSubtree(next, action.nodeId);
+      return next;
+    case 'ADD_LINK':
+      // Validated in the model (addCrossEdge): no-op on reject. The
+      // hook already validated before dispatch, so this won't reject in
+      // practice — but routing through addCrossEdge keeps the model
+      // boundary the only mutation path (I-DAG-1). A no-op leaves `next`
+      // an unmutated clone, which is harmless.
+      addCrossEdge(next, action.from, action.to);
+      return next;
+    case 'DELETE_LINK':
+      deleteCrossEdge(next, action.from, action.to);
       return next;
     case 'TOGGLE_COLLAPSE': {
       const node = next.nodesById.get(action.nodeId);
@@ -350,14 +366,37 @@ export default function MindmapCanvas({
     initialPendingForTree(tree),
   );
 
-  // Tap on a labeled node body: open its edit modal. Tap on an
-  // unlabeled node body: same — modal opens to set its label. The
-  // modal-edit gesture also selects the node, so the existing per-
-  // node Delete affordance still works after the modal closes.
-  const handleSelect = useCallback((nodeId: NodeId) => {
-    setSelectedId(nodeId);
-    setPending({kind: 'edit', nodeId});
-  }, []);
+  // Link mode state (§F-DAG-3). Extracted into useLinkMode (same SRP
+  // split as useInsertFlow): the hook owns arm/disarm, the two-tap
+  // source→target selection, and the transient reject banner; the
+  // canvas renders the Link toolbar button + cross-edge overlay and
+  // dispatches the accepted link. onAddLink routes to the reducer's
+  // ADD_LINK (which calls addCrossEdge on the clone — model boundary).
+  // Declared before handleSelect, which consumes it while armed.
+  const linkMode = useLinkMode({
+    tree,
+    onAddLink: useCallback(
+      (from: NodeId, to: NodeId) => dispatch({type: 'ADD_LINK', from, to}),
+      [],
+    ),
+  });
+
+  // Tap on a node body. While link mode is armed, a tap is a link
+  // source/target selection (§F-DAG-3) — NOT a label edit; route it to
+  // the hook and bail before opening the modal. Otherwise (idle) keep
+  // the existing behavior: open the edit modal and select the node so
+  // the per-node Delete affordance still works after the modal closes.
+  const handleSelect = useCallback(
+    (nodeId: NodeId) => {
+      if (linkMode.isArmed) {
+        linkMode.selectForLink(nodeId);
+        return;
+      }
+      setSelectedId(nodeId);
+      setPending({kind: 'edit', nodeId});
+    },
+    [linkMode],
+  );
 
   const handleBackgroundPress = useCallback(() => {
     setSelectedId(null);
@@ -429,6 +468,13 @@ export default function MindmapCanvas({
     dispatch({type: 'TOGGLE_COLLAPSE', nodeId});
   }, []);
 
+  // Tap a rendered cross-edge while link mode is armed → delete it
+  // (§F-DAG-3-FR4). Wired into the Stage's CrossConnector overlay, which
+  // only exposes the tap target when armed.
+  const handleDeleteLink = useCallback((from: NodeId, to: NodeId) => {
+    dispatch({type: 'DELETE_LINK', from, to});
+  }, []);
+
   // Insert pipeline state (§F-IN-*). Extracted into useInsertFlow so
   // the canvas renders topology + affordances + top bar, while the
   // hook owns debounce, pending state, and the transient error banner.
@@ -494,7 +540,10 @@ export default function MindmapCanvas({
     setClearArmed(false);
     setPending({kind: 'root', nodeId: 0 as NodeId});
     setClearTick(t => t + 1);
-  }, [clearArmed, flow.isInserting]);
+    // Disarm link mode too — the wiped tree has no nodes to link, and a
+    // stale armed source from the old tree must not carry over.
+    linkMode.reset();
+  }, [clearArmed, flow.isInserting, linkMode]);
 
   return (
     <View style={styles.root}>
@@ -538,6 +587,44 @@ export default function MindmapCanvas({
             {clearArmed ? 'Confirm Clear' : 'Clear'}
           </Text>
         </Pressable>
+        {/*
+         * Link — arms DAG link mode (§F-DAG-3). While armed, tapping a
+         * source node then a target node creates a validated cross-edge;
+         * tapping a rendered cross-edge deletes it. Armed style mirrors
+         * Clear's inverted look. Disabled when the tree has < 2 nodes
+         * (nothing to link, §F-DAG-3-FR5) or while an insert is in
+         * flight (the tree must not mutate under the pipeline). Tapping
+         * again disarms.
+         */}
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={linkMode.isArmed ? 'Cancel Link' : 'Link'}
+          accessibilityState={{
+            disabled: flow.isInserting || tree.nodesById.size < 2,
+          }}
+          disabled={flow.isInserting || tree.nodesById.size < 2}
+          onPress={linkMode.toggleArm}
+          style={({pressed}) => [
+            styles.topBarBtn,
+            styles.topBarBtnAdjacent,
+            pressed &&
+              !flow.isInserting &&
+              tree.nodesById.size >= 2 &&
+              styles.topBarBtnPressed,
+            linkMode.isArmed && styles.topBarBtnArmed,
+            (flow.isInserting || tree.nodesById.size < 2) &&
+              styles.topBarBtnDisabled,
+          ]}>
+          <Text
+            style={[
+              styles.topBarBtnText,
+              linkMode.isArmed && styles.topBarBtnTextArmed,
+              (flow.isInserting || tree.nodesById.size < 2) &&
+                styles.topBarBtnTextDisabled,
+            ]}>
+            {linkMode.isArmed ? 'Cancel Link' : 'Link'}
+          </Text>
+        </Pressable>
         <View style={styles.topBarSpacer} />
         {/*
          * Insert / Save button — §F-AC-8 for first-insert, §F-ED-7
@@ -555,6 +642,17 @@ export default function MindmapCanvas({
       {flow.insertError !== null && (
         <View accessibilityLabel="insert-error" style={styles.errorBanner}>
           <Text style={styles.errorText}>{flow.insertError}</Text>
+        </View>
+      )}
+      {/*
+       * Link-reject banner (§F-DAG-3-FR3) — reuses the errorBanner
+       * styling. Insert and link banners won't both show in practice
+       * (link mode is disabled while inserting), so a separate source is
+       * fine.
+       */}
+      {linkMode.linkError !== null && (
+        <View accessibilityLabel="link-error" style={styles.errorBanner}>
+          <Text style={styles.errorText}>{linkMode.linkError}</Text>
         </View>
       )}
       <Pressable
@@ -587,11 +685,14 @@ export default function MindmapCanvas({
             layout={layout}
             visibleIds={visibleIds}
             selectedId={selectedId}
+            armed={linkMode.isArmed}
+            sourceId={linkMode.sourceId}
             onSelect={handleSelect}
             onAddChild={handleAddChild}
             onAddSibling={handleAddSibling}
             onDelete={handleDelete}
             onToggleCollapse={handleToggleCollapse}
+            onDeleteLink={handleDeleteLink}
           />
         </View>
       </Pressable>
@@ -837,11 +938,17 @@ type StageProps = {
   layout: LayoutResult;
   visibleIds: Set<NodeId>;
   selectedId: NodeId | null;
+  /** True while DAG link mode is armed (§F-DAG-3). */
+  armed: boolean;
+  /** The selected link source while armed, else null. */
+  sourceId: NodeId | null;
   onSelect: (nodeId: NodeId) => void;
   onAddChild: (parentId: NodeId) => void;
   onAddSibling: (nodeId: NodeId) => void;
   onDelete: (nodeId: NodeId) => void;
   onToggleCollapse: (nodeId: NodeId) => void;
+  /** Delete a cross-edge (only invoked from the overlay while armed). */
+  onDeleteLink: (from: NodeId, to: NodeId) => void;
 };
 
 /**
@@ -851,22 +958,28 @@ type StageProps = {
  * stage-local (top-left = 0,0).
  *
  * Render order (back to front):
- *   1. connectors (so nodes paint on top and mask the center→center
- *      overshoot)
- *   2. node outlines (interactive — tap selects)
- *   3. action icons (interactive — Add Child / Sibling / Collapse /
- *      Delete)
+ *   1. tree connectors (so nodes paint on top and mask the center→
+ *      center overshoot)
+ *   2. cross-edge overlay (DAG links — gray, tappable-to-delete while
+ *      armed)
+ *   3. node outlines (interactive — tap selects, or picks link source/
+ *      target while armed)
+ *   4. action icons (Add Child / Sibling / Collapse / Delete) — hidden
+ *      while link mode is armed so the canvas reads as "pick two nodes"
  */
 function Stage({
   tree,
   layout,
   visibleIds,
   selectedId,
+  armed,
+  sourceId,
   onSelect,
   onAddChild,
   onAddSibling,
   onDelete,
   onToggleCollapse,
+  onDeleteLink,
 }: StageProps): React.JSX.Element {
   const {unionBbox} = layout;
   const origin: Point = {x: unionBbox.x, y: unionBbox.y};
@@ -917,6 +1030,30 @@ function Stage({
           />
         );
       })}
+      {/*
+       * Cross-edge overlay (§F-DAG-3-FR4). Center-to-center gray lines,
+       * matching the tree-connector convention (the View is masked by
+       * node outlines). While armed, each is a tap target that deletes
+       * the edge; idle, it's a non-interactive visual. Endpoint nodes
+       * may be inside a collapsed subtree — guard on a missing center.
+       */}
+      {tree.crossEdges.map(edge => {
+        const fromCenter = layout.centers.get(edge.from);
+        const toCenter = layout.centers.get(edge.to);
+        if (!fromCenter || !toCenter) {
+          return null;
+        }
+        return (
+          <CrossConnector
+            key={`cross-${edge.from}-${edge.to}`}
+            from={fromCenter}
+            to={toCenter}
+            origin={origin}
+            onPress={armed ? () => onDeleteLink(edge.from, edge.to) : undefined}
+            label={`cross-edge-${edge.from}-${edge.to}`}
+          />
+        );
+      })}
       {visibleNodes.map(node => {
         const bbox = layout.bboxes.get(node.id);
         if (!bbox) {
@@ -929,30 +1066,38 @@ function Stage({
             bbox={bbox}
             origin={origin}
             isSelected={selectedId === node.id}
+            isLinkSource={armed && sourceId === node.id}
             onPress={onSelect}
           />
         );
       })}
-      {visibleNodes.map(node => {
-        const bbox = layout.bboxes.get(node.id);
-        if (!bbox) {
-          return null;
-        }
-        return (
-          <NodeActions
-            key={`actions-${node.id}`}
-            node={node}
-            tree={tree}
-            bbox={bbox}
-            origin={origin}
-            isSelected={selectedId === node.id}
-            onAddChild={onAddChild}
-            onAddSibling={onAddSibling}
-            onDelete={onDelete}
-            onToggleCollapse={onToggleCollapse}
-          />
-        );
-      })}
+      {/*
+       * Per-node action icons are hidden while link mode is armed
+       * (§F-DAG-3): the canvas reads as "tap a source, then a target,"
+       * so Add Child / Sibling / Collapse / Delete would only add noise
+       * and mis-taps.
+       */}
+      {!armed &&
+        visibleNodes.map(node => {
+          const bbox = layout.bboxes.get(node.id);
+          if (!bbox) {
+            return null;
+          }
+          return (
+            <NodeActions
+              key={`actions-${node.id}`}
+              node={node}
+              tree={tree}
+              bbox={bbox}
+              origin={origin}
+              isSelected={selectedId === node.id}
+              onAddChild={onAddChild}
+              onAddSibling={onAddSibling}
+              onDelete={onDelete}
+              onToggleCollapse={onToggleCollapse}
+            />
+          );
+        })}
     </View>
   );
 }
@@ -974,16 +1119,20 @@ function NodeFrame({
   bbox,
   origin,
   isSelected,
+  isLinkSource,
   onPress,
 }: {
   node: MindmapNode;
   bbox: Rect;
   origin: Point;
   isSelected: boolean;
+  isLinkSource: boolean;
   onPress: (nodeId: NodeId) => void;
 }): React.JSX.Element {
   const penWidth = penWidthForShape(node.shape);
-  const borderWidth = penWidthToPx(penWidth) * (isSelected ? 2 : 1);
+  // Both selection and the armed link-source emphasis double the border
+  // so the picked source reads clearly while link mode is armed.
+  const borderWidth = penWidthToPx(penWidth) * (isSelected || isLinkSource ? 2 : 1);
   const skewTransform = transformForShape(node.shape);
   // PARALLELOGRAM nodes need their CONTENTS un-skewed so the label
   // text reads upright while the outline is slanted. Composing
@@ -1063,6 +1212,55 @@ function Connector({
         },
       ]}
     />
+  );
+}
+
+/**
+ * DAG cross-edge overlay (§F-DAG-3-FR4). Same rotated-View math as
+ * Connector, but styled distinct (thin gray line, the screen analogue
+ * of CROSS_EDGE_PEN's 0x9D) and wrapped in a Pressable so it can be
+ * tapped to delete while link mode is armed. The visible line is a thin
+ * 2 px strip centred inside a taller HIT band so it's reliably tappable
+ * with the pen on e-ink without rendering a fat stroke. When `onPress`
+ * is undefined (idle), the Pressable is disabled — purely visual.
+ */
+function CrossConnector({
+  from,
+  to,
+  origin,
+  onPress,
+  label,
+}: {
+  from: Point;
+  to: Point;
+  origin: Point;
+  onPress?: () => void;
+  label: string;
+}): React.JSX.Element {
+  const dx = to.x - from.x;
+  const dy = to.y - from.y;
+  const length = Math.hypot(dx, dy);
+  const angle = Math.atan2(dy, dx);
+  const midX = (from.x + to.x) / 2;
+  const midY = (from.y + to.y) / 2;
+  const HIT = 16; // tappable band height; the visible line is thinner
+  return (
+    <Pressable
+      accessibilityLabel={label}
+      onPress={onPress}
+      disabled={!onPress}
+      style={[
+        styles.crossConnector,
+        {
+          left: midX - length / 2 - origin.x,
+          top: midY - HIT / 2 - origin.y,
+          width: length,
+          height: HIT,
+          transform: [{rotate: `${angle}rad`}],
+        },
+      ]}>
+      <View style={styles.crossConnectorLine} />
+    </Pressable>
   );
 }
 
@@ -1448,6 +1646,19 @@ const styles = StyleSheet.create({
   connector: {
     position: 'absolute',
     backgroundColor: '#000',
+  },
+  // DAG cross-edge overlay: a transparent tap band (height set inline)
+  // centring a thin gray line. Gray #9d9d9d is the screen analogue of
+  // CROSS_EDGE_PEN's 0x9D so the canvas matches the inserted geometry.
+  crossConnector: {
+    position: 'absolute',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  crossConnectorLine: {
+    width: '100%',
+    height: 2,
+    backgroundColor: '#9d9d9d',
   },
   iconButton: {
     position: 'absolute',
