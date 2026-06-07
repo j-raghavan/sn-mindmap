@@ -1210,22 +1210,31 @@ describe('insertConceptMap — labeled nodes (TYPE_TEXT path)', () => {
 });
 
 describe('insertConceptMap — failure semantics (§F-IN-1 / F-NDI-2)', () => {
-  it('throws when getCurrentFilePath rejects (notePath required)', async () => {
-    asMock(PluginCommAPI.getCurrentFilePath).mockRejectedValueOnce(
-      new Error('bridge down'),
-    );
+  it('throws the insertConceptMap-prefixed error when notePath resolves null', async () => {
+    // getCurrentFilePath success:false → resolvePageContext falls through
+    // to defaults (notePath/page null) → finalizeInsert rejects with the
+    // CONTEXT-prefixed message. Assert the exact 'insertConceptMap:' prefix
+    // so the concept path's error is distinct from insertMindmap's (the
+    // context string is the only difference, per the shared finalizeInsert).
+    asMock(PluginCommAPI.getCurrentFilePath).mockResolvedValueOnce({
+      success: false,
+    });
     await expect(
       insertConceptMap({graph: buildSmallGraph()}),
-    ).rejects.toThrow();
+    ).rejects.toThrow(
+      /^insertConceptMap: resolvePageContext returned null notePath\/page/,
+    );
     // No additive write happened.
     expect(PluginFileAPI.insertElements).not.toHaveBeenCalled();
   });
 
-  it('throws when getPageSize returns success:false', async () => {
+  it('throws the insertConceptMap-prefixed error when getPageSize fails', async () => {
     asMock(PluginFileAPI.getPageSize).mockResolvedValueOnce({success: false});
     await expect(
       insertConceptMap({graph: buildSmallGraph()}),
-    ).rejects.toThrow();
+    ).rejects.toThrow(
+      /^insertConceptMap: resolvePageContext returned null notePath\/page/,
+    );
   });
 
   it('throws when insertElements fails (existing content never at risk)', async () => {
