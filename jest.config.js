@@ -26,6 +26,9 @@ module.exports = {
     './src/useLinkMode.ts': {
       branches: 97, functions: 100, lines: 97, statements: 97,
     },
+    './src/model/graph.ts': {
+      branches: 97, functions: 100, lines: 97, statements: 97,
+    },
     './src/pluginRouter.ts': {
       branches: 97, functions: 100, lines: 97, statements: 97,
     },
