@@ -559,15 +559,51 @@ function collectGraphLabeledNodes(
 const TEXT_PADDING_PX = 8;
 
 /**
- * Map a node's bbox height to a font size that looks centred and
- * legible inside the outline. Empirical values: NODE_HEIGHT=96 gives
- * a comfortable ~28 px font; ~bbox.h × 0.32 with a 20–48 clamp keeps
- * smaller fit-to-page-scaled nodes readable without blowing past the
- * outline at large scales.
+ * Average glyph advance as a fraction of the font size, used to predict
+ * a label's rendered width (label.length × fontSize × this). Deliberately
+ * generous (the firmware's proportional font averages nearer ~0.5) so the
+ * width-fit ERRS SMALL and the label never spills past the outline. RB:
+ * tune on-device against the real font metrics.
  */
-function fontSizeForBbox(bbox: Rect): number {
-  const desired = Math.round(bbox.h * 0.32);
-  return Math.max(20, Math.min(48, desired));
+const CHAR_ADVANCE_RATIO = 0.6;
+
+/** Hard ceiling so labels in big boxes don't render comically large. */
+const MAX_FONT_PX = 48;
+
+/**
+ * Tiny safety floor — only guards against a degenerate ≤0 size for an
+ * absurdly long label in a sub-pixel box. It is intentionally well BELOW
+ * the old 20 px floor: that floor was the bug — when the map scaled down,
+ * the height-derived size fell under 20, got clamped UP to 20, and the
+ * now-too-big text was clipped by the firmware to the (also shrunk) box
+ * ("Main idea" → "Mai"). Fit must win over a readability floor, because a
+ * clipped label loses information while a small one does not.
+ */
+const MIN_FONT_PX = 6;
+
+/**
+ * Font size that fits the label INSIDE its box on BOTH axes. The firmware
+ * CLIPS overflowing text (it neither wraps nor auto-shrinks), and node
+ * boxes are a fixed NODE_WIDTH regardless of label length, so the size
+ * must be the smaller of:
+ *   - vertical fit: bbox.h × 0.32 (the historical look — governs short
+ *     labels, so their size is unchanged from before), and
+ *   - horizontal fit: the size at which `label.length` glyphs span the
+ *     padded box width (governs long labels / downscaled boxes).
+ * Capped at MAX_FONT_PX, floored only at the degenerate MIN_FONT_PX.
+ *
+ * Because the emit runs on the fit-to-page-SCALED bbox, this scales with
+ * the map: short labels keep bbox.h × 0.32, and downscaling no longer
+ * clips because there is no longer a 20 px floor to overshoot.
+ */
+function fontSizeForLabel(label: string, bbox: Rect): number {
+  const availW = Math.max(1, bbox.w - 2 * TEXT_PADDING_PX);
+  const byHeight = bbox.h * 0.32;
+  const byWidth = availW / (Math.max(1, label.length) * CHAR_ADVANCE_RATIO);
+  const fit = Math.min(byHeight, byWidth);
+  // floor (not round): rounding UP could re-introduce a sub-pixel overflow,
+  // and the whole point is that the label never exceeds the box.
+  return Math.floor(Math.max(MIN_FONT_PX, Math.min(MAX_FONT_PX, fit)));
 }
 
 /**
@@ -591,8 +627,8 @@ function fontSizeForBbox(bbox: Rect): number {
  *      uuid + plumbing.
  *   2. Populate `pageNum` / `layerNum` / `textBox` with the label
  *      text, the node's outline bbox shrunk by TEXT_PADDING_PX as
- *      `textRect`, fontSize derived from bbox height, and centre
- *      alignment.
+ *      `textRect`, fontSize fit to the label AND the box (so it can't
+ *      overflow/clip), and centre alignment.
  *
  * Throws on the first `createElement` failure.
  */
@@ -645,7 +681,7 @@ async function buildElementsForInsert(
         right: Math.round(bbox.x + bbox.w - TEXT_PADDING_PX),
         bottom: Math.round(bbox.y + bbox.h - TEXT_PADDING_PX),
       },
-      fontSize: fontSizeForBbox(bbox),
+      fontSize: fontSizeForLabel(label, bbox),
       textAlign: 1, // centre — matches sn-plugin-lib TextBox.textAlign convention
       textBold: 0,
       textItalics: 0,

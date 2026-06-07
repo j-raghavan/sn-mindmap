@@ -667,7 +667,7 @@ describe('insertMindmap — labeled nodes (TYPE_TEXT path)', () => {
     expect(textCount).toBe(2);
   });
 
-  it('populates textBox with the label, padded textRect, clamped fontSize and centre alignment', async () => {
+  it('populates textBox with the label, padded textRect, fitted fontSize and centre alignment', async () => {
     const tree = createTree();
     setLabel(tree, 0, '  Padded label  ');
 
@@ -690,11 +690,49 @@ describe('insertMindmap — labeled nodes (TYPE_TEXT path)', () => {
     // 8 px padding on every side.
     expect(tb.textRect!.left).toBeLessThan(tb.textRect!.right);
     expect(tb.textRect!.top).toBeLessThan(tb.textRect!.bottom);
-    // fontSize is clamped between 20 and 48.
-    expect(tb.fontSize).toBeGreaterThanOrEqual(20);
-    expect(tb.fontSize).toBeLessThanOrEqual(48);
+    // fontSize fits the box: capped at 48, above the degenerate floor, and
+    // — the whole point — small enough that the label's predicted rendered
+    // width (length × size × ~0.6) stays inside the padded textRect, so the
+    // firmware can't clip it ("Padded label" no longer becomes "Padded l…").
+    const rectW = tb.textRect!.right - tb.textRect!.left;
+    expect(tb.fontSize!).toBeGreaterThanOrEqual(6);
+    expect(tb.fontSize!).toBeLessThanOrEqual(48);
+    expect('Padded label'.length * tb.fontSize! * 0.6).toBeLessThanOrEqual(
+      rectW + 1e-6,
+    );
     // Centre alignment.
     expect(tb.textAlign).toBe(1);
+  });
+
+  it('shrinks the font so a long label fits the box width instead of clipping', async () => {
+    // A long single-node label at the SAME box size must get a smaller font
+    // than a short one — width-fit, not height-only sizing.
+    const longTree = createTree();
+    setLabel(longTree, 0, 'A very long central idea label');
+    await insertMindmap({tree: longTree});
+    const longTb = (
+      asMock(PluginFileAPI.insertElements).mock.calls[0][2] as Array<{
+        textBox?: {fontSize?: number; textRect?: {left: number; right: number}};
+      }>
+    ).filter(el => el?.textBox)[0].textBox!;
+    const longRectW = longTb.textRect!.right - longTb.textRect!.left;
+    // The long label still fits its padded rect (no clip).
+    expect(
+      'A very long central idea label'.length * longTb.fontSize! * 0.6,
+    ).toBeLessThanOrEqual(longRectW + 1e-6);
+
+    asMock(PluginFileAPI.insertElements).mockClear();
+
+    const shortTree = createTree();
+    setLabel(shortTree, 0, 'Hi');
+    await insertMindmap({tree: shortTree});
+    const shortTb = (
+      asMock(PluginFileAPI.insertElements).mock.calls[0][2] as Array<{
+        textBox?: {fontSize?: number};
+      }>
+    ).filter(el => el?.textBox)[0].textBox!;
+    // Same box, shorter label → larger (height-governed) font.
+    expect(shortTb.fontSize!).toBeGreaterThan(longTb.fontSize!);
   });
 });
 
