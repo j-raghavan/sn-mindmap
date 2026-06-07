@@ -91,6 +91,7 @@ import {
   DEFAULT_PAGE_HEIGHT,
   DEFAULT_PAGE_WIDTH,
   INSERT_MARGIN_PX,
+  LASSO_HALO_PX,
   insertConceptMap,
   insertMindmap,
 } from '../src/insert';
@@ -380,9 +381,11 @@ describe('insertMindmap — happy path (§F-IN-1..F-IN-4)', () => {
 
   it('passes showLassoAfterInsert:false through to every inserted geometry (§F-IN-3)', async () => {
     // emitGeometries sets showLassoAfterInsert:false on every
-    // emitted geometry so the host doesn't auto-lasso anything in
-    // the batched write. Post-insert we explicitly clear the lasso
-    // with setLassoBoxState(2) to leave the pen in write mode.
+    // emitted geometry so the host doesn't auto-lasso each element
+    // individually during the batched write. The single map-wide
+    // grab-lasso is applied explicitly afterward and deliberately
+    // PERSISTS (we do NOT setLassoBoxState(2) it away) so the user can
+    // drag the inserted map straight away.
     const tree = buildSmallTree();
     await insertMindmap({tree});
 
@@ -390,6 +393,42 @@ describe('insertMindmap — happy path (§F-IN-1..F-IN-4)', () => {
     for (const [geometry] of insertCalls) {
       expect(geometry.showLassoAfterInsert).toBe(false);
     }
+  });
+
+  it('expands the map grab-lasso by LASSO_HALO_PX beyond the inserted geometry (§F-IN-3)', async () => {
+    // The grab-lasso must clear the geometry on every side by LASSO_HALO_PX
+    // so strokes sitting exactly on the union-rect boundary are captured —
+    // a tight rect can miss edge strokes. Compare the SECOND lassoElements
+    // call (the map grab; the first is the whole-page placement probe) to
+    // the bounding box of the actually-inserted geometry points.
+    const tree = buildSmallTree();
+    await insertMindmap({tree});
+
+    let gMinX = Infinity;
+    let gMinY = Infinity;
+    let gMaxX = -Infinity;
+    let gMaxY = -Infinity;
+    for (const [geometry] of getInsertedGeometries()) {
+      for (const p of geometry.points ?? []) {
+        gMinX = Math.min(gMinX, p.x);
+        gMinY = Math.min(gMinY, p.y);
+        gMaxX = Math.max(gMaxX, p.x);
+        gMaxY = Math.max(gMaxY, p.y);
+      }
+    }
+    const mapLasso = asMock(PluginCommAPI.lassoElements).mock.calls[1][0] as {
+      left: number;
+      top: number;
+      right: number;
+      bottom: number;
+    };
+    // Each side sits ~LASSO_HALO_PX outside the geometry bbox (±1 px for the
+    // integer rounding of points vs the unrounded union rect).
+    const TOL = 1;
+    expect(Math.abs(gMinX - mapLasso.left - LASSO_HALO_PX)).toBeLessThanOrEqual(TOL);
+    expect(Math.abs(mapLasso.right - gMaxX - LASSO_HALO_PX)).toBeLessThanOrEqual(TOL);
+    expect(Math.abs(gMinY - mapLasso.top - LASSO_HALO_PX)).toBeLessThanOrEqual(TOL);
+    expect(Math.abs(mapLasso.bottom - gMaxY - LASSO_HALO_PX)).toBeLessThanOrEqual(TOL);
   });
 
   it('rounds every emitted geometry point to integers before insertGeometry (native firmware banner guard)', async () => {
@@ -1367,5 +1406,25 @@ describe('insertConceptMap — concept-specific layout (§F-IN-DAG-2)', () => {
     const geos = getInsertedGeometries();
     expect(geos.length).toBe(1);
     expect(geos[0][0].type).toBe('GEO_polygon');
+  });
+
+  it('places the concept map below existing ink (shared RA-2 placement path)', async () => {
+    // insertConceptMap reuses the same finalizeInsert placement tail as
+    // insertMindmap. Lock that the lasso-probe overlap-avoidance applies to
+    // DAG mode too: with existing ink ending at maxY=400 and ~1472 px of
+    // room below it, the whole concept map must land below the ink so its
+    // auto-lasso can't grab the user's notes.
+    const contentMaxY = 400;
+    mockExistingContent({right: DEFAULT_PAGE_WIDTH - 50, bottom: contentMaxY});
+
+    await insertConceptMap({graph: buildSmallGraph()});
+
+    let minY = Infinity;
+    for (const [geometry] of getInsertedGeometries()) {
+      for (const p of geometry.points ?? []) {
+        minY = Math.min(minY, p.y);
+      }
+    }
+    expect(minY).toBeGreaterThanOrEqual(contentMaxY);
   });
 });

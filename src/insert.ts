@@ -743,12 +743,12 @@ function roundGeometryPoints(geometry: Geometry): Geometry {
  * Mirrors the three-step fall-through from sn-shapes:
  * PluginCommAPI.getCurrentFilePath -> getCurrentPageNum ->
  * PluginFileAPI.getPageSize. Any null-ish / failure result at any
- * step, or a thrown exception, returns the Nomad portrait defaults
- * (with notePath/page = null, which the probe treats as "don't
- * attempt"). The per-geometry insertGeometry loop doesn't consume
- * notePath or page — it relies on the firmware's implicit
- * "current page" context — so a null pair still lets the slow path
- * run to completion.
+ * step, or a thrown exception, returns the Nomad portrait defaults for
+ * width/height (so fit-to-page still has sane bounds) but leaves
+ * notePath/page = null. The additive insertElements call REQUIRES both,
+ * so finalizeInsert throws on a null notePath/page rather than writing
+ * to the wrong page — the placement probe likewise treats null as
+ * "don't attempt" and centres on the whole page.
  */
 type PageContext = {
   width: number;
