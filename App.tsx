@@ -1,5 +1,5 @@
 import React from 'react';
-import MindmapCanvas from './src/MindmapCanvas';
+import Canvas from './src/Canvas';
 import {installPluginRouter} from './src/pluginRouter';
 
 // Install the router listener eagerly — idempotent, so safe to call from
@@ -7,17 +7,17 @@ import {installPluginRouter} from './src/pluginRouter';
 // harnesses render App.tsx without executing index.js.
 installPluginRouter();
 
-// Single entry point (per requirements §7.3):
+// Single entry point (per requirements §7.3 / §14.2):
 //
-//   id=100 "Mindmap" → MindmapCanvas (authoring canvas, §5.1)
+//   id=100 "Mindmap" → Canvas (mode-selecting authoring entry)
 //
-// The lasso-toolbar id=200 "Edit Mindmap" entry was removed along
-// with the edit/decode pipeline.
+// Canvas opens the central-idea modal with the Mindmap | Concept map
+// toggle (§14.2), then renders MindmapCanvas (§5.1) or ConceptCanvas
+// (§14.4) for the chosen document mode. The lasso-toolbar id=200 "Edit
+// Mindmap" entry was removed along with the edit/decode pipeline.
 export default function App(): React.JSX.Element {
-  // Open the authoring canvas on a bare tree per §F-AC-2 (single
-  // root Oval at logical origin, empty, no placeholder label). The
-  // user drives the rest of the topology via Add Child / Add Sibling
-  // (§F-AC-5); MindmapCanvas's reducer seed calls createTree() when
-  // no initialTree prop is passed.
-  return <MindmapCanvas />;
+  // Open the mode-selecting central-idea modal per §14.2 (Mindmap |
+  // Concept map). The chosen mode is fixed for the document's life and
+  // seeds the matching canvas with a labeled root.
+  return <Canvas />;
 }
