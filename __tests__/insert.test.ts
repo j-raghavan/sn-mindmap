@@ -1427,4 +1427,49 @@ describe('insertConceptMap — concept-specific layout (§F-IN-DAG-2)', () => {
     }
     expect(minY).toBeGreaterThanOrEqual(contentMaxY);
   });
+
+  it('places the concept map to the RIGHT when the below-band is too short (shared RA-2)', async () => {
+    // Existing ink reaches near the bottom (below-band < MIN_PLACEMENT_BAND)
+    // but only the left portion horizontally, so the right-band has room.
+    // Mirrors the mindmap RIGHT-band test for the shared finalizeInsert path.
+    mockExistingContent({right: 400, bottom: DEFAULT_PAGE_HEIGHT - 200});
+
+    await insertConceptMap({graph: buildSmallGraph()});
+
+    let minX = Infinity;
+    for (const [geometry] of getInsertedGeometries()) {
+      for (const p of geometry.points ?? []) {
+        minX = Math.min(minX, p.x);
+      }
+    }
+    // The map sits to the right of the existing content's right edge.
+    expect(minX).toBeGreaterThanOrEqual(400);
+  });
+
+  it('falls back to page-center when the page is too full for an empty band (shared RA-2)', async () => {
+    // Ink extends near both the bottom and right edges, so neither band
+    // meets MIN_PLACEMENT_BAND; placement centres on the whole page (overlap
+    // accepted — the firmware lasso can do no better on a full page).
+    mockExistingContent({
+      right: DEFAULT_PAGE_WIDTH - 50,
+      bottom: DEFAULT_PAGE_HEIGHT - 50,
+    });
+
+    await insertConceptMap({graph: buildSmallGraph()});
+
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const [geometry] of getInsertedGeometries()) {
+      for (const p of geometry.points ?? []) {
+        minX = Math.min(minX, p.x);
+        minY = Math.min(minY, p.y);
+        maxX = Math.max(maxX, p.x);
+        maxY = Math.max(maxY, p.y);
+      }
+    }
+    expect((minX + maxX) / 2).toBeCloseTo(DEFAULT_PAGE_WIDTH / 2, 0);
+    expect((minY + maxY) / 2).toBeCloseTo(DEFAULT_PAGE_HEIGHT / 2, 0);
+  });
 });
