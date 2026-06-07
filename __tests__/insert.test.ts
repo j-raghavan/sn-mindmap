@@ -280,23 +280,25 @@ describe('insertMindmap — happy path (§F-IN-1..F-IN-4)', () => {
     expect(lassoArg.left).toBeLessThan(lassoArg.right);
     expect(lassoArg.top).toBeLessThan(lassoArg.bottom);
 
-    // Order: createElement × N → insertElements → lassoElements →
-    // reloadFile → close.
+    // Order: createElement × N → insertElements → reloadFile →
+    // lassoElements → close. The lasso MUST come AFTER reloadFile —
+    // pre-reload the inserted elements aren't in the rendered page so
+    // the lasso matches nothing, and a later reload would clear it.
     const lastCreateOrder = Math.max(
       ...asMock(PluginCommAPI.createElement).mock.invocationCallOrder,
     );
     const insertOrder = asMock(PluginFileAPI.insertElements).mock
       .invocationCallOrder[0];
-    const lassoOrder = asMock(PluginCommAPI.lassoElements).mock
-      .invocationCallOrder[0];
     const reloadOrder = asMock(PluginCommAPI.reloadFile).mock
+      .invocationCallOrder[0];
+    const lassoOrder = asMock(PluginCommAPI.lassoElements).mock
       .invocationCallOrder[0];
     const closeOrder = asMock(PluginManager.closePluginView).mock
       .invocationCallOrder[0];
     expect(insertOrder).toBeGreaterThan(lastCreateOrder);
-    expect(lassoOrder).toBeGreaterThan(insertOrder);
-    expect(reloadOrder).toBeGreaterThan(lassoOrder);
-    expect(closeOrder).toBeGreaterThan(reloadOrder);
+    expect(reloadOrder).toBeGreaterThan(insertOrder);
+    expect(lassoOrder).toBeGreaterThan(reloadOrder);
+    expect(closeOrder).toBeGreaterThan(lassoOrder);
   });
 
   it('passes (notePath, page, elements) to insertElements in that order (F-NDI-1-FR4)', async () => {

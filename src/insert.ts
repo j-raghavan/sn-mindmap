@@ -102,6 +102,15 @@ export const DEFAULT_PAGE_HEIGHT = 1872;
  */
 export const INSERT_MARGIN_PX = 200;
 
+/**
+ * Halo (px) added on every side of the union rect when auto-lassoing
+ * the inserted block (§F-IN-3). A lasso rect that exactly hugs the
+ * union bounds can miss strokes sitting on the boundary, so we expand
+ * slightly to make sure every emitted geometry is captured. Mirrors the
+ * 16 px halo an earlier on-device probe run used.
+ */
+export const LASSO_HALO_PX = 16;
+
 export type InsertInput = {
   tree: Tree;
 };
@@ -233,20 +242,39 @@ export async function insertMindmap(input: InsertInput): Promise<void> {
       throw new Error(insertRes?.error?.message ?? 'insertElements failed');
     }
 
+    // Force the host to repaint the page with the newly-inserted
+    // geometries. reloadFile is non-fatal: its success is cosmetic
+    // (the page would repaint on the next interaction anyway), so
+    // we log and continue even on failure.
+    //
+    // ORDER MATTERS: reloadFile MUST run BEFORE the auto-lasso below.
+    // insertElements commits the elements to the file, but the host's
+    // rendered/current page doesn't include them until reloadFile
+    // re-reads it. An on-device trace showed lassoElements returning
+    // {success:true, result:false} when called pre-reload (it matched
+    // nothing — the elements weren't in the rendered page yet), and a
+    // reload after a lasso would also clear the selection. So: reload
+    // first, then lasso.
+    log('reloadFile:before');
+    const reloadRes = (await PluginCommAPI.reloadFile()) as ApiRes<boolean>;
+    log('reloadFile:after', reloadRes);
+
     // Auto-lasso the freshly inserted block so the user can drag the
     // whole map into place right after insert (§F-IN-3). lassoElements
     // takes a {left,top,right,bottom} rect; unionRect is in page coords
-    // ({x,y,w,h}), rounded to integers at the firmware boundary like the
-    // geometry points. We deliberately do NOT follow shape-snap's
-    // setLassoBoxState(2) (which REMOVES the lasso box) — we want the
-    // selection to PERSIST so the map is grab-ready. Non-fatal: a lasso
-    // failure is cosmetic, so we log and continue rather than abort an
-    // already-committed insert.
+    // ({x,y,w,h}). We expand by LASSO_HALO_PX on every side so elements
+    // sitting exactly on the union-rect boundary are captured (a tight
+    // rect can miss edge strokes), and round to integers at the firmware
+    // boundary like the geometry points. We deliberately do NOT follow
+    // shape-snap's setLassoBoxState(2) (which REMOVES the lasso box) —
+    // we want the selection to PERSIST so the map is grab-ready.
+    // Non-fatal: a lasso failure is cosmetic, so we log and continue
+    // rather than abort an already-committed insert.
     const lassoRect = {
-      left: Math.round(unionRect.x),
-      top: Math.round(unionRect.y),
-      right: Math.round(unionRect.x + unionRect.w),
-      bottom: Math.round(unionRect.y + unionRect.h),
+      left: Math.round(unionRect.x - LASSO_HALO_PX),
+      top: Math.round(unionRect.y - LASSO_HALO_PX),
+      right: Math.round(unionRect.x + unionRect.w + LASSO_HALO_PX),
+      bottom: Math.round(unionRect.y + unionRect.h + LASSO_HALO_PX),
     };
     log('lassoElements:before', lassoRect);
     const lassoRes = (await PluginCommAPI.lassoElements(
@@ -258,14 +286,6 @@ export async function insertMindmap(input: InsertInput): Promise<void> {
       errorCode: (lassoRes?.error as {code?: number} | undefined)?.code,
       errorMessage: lassoRes?.error?.message,
     });
-
-    // Force the host to repaint the page with the newly-inserted
-    // geometries. reloadFile is non-fatal: its success is cosmetic
-    // (the page would repaint on the next interaction anyway), so
-    // we log and continue even on failure.
-    log('reloadFile:before');
-    const reloadRes = (await PluginCommAPI.reloadFile()) as ApiRes<boolean>;
-    log('reloadFile:after', reloadRes);
 
     // Dismiss the plugin. NOT awaited — the host's response to
     // closePluginView can be slow on-device, and we don't want the
