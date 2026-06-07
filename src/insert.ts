@@ -747,8 +747,13 @@ function roundGeometryPoints(geometry: Geometry): Geometry {
  * width/height (so fit-to-page still has sane bounds) but leaves
  * notePath/page = null. The additive insertElements call REQUIRES both,
  * so finalizeInsert throws on a null notePath/page rather than writing
- * to the wrong page — the placement probe likewise treats null as
- * "don't attempt" and centres on the whole page.
+ * to the wrong page. NOTE: that null guard sits just before the write,
+ * AFTER the placement probe — the probe operates on the CURRENT page via
+ * lassoElements/getLassoRect (it needs only width/height, not
+ * notePath/page), so on a failed page-context resolution it still runs a
+ * whole-page lasso probe and only then does finalizeInsert throw at the
+ * write guard. (A read-only lasso has no lasting effect, so this is
+ * harmless; the tests assert exactly this ordering.)
  */
 type PageContext = {
   width: number;
