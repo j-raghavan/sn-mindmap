@@ -57,6 +57,9 @@ jest.mock('sn-plugin-lib', () => {
         .fn()
         .mockResolvedValue({success: true, result: 0}),
       lassoElements: jest.fn().mockResolvedValue({success: true}),
+      getLassoRect: jest
+        .fn()
+        .mockResolvedValue({success: true, result: null}),
       deleteLassoElements: jest.fn().mockResolvedValue({success: true}),
       setLassoBoxState: jest.fn().mockResolvedValue({success: true}),
       reloadFile: jest.fn().mockResolvedValue({success: true}),
@@ -166,6 +169,28 @@ function getInsertedGeometries(): Array<[InsertedGeometry]> {
     .map(el => [el.geometry as InsertedGeometry]);
 }
 
+/**
+ * Stage the placement probe so it reports existing-content bounds in
+ * page-pixel space: the whole-page lasso selects something
+ * (result:true) and getLassoRect returns the given rect. `right`/`bottom`
+ * are the content's far corner (what choosePlacementRegion avoids).
+ */
+function mockExistingContent(rect: {
+  left?: number;
+  top?: number;
+  right: number;
+  bottom: number;
+}): void {
+  asMock(PluginCommAPI.lassoElements).mockResolvedValue({
+    success: true,
+    result: true,
+  });
+  asMock(PluginCommAPI.getLassoRect).mockResolvedValue({
+    success: true,
+    result: {left: 0, top: 0, ...rect},
+  });
+}
+
 function resetMocks() {
   // createElement mints a fresh native-like Element per call. Tests
   // that want to observe all N elements should read
@@ -198,6 +223,11 @@ function resetMocks() {
   });
   asMock(PluginCommAPI.lassoElements).mockClear();
   asMock(PluginCommAPI.lassoElements).mockResolvedValue({success: true});
+  asMock(PluginCommAPI.getLassoRect).mockClear();
+  asMock(PluginCommAPI.getLassoRect).mockResolvedValue({
+    success: true,
+    result: null,
+  });
   asMock(PluginCommAPI.deleteLassoElements).mockClear();
   asMock(PluginCommAPI.deleteLassoElements).mockResolvedValue({
     success: true,
@@ -260,23 +290,37 @@ describe('insertMindmap — happy path (§F-IN-1..F-IN-4)', () => {
     expect(insertCalls.length).toBe(7);
     expect(PluginFileAPI.insertElements).toHaveBeenCalledTimes(1);
     // I-NDI-1/2: the additive path NEVER rewrites the whole page
-    // (replaceElements) — that was the buggy v1.0.2 displacement path.
-    // getElements IS called now, but READ-ONLY for placement (to find
-    // empty space); existing elements are never sent back (proven by the
+    // (replaceElements) — that was the buggy v1.0.2 displacement path —
+    // and never even READS existing elements (getElements); placement
+    // reads only their bounds via the lasso probe (proven by the
     // non-empty-page regression below), so existing content is never
     // displaced.
     expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
-    // We do NOT call setLassoBoxState(2) — that REMOVES the lasso box;
-    // we want the auto-lasso (below) to PERSIST so the user can drag the
-    // inserted map.
+    expect(PluginFileAPI.getElements).not.toHaveBeenCalled();
+    // On an EMPTY page (this happy-path default) the probe selects
+    // nothing, so it never clears a selection: setLassoBoxState stays
+    // untouched and the map's own auto-lasso (below) PERSISTS so the user
+    // can drag the inserted map. (On a populated page the probe DOES
+    // clear its transient whole-page selection — covered separately.)
     expect(PluginCommAPI.setLassoBoxState).not.toHaveBeenCalled();
     expect(PluginCommAPI.reloadFile).toHaveBeenCalledTimes(1);
     expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
 
-    // Auto-lasso the inserted block once, with an integer
-    // {left,top,right,bottom} rect (§F-IN-3) so the map is grab-ready.
-    expect(PluginCommAPI.lassoElements).toHaveBeenCalledTimes(1);
-    const lassoArg = asMock(PluginCommAPI.lassoElements).mock.calls[0][0] as {
+    // lassoElements is called TWICE: first the read-only placement probe
+    // (whole-page rect, to read existing-content bounds in pixel space),
+    // then the map's own grab-lasso (§F-IN-3). Both carry integer
+    // {left,top,right,bottom} rects.
+    expect(PluginCommAPI.lassoElements).toHaveBeenCalledTimes(2);
+    const lassoCalls = asMock(PluginCommAPI.lassoElements).mock.calls;
+    const probeArg = lassoCalls[0][0] as {
+      left: number;
+      top: number;
+      right: number;
+      bottom: number;
+    };
+    // Probe spans the whole page (0,0 → pageW,pageH).
+    expect(probeArg).toEqual({left: 0, top: 0, right: 1404, bottom: 1872});
+    const lassoArg = lassoCalls[1][0] as {
       left: number;
       top: number;
       right: number;
@@ -289,9 +333,10 @@ describe('insertMindmap — happy path (§F-IN-1..F-IN-4)', () => {
     expect(lassoArg.top).toBeLessThan(lassoArg.bottom);
 
     // Order: createElement × N → insertElements → reloadFile →
-    // lassoElements → close. The lasso MUST come AFTER reloadFile —
-    // pre-reload the inserted elements aren't in the rendered page so
-    // the lasso matches nothing, and a later reload would clear it.
+    // (map) lassoElements → close. The MAP lasso MUST come AFTER reloadFile
+    // — pre-reload the inserted elements aren't in the rendered page so
+    // the lasso matches nothing, and a later reload would clear it. (The
+    // placement probe lasso runs earlier, before insertElements.)
     const lastCreateOrder = Math.max(
       ...asMock(PluginCommAPI.createElement).mock.invocationCallOrder,
     );
@@ -299,14 +344,15 @@ describe('insertMindmap — happy path (§F-IN-1..F-IN-4)', () => {
       .invocationCallOrder[0];
     const reloadOrder = asMock(PluginCommAPI.reloadFile).mock
       .invocationCallOrder[0];
-    const lassoOrder = asMock(PluginCommAPI.lassoElements).mock
-      .invocationCallOrder[0];
+    const mapLassoOrder = Math.max(
+      ...asMock(PluginCommAPI.lassoElements).mock.invocationCallOrder,
+    );
     const closeOrder = asMock(PluginManager.closePluginView).mock
       .invocationCallOrder[0];
     expect(insertOrder).toBeGreaterThan(lastCreateOrder);
     expect(reloadOrder).toBeGreaterThan(insertOrder);
-    expect(lassoOrder).toBeGreaterThan(reloadOrder);
-    expect(closeOrder).toBeGreaterThan(lassoOrder);
+    expect(mapLassoOrder).toBeGreaterThan(reloadOrder);
+    expect(closeOrder).toBeGreaterThan(mapLassoOrder);
   });
 
   it('passes (notePath, page, elements) to insertElements in that order (F-NDI-1-FR4)', async () => {
@@ -370,62 +416,47 @@ describe('insertMindmap — happy path (§F-IN-1..F-IN-4)', () => {
 });
 
 describe('insertMindmap — non-destructive insert (F-NDI-1..F-NDI-3)', () => {
-  it('sends ONLY the plugin\'s new elements; pre-existing page content is never in the payload (F-NDI-3-AC1)', async () => {
-    // THE regression that hid the shipped bug. Every prior insert test
-    // mocked an empty page (getElements → result:[]), and the on-device
-    // trace was captured with existingCount:0, so nothing ever proved
-    // the existing content stayed out of the write. Here we stand the
-    // page up with pre-existing elements and prove the additive path
-    // sends NONE of them.
+  it('sends ONLY the plugin\'s new elements; the read-then-rewrite path is gone (F-NDI-3-AC1)', async () => {
+    // THE regression that hid the shipped bug was a read-then-rewrite:
+    // getElements → concat existing + new → replaceElements rewrote the
+    // WHOLE page and displaced the user's ink. That path is gone. The
+    // insert is purely additive (insertElements with only the new
+    // elements) and never READS the page's existing elements at all —
+    // placement reads only their pixel BOUNDS, via the lasso probe
+    // (resolveContentExtentPx), which returns a rect, not element data.
     //
-    // We make getElements return a page that ALREADY holds two
-    // elements carrying a sentinel field. If the old read-then-rewrite
-    // path were still alive, these would be concatenated into the write
-    // payload. getElements IS read now (for placement), but the additive
-    // path never sends those elements back, so they must be absent from
-    // insertElements' payload. (These have no maxX/maxY, so placement
-    // falls back to page-center — irrelevant to this assertion.)
-    const preExisting = [
-      {uuid: 'native-existing-1', __preExisting: true, geometry: {type: 'native-stroke'}},
-      {uuid: 'native-existing-2', __preExisting: true, geometry: {type: 'native-stroke'}},
-    ];
-    asMock(PluginFileAPI.getElements).mockResolvedValue({
-      success: true,
-      result: preExisting,
-    });
+    // Simulate a populated page (the probe reports content bounds) and
+    // prove the destructive read/rewrite calls never fire and the
+    // payload is exactly the plugin's own elements.
+    mockExistingContent({right: 600, bottom: 500});
 
     const tree = buildSmallTree();
     await insertMindmap({tree});
 
-    // Exactly one additive call.
+    // Exactly one additive call; the old read + whole-page rewrite calls
+    // are never made (their return into the payload was the displacement
+    // bug).
     expect(PluginFileAPI.insertElements).toHaveBeenCalledTimes(1);
-    // The page is NEVER whole-page-rewritten (the displacement bug). The
-    // read (getElements) is placement-only; existing elements never go
-    // back into the payload — that is what keeps existing content in place.
+    expect(PluginFileAPI.getElements).not.toHaveBeenCalled();
     expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
 
     const payload = asMock(PluginFileAPI.insertElements).mock
       .calls[0][2] as Array<Record<string, unknown>>;
     // Payload length == ONLY the plugin's new elements (7 geometries +
-    // 0 labels for the small tree) — not 7 + 2 existing.
+    // 0 labels for the small tree).
     expect(payload).toHaveLength(7);
-    // No pre-existing element leaked into the payload — neither by the
-    // sentinel field nor by uuid.
+    // Every payload element is one the plugin minted this run
+    // (test-uuid-*), so no foreign / pre-existing element could be in it.
     for (const el of payload) {
-      expect(el.__preExisting).toBeUndefined();
-      expect(el.uuid).not.toBe('native-existing-1');
-      expect(el.uuid).not.toBe('native-existing-2');
+      expect(String(el.uuid)).toMatch(/^test-uuid-/);
     }
   });
 
   it('non-empty page: payload length is geometries + labels only, with labels present (F-NDI-3-FR2)', async () => {
-    // Same non-empty page, but now with two labeled nodes so the
+    // Same populated page, but now with two labeled nodes so the
     // payload is geometries + labels. Still: only the plugin's new
     // elements, never the existing page content.
-    asMock(PluginFileAPI.getElements).mockResolvedValue({
-      success: true,
-      result: [{uuid: 'native-existing-1', __preExisting: true}],
-    });
+    mockExistingContent({right: 600, bottom: 500});
 
     const tree = createTree();
     setLabel(tree, 0, 'Root idea');
@@ -447,12 +478,8 @@ describe('insertMindmap — non-destructive insert (F-NDI-1..F-NDI-3)', () => {
   it('empty page: insert still lands the full geometry set page-centered (F-NDI-1-AC2 — no regression)', async () => {
     // The working case must stay working. On an empty page the additive
     // insert sends the full geometry+label set, identical to v1.0.2
-    // minus the (now removed) whole-page read.
-    asMock(PluginFileAPI.getElements).mockResolvedValue({
-      success: true,
-      result: [],
-    });
-
+    // minus the (now removed) whole-page read. The placement probe finds
+    // no content (default lasso → result-less) so the map centers.
     const tree = buildSmallTree();
     await insertMindmap({tree});
 
@@ -486,10 +513,7 @@ describe('insertMindmap — non-destructive insert (F-NDI-1..F-NDI-3)', () => {
     // land entirely below the content so its auto-lasso rect doesn't
     // overlap — and thus dragging the map won't drag the user's ink.
     const contentMaxY = 400;
-    asMock(PluginFileAPI.getElements).mockResolvedValue({
-      success: true,
-      result: [{uuid: 'ink-1', maxX: DEFAULT_PAGE_WIDTH - 50, maxY: contentMaxY}],
-    });
+    mockExistingContent({right: DEFAULT_PAGE_WIDTH - 50, bottom: contentMaxY});
 
     const tree = buildSmallTree();
     await insertMindmap({tree});
@@ -510,15 +534,9 @@ describe('insertMindmap — non-destructive insert (F-NDI-1..F-NDI-3)', () => {
     // neither the below-band nor the right-band meets MIN_PLACEMENT_BAND;
     // placement falls back to centering on the whole page (overlap
     // accepted — the firmware lasso can't do better on a full page).
-    asMock(PluginFileAPI.getElements).mockResolvedValue({
-      success: true,
-      result: [
-        {
-          uuid: 'ink-full',
-          maxX: DEFAULT_PAGE_WIDTH - 50,
-          maxY: DEFAULT_PAGE_HEIGHT - 50,
-        },
-      ],
+    mockExistingContent({
+      right: DEFAULT_PAGE_WIDTH - 50,
+      bottom: DEFAULT_PAGE_HEIGHT - 50,
     });
 
     const tree = buildSmallTree();
@@ -544,10 +562,7 @@ describe('insertMindmap — non-destructive insert (F-NDI-1..F-NDI-3)', () => {
   it('places the map to the RIGHT when the below-band is too short (RA-2)', async () => {
     // Content reaches near the bottom (below-band < MIN_PLACEMENT_BAND)
     // but only the left portion horizontally, so the right-band has room.
-    asMock(PluginFileAPI.getElements).mockResolvedValue({
-      success: true,
-      result: [{uuid: 'ink-tall', maxX: 400, maxY: DEFAULT_PAGE_HEIGHT - 200}],
-    });
+    mockExistingContent({right: 400, bottom: DEFAULT_PAGE_HEIGHT - 200});
 
     const tree = buildSmallTree();
     await insertMindmap({tree});
@@ -564,11 +579,12 @@ describe('insertMindmap — non-destructive insert (F-NDI-1..F-NDI-3)', () => {
   });
 
   it('falls back to page-center when the placement read throws (RA-2, non-fatal)', async () => {
-    // resolveContentExtent swallows any getElements error and returns
-    // null, so placement falls back to centering on the whole page — a
-    // read failure must never abort the insert.
-    asMock(PluginFileAPI.getElements).mockRejectedValueOnce(
-      new Error('simulated: getElements threw during placement'),
+    // resolveContentExtentPx swallows any probe error and returns null,
+    // so placement falls back to centering on the whole page — a read
+    // failure must never abort the insert. The probe is the FIRST
+    // lassoElements call; the map's own grab-lasso still fires after.
+    asMock(PluginCommAPI.lassoElements).mockRejectedValueOnce(
+      new Error('simulated: lasso probe threw during placement'),
     );
 
     const tree = buildSmallTree();
@@ -590,6 +606,43 @@ describe('insertMindmap — non-destructive insert (F-NDI-1..F-NDI-3)', () => {
     }
     expect((minX + maxX) / 2).toBeCloseTo(DEFAULT_PAGE_WIDTH / 2, 0);
     expect((minY + maxY) / 2).toBeCloseTo(DEFAULT_PAGE_HEIGHT / 2, 0);
+  });
+
+  it('falls back to page-center when the probe selects but getLassoRect is unusable (RA-2)', async () => {
+    // The whole-page lasso DID select something (result:true) but
+    // getLassoRect comes back with no usable rect — placement treats the
+    // extent as unknown and centers on the whole page. Because the probe
+    // made a selection, it MUST be cleared (setLassoBoxState(2)) so only
+    // the map's own auto-lasso survives.
+    asMock(PluginCommAPI.lassoElements).mockResolvedValueOnce({
+      success: true,
+      result: true,
+    });
+    asMock(PluginCommAPI.getLassoRect).mockResolvedValueOnce({
+      success: true,
+      result: null,
+    });
+
+    const tree = buildSmallTree();
+    await expect(insertMindmap({tree})).resolves.toBeUndefined();
+
+    const insertCalls = getInsertedGeometries();
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const [geometry] of insertCalls) {
+      for (const p of geometry.points ?? []) {
+        minX = Math.min(minX, p.x);
+        minY = Math.min(minY, p.y);
+        maxX = Math.max(maxX, p.x);
+        maxY = Math.max(maxY, p.y);
+      }
+    }
+    expect((minX + maxX) / 2).toBeCloseTo(DEFAULT_PAGE_WIDTH / 2, 0);
+    expect((minY + maxY) / 2).toBeCloseTo(DEFAULT_PAGE_HEIGHT / 2, 0);
+    // Probe selection cleared exactly once.
+    expect(PluginCommAPI.setLassoBoxState).toHaveBeenCalledWith(2);
   });
 });
 
@@ -890,17 +943,18 @@ describe('insertMindmap — error + cleanup (§F-IN-5)', () => {
     expect(PluginManager.closePluginView).not.toHaveBeenCalled();
   });
 
-  // F-NDI-3-FR3: the old getElements-failure tests are GONE. getElements
-  // is now called READ-ONLY for placement, and a getElements failure is
-  // swallowed (falls back to page-center) — it cannot abort the insert,
-  // so there is no failure path to exercise.
+  // F-NDI-3-FR3: the old getElements-failure tests are GONE. The insert
+  // no longer reads existing elements at all; the placement probe (a
+  // read-only lasso) swallows any failure and falls back to page-center —
+  // it cannot abort the insert, so there is no failure path to exercise.
 
   it('re-raises an insertElements failure and leaves the existing page untouched (F-NDI-2-AC1)', async () => {
     // insertElements rejecting throws the host message. The user's
     // existing content is provably untouched: it is never whole-page
-    // rewritten (replaceElements), and the placement read (getElements)
-    // is non-destructive. closePluginView is skipped so the UI stays
-    // open and shows the error banner.
+    // rewritten (replaceElements), and the placement probe only reads
+    // bounds (a lasso select/deselect, never a stroke edit).
+    // closePluginView is skipped so the UI stays open and shows the
+    // error banner.
     asMock(PluginFileAPI.insertElements).mockResolvedValueOnce({
       success: false,
       error: {message: 'simulated: insertElements rejected'},
@@ -913,7 +967,15 @@ describe('insertMindmap — error + cleanup (§F-IN-5)', () => {
     expect(PluginManager.closePluginView).not.toHaveBeenCalled();
     // No DESTRUCTIVE call was ever issued — the page is never rewritten.
     expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
-    expect(PluginCommAPI.lassoElements).not.toHaveBeenCalled();
+    // Only the read-only placement probe (whole-page rect) ran; the map's
+    // own grab-lasso is never reached after the insert fails.
+    expect(PluginCommAPI.lassoElements).toHaveBeenCalledTimes(1);
+    expect(asMock(PluginCommAPI.lassoElements).mock.calls[0][0]).toEqual({
+      left: 0,
+      top: 0,
+      right: 1404,
+      bottom: 1872,
+    });
     expect(PluginCommAPI.deleteLassoElements).not.toHaveBeenCalled();
   });
 
@@ -938,14 +1000,18 @@ describe('insertMindmap — error + cleanup (§F-IN-5)', () => {
     // geometries are already committed by the time it fires, so a lasso
     // failure must NOT roll back the insert — reloadFile + close still
     // run and the user sees the inserted map (just not pre-selected).
-    asMock(PluginCommAPI.lassoElements).mockResolvedValueOnce({
-      success: false,
-      error: {code: 904, message: 'simulated: lasso refused'},
-    });
+    // First lassoElements call is the placement probe (benign here); the
+    // SECOND is the map grab-lasso we force to fail.
+    asMock(PluginCommAPI.lassoElements)
+      .mockResolvedValueOnce({success: true})
+      .mockResolvedValueOnce({
+        success: false,
+        error: {code: 904, message: 'simulated: lasso refused'},
+      });
 
     const tree = buildSmallTree();
     await expect(insertMindmap({tree})).resolves.toBeUndefined();
-    expect(PluginCommAPI.lassoElements).toHaveBeenCalledTimes(1);
+    expect(PluginCommAPI.lassoElements).toHaveBeenCalledTimes(2);
     expect(PluginCommAPI.reloadFile).toHaveBeenCalledTimes(1);
     expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
   });
@@ -1147,10 +1213,13 @@ describe('insertConceptMap — happy path (§F-IN-DAG-1)', () => {
     // Additive: never the whole-page replace path.
     expect(PluginFileAPI.replaceElements).not.toHaveBeenCalled();
     expect(PluginCommAPI.reloadFile).toHaveBeenCalledTimes(1);
-    expect(PluginCommAPI.lassoElements).toHaveBeenCalledTimes(1);
+    // Two lassoElements: the read-only placement probe, then the map grab.
+    expect(PluginCommAPI.lassoElements).toHaveBeenCalledTimes(2);
     expect(PluginManager.closePluginView).toHaveBeenCalledTimes(1);
 
-    // Order: createElement × N → insertElements → reloadFile → lasso → close.
+    // Order: createElement × N → insertElements → reloadFile →
+    // (map) lasso → close. The map grab-lasso is the LAST lasso call
+    // (the placement probe runs before insertElements).
     const lastCreateOrder = Math.max(
       ...asMock(PluginCommAPI.createElement).mock.invocationCallOrder,
     );
@@ -1158,14 +1227,15 @@ describe('insertConceptMap — happy path (§F-IN-DAG-1)', () => {
       .invocationCallOrder[0];
     const reloadOrder = asMock(PluginCommAPI.reloadFile).mock
       .invocationCallOrder[0];
-    const lassoOrder = asMock(PluginCommAPI.lassoElements).mock
-      .invocationCallOrder[0];
+    const mapLassoOrder = Math.max(
+      ...asMock(PluginCommAPI.lassoElements).mock.invocationCallOrder,
+    );
     const closeOrder = asMock(PluginManager.closePluginView).mock
       .invocationCallOrder[0];
     expect(insertOrder).toBeGreaterThan(lastCreateOrder);
     expect(reloadOrder).toBeGreaterThan(insertOrder);
-    expect(lassoOrder).toBeGreaterThan(reloadOrder);
-    expect(closeOrder).toBeGreaterThan(lassoOrder);
+    expect(mapLassoOrder).toBeGreaterThan(reloadOrder);
+    expect(closeOrder).toBeGreaterThan(mapLassoOrder);
   });
 
   it('emits one connector per parent edge — a two-parent node inserts both', async () => {

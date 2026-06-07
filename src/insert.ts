@@ -301,17 +301,22 @@ async function finalizeInsert({
   // auto-lasso of a map placed ON TOP of existing ink would also grab
   // that ink, and dragging the map would drag the user's notes. To
   // avoid it we place the map in EMPTY space: read the existing
-  // content's extent (each Element exposes maxX/maxY cheaply) and drop
-  // the map into the band below — or, failing that, to the right of —
-  // all existing content, falling back to the whole page (centered)
-  // when the page is too full to fit a band. This only READS the
-  // existing content's bounds; the insert itself stays additive
-  // (insertElements), so existing strokes are still never rewritten or
-  // displaced (I-NDI-2 holds).
-  const contentExtent = await resolveContentExtent(
-    pageCtx.notePath,
-    pageCtx.page,
-  );
+  // content's extent and drop the map into the band below — or, failing
+  // that, to the right of — all existing content, falling back to the
+  // whole page (centered) when the page is too full to fit a band.
+  //
+  // The extent MUST be in the same page-pixel space as the map we place
+  // and the lasso rect we later send. getElements' maxX/maxY are in the
+  // firmware's NATIVE stroke (EMR) space — ~6-11x the page (an on-device
+  // trace read 21632x16224 against a 1920x2560 page) — so comparing them
+  // to the pixel page made every band compute negative and the map
+  // always landed centered ON TOP of the ink. Instead we let the
+  // firmware do the EMR->pixel conversion for us: lasso the whole page,
+  // read the selection's bounding rect (pixel space, the same Rect the
+  // lasso hit-test uses), then drop the box. READ-ONLY for the user's
+  // ink — selecting then deselecting never rewrites strokes, and the
+  // insert itself stays additive (I-NDI-2 holds).
+  const contentExtent = await resolveContentExtentPx(pageWidth, pageHeight);
   const region = choosePlacementRegion(pageWidth, pageHeight, contentExtent);
   log('choosePlacementRegion:done', {contentExtent, region});
 
@@ -769,52 +774,91 @@ function autoExpand(tree: Tree): Tree {
 }
 
 /**
- * Bottom-right extent of all existing content on the page, or null when
- * the page is empty / unreadable. Used by choosePlacementRegion to drop
- * the new map into empty space (§F-IN-3 / RA-2).
+ * Bottom-right extent (page-pixel space) of all existing content on the
+ * page, or null when the page is empty / unreadable. Used by
+ * choosePlacementRegion to drop the new map into empty space
+ * (§F-IN-3 / RA-2).
  *
- * Elements expose `maxX`/`maxY` (their far corner) as plain fields, so
- * we get the rightmost/bottommost extent of all content cheaply WITHOUT
- * reading any stroke points (those live in lazy native cache). We only
- * need the far corner: every element's bottom is ≤ max(maxY), so placing
- * the map below max(maxY) clears all of it. This is READ-ONLY — the
- * insert stays additive, so existing content is never rewritten.
+ * Why not getElements? Element `maxX`/`maxY` are in the firmware's NATIVE
+ * stroke (EMR) coordinate space, which is ~6-11x the page (an on-device
+ * trace read 21632x16224 against a 1920x2560 page). Placement, the map
+ * geometry, and the auto-lasso rect all work in page-PIXEL space, so an
+ * EMR extent made every empty-band calc go negative and the map always
+ * landed centered on top of the ink.
  *
- * Best-effort: any failure (null page context, getElements error, no
- * elements, no finite bounds) returns null and the caller centers on
- * the whole page.
+ * Instead we borrow the firmware's own EMR->pixel conversion: lasso the
+ * whole page (left/top/right/bottom in pixel space, the exact space the
+ * lasso hit-test consumes), then read the selection's bounding rect via
+ * getLassoRect — that Rect comes back in pixel space — and immediately
+ * drop the lasso box (setLassoBoxState(2) = "completely remove"; it
+ * deselects only, never deletes strokes). The right/bottom of that rect
+ * is the bottom-right extent of all ink, already in the space we place
+ * into.
+ *
+ * Best-effort and READ-ONLY for the user's ink: an empty page (lasso
+ * matches nothing), a missing/!success rect, or any thrown error returns
+ * null and the caller centers on the whole page.
  */
-async function resolveContentExtent(
-  notePath: string | null,
-  page: number | null,
+async function resolveContentExtentPx(
+  pageW: number,
+  pageH: number,
 ): Promise<{maxX: number; maxY: number} | null> {
-  if (notePath === null || page === null) {
-    return null;
-  }
+  let selected = false;
   try {
-    const res = (await PluginFileAPI.getElements(
-      page,
-      notePath,
-    )) as ApiRes<Array<{maxX?: number; maxY?: number}>>;
-    if (!res?.success || !Array.isArray(res.result) || res.result.length === 0) {
+    const lassoRes = (await PluginCommAPI.lassoElements({
+      left: 0,
+      top: 0,
+      right: Math.round(pageW),
+      bottom: Math.round(pageH),
+    })) as ApiRes<boolean>;
+    // result === true means at least one element was selected; false (the
+    // empty-page case, or a lasso no-op) means there is nothing to avoid
+    // and nothing to clear.
+    if (!lassoRes?.success || lassoRes.result !== true) {
       return null;
     }
-    let maxX = -Infinity;
-    let maxY = -Infinity;
-    for (const el of res.result) {
-      if (typeof el?.maxX === 'number' && el.maxX > maxX) {
-        maxX = el.maxX;
-      }
-      if (typeof el?.maxY === 'number' && el.maxY > maxY) {
-        maxY = el.maxY;
-      }
-    }
-    if (!Number.isFinite(maxX) || !Number.isFinite(maxY)) {
+    selected = true;
+    const rectRes = (await PluginCommAPI.getLassoRect()) as ApiRes<{
+      left?: number;
+      top?: number;
+      right?: number;
+      bottom?: number;
+    }>;
+    const rect = rectRes?.result;
+    if (
+      !rectRes?.success ||
+      !rect ||
+      typeof rect.right !== 'number' ||
+      typeof rect.bottom !== 'number' ||
+      !Number.isFinite(rect.right) ||
+      !Number.isFinite(rect.bottom)
+    ) {
       return null;
     }
-    return {maxX, maxY};
+    log('resolveContentExtentPx:done', {rect});
+    return {maxX: rect.right, maxY: rect.bottom};
   } catch {
     return null;
+  } finally {
+    // Clear the probe selection iff we actually made one, so the only
+    // surviving selection at insert-end is the map's own auto-lasso.
+    if (selected) {
+      await clearLassoBox();
+    }
+  }
+}
+
+/**
+ * Drop the lasso box so the whole-page content probe leaves no transient
+ * selection behind. state 2 = "completely remove" the box (deselect) —
+ * it never deletes strokes (that is deleteLassoElements). Best-effort:
+ * a failure here is purely cosmetic, so swallow it.
+ */
+async function clearLassoBox(): Promise<void> {
+  try {
+    await PluginCommAPI.setLassoBoxState(2);
+  } catch {
+    // cosmetic — the plugin closing clears any lingering selection anyway
   }
 }
 
