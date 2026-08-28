@@ -6,5 +6,9 @@
   "versionCode": "10004",
   "pluginID": "xl4pdqskm5sqfg0j",
   "pluginKey": "SnMindmap",
-  "jsMainPath": "index"
+  "jsMainPath": "index",
+  "uses-permissions": [
+    "plugin.permission.FILE:READ",
+    "plugin.permission.FILE:WRITE"
+  ]
 }
